@@ -8484,15 +8484,23 @@ class TelegramAdapter(BasePlatformAdapter):
         max_bytes = getattr(self, "_max_doc_bytes", 20 * 1024 * 1024)
         file_size = getattr(source, "file_size", None)
         try:
-            size = int(file_size or 0)
+            size = int(file_size) if file_size is not None else None
         except (TypeError, ValueError):
-            size = 0
-        if not (0 < size <= max_bytes):
+            size = None
+        # Telegram frequently omits file_size on nested reply_to_message media
+        # (especially the largest PhotoSize), which made the old ``0 < size``
+        # guard silently drop replied-to screenshots. Only reject when the size
+        # is KNOWN to exceed the cap; re-check the real byte length post-download.
+        if size is not None and size > max_bytes:
+            logger.info("[Telegram] Skipped replied-to media over size cap (declared %d bytes)", size)
             return
 
         try:
             file_obj = await source.get_file()
             data = bytes(await file_obj.download_as_bytearray())
+            if len(data) > max_bytes:
+                logger.info("[Telegram] Skipped replied-to media over size cap (%d bytes downloaded)", len(data))
+                return
             if not filename:
                 filename = os.path.basename(getattr(file_obj, "file_path", "") or "")
             cached = cache_media_bytes(data, filename=filename, mime_type=mime, default_kind=kind)

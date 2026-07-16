@@ -6724,6 +6724,160 @@ def _dispatch_all_via_service_manager_if_s6(action: str) -> bool:
 
 
 
+def _get_reload_profiles_allowlist() -> list:
+    """Return the configured ``gateway.reload_profiles`` allowlist.
+
+    The allowlist is a list of profile names the trusted default gateway is
+    permitted to drain-reload via ``hermes gateway reload-profiles``.  It is
+    **empty by default** (the feature is disabled unless explicitly
+    configured).  Non-string / blank entries are dropped; order is preserved
+    and duplicates are collapsed so the reload order is deterministic.
+    """
+    cfg = read_raw_config()
+    gw = cfg.get("gateway", {}) if isinstance(cfg, dict) else {}
+    raw = gw.get("reload_profiles", []) if isinstance(gw, dict) else []
+    if not isinstance(raw, list):
+        return []
+    out: list = []
+    seen: set = set()
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        name = item.strip()
+        if name and name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+def run_gateway_reload_profiles(dry_run: bool = False) -> int:
+    """Drain-reload an allowlisted roster of profile gateways, self last.
+
+    This is the sanctioned, narrow lifecycle verb behind
+    ``hermes gateway reload-profiles``.  It exists so the trusted default
+    assistant can pick up config changes across a fixed set of sibling
+    profile gateways without the operator hand-running ``restart`` per bot.
+
+    Hard guarantees (do not weaken):
+
+    * **Authorization** — runs only from the default / root Hermes home.
+      Named profiles are refused; a named profile must never be able to
+      reach across into its siblings.
+    * **Allowlist only** — touches exactly the profiles named in
+      ``gateway.reload_profiles`` *and* actually registered on disk.  The
+      intersection is the target set; anything else is ignored.
+    * **Reload, never kill** — each foreign profile is signalled through the
+      drain-aware ``_graceful_restart_via_sigusr1`` (SIGUSR1 → drain →
+      service-manager restart).  The current default gateway is reloaded
+      **last** through the sanctioned self-restart path
+      (``_request_gateway_self_restart``), falling back to the same
+      drain-aware SIGUSR1 when this CLI is not a child of the gateway.  No
+      ``kill``/``pkill``/``systemctl stop``/``launchctl bootout`` is issued.
+
+    Returns a process exit code (0 = success / nothing to do, 1 = refused).
+    """
+    from hermes_cli.profiles import get_active_profile_name, list_profiles
+
+    # --- Authorization: default/root Hermes home only -----------------------
+    active = get_active_profile_name()
+    if active != "default":
+        print_error(
+            "`hermes gateway reload-profiles` may only run from the default "
+            "profile (root Hermes home).\n"
+            f"Active profile is '{active}'. Refusing — a named profile cannot "
+            "reload sibling gateways."
+        )
+        return 1
+
+    # --- Allowlist (empty/disabled by default) ------------------------------
+    allowlist = _get_reload_profiles_allowlist()
+    if not allowlist:
+        print_info(
+            "gateway.reload_profiles is empty — nothing to reload.\n"
+            "Configure a profile allowlist under `gateway.reload_profiles` in "
+            "config.yaml to enable this command."
+        )
+        return 0
+
+    # --- Intersect with actually-registered profiles ------------------------
+    registered = {p.name for p in list_profiles()}
+    targets = [name for name in allowlist if name in registered]
+    unknown = [name for name in allowlist if name not in registered]
+    if unknown:
+        print_warning(
+            "Ignoring allowlisted profiles that are not registered: "
+            + ", ".join(unknown)
+        )
+    if not targets:
+        print_info("No allowlisted profiles are registered — nothing to reload.")
+        return 0
+
+    # Reload the current default gateway LAST (self-restart via drain).
+    foreign = [name for name in targets if name != "default"]
+    reload_default_last = "default" in targets
+
+    running = {p.profile: p.pid for p in find_profile_gateway_processes()}
+    drain_timeout = _get_restart_drain_timeout()
+
+    def _describe(name: str, pid: int) -> str:
+        return f"{name} (pid {pid})"
+
+    reloaded: list = []
+    skipped: list = []
+
+    for name in foreign:
+        pid = running.get(name)
+        if not pid:
+            skipped.append(name)
+            print_warning(f"Profile '{name}' has no running gateway — skipping.")
+            continue
+        if dry_run:
+            print_info(f"[dry-run] would drain-reload {_describe(name, pid)}")
+            reloaded.append(name)
+            continue
+        if _graceful_restart_via_sigusr1(pid, drain_timeout):
+            reloaded.append(name)
+            print_success(f"Drain-reloaded {_describe(name, pid)}")
+        else:
+            skipped.append(name)
+            print_warning(
+                f"Could not drain-reload {_describe(name, pid)} "
+                "(no SIGUSR1 / did not exit in time)."
+            )
+
+    if reload_default_last:
+        pid = running.get("default")
+        if not pid:
+            print_warning(
+                "Default gateway is not running — skipping self-reload."
+            )
+        elif dry_run:
+            print_info(f"[dry-run] would self-reload {_describe('default', pid)} (last)")
+            reloaded.append("default")
+        else:
+            # Prefer the ancestor-guarded self-restart path; fall back to the
+            # same drain-aware SIGUSR1 when this CLI is not a child of the
+            # gateway (e.g. run from a plain shell).  Both are drain-only.
+            if _request_gateway_self_restart(pid) or _graceful_restart_via_sigusr1(
+                pid, drain_timeout
+            ):
+                reloaded.append("default")
+                print_success(f"Self-reload requested for {_describe('default', pid)} (last)")
+            else:
+                skipped.append("default")
+                print_warning(
+                    f"Could not self-reload {_describe('default', pid)}."
+                )
+
+    if not dry_run:
+        print_info(
+            f"reload-profiles: {len(reloaded)} reloaded"
+            + (f", {len(skipped)} skipped" if skipped else "")
+            + "."
+        )
+    return 0
+
+
 def gateway_command(args):
     """Handle gateway subcommands."""
     try:
@@ -7445,6 +7599,15 @@ def _gateway_command_inner(args):
 
         # Show other profiles' gateway status for multi-profile awareness
         _print_other_profiles_gateway_status()
+
+    elif subcmd == "reload-profiles":
+        # Sanctioned narrow lifecycle verb: drain-reload an allowlisted roster
+        # of profile gateways (self last).  Intentionally NOT gated by the
+        # `_HERMES_GATEWAY` self-stop/restart guard — this is the approved
+        # drain-only path and never issues stop/kill primitives.
+        rc = run_gateway_reload_profiles(dry_run=getattr(args, "dry_run", False))
+        if rc:
+            sys.exit(rc)
 
     elif subcmd == "list":
         _gateway_list()

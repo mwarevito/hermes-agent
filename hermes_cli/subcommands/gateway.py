@@ -143,6 +143,31 @@ def build_gateway_parser(
     )
     _add_compat_platform_flag(gateway_restart)
 
+    # gateway reload-profiles
+    #
+    # Drain-reload an allowlisted roster of sibling profile gateways (self
+    # last) so the trusted default assistant can pick up config changes
+    # without hand-running `restart` per bot.  Deliberately a separate verb
+    # from stop/restart: it never issues a kill/stop primitive, only the
+    # drain-aware SIGUSR1 path, and runs only from the default profile against
+    # profiles listed in `gateway.reload_profiles` (empty by default).
+    gateway_reload_profiles = gateway_subparsers.add_parser(
+        "reload-profiles",
+        help="Drain-reload allowlisted profile gateways (self last)",
+        description=(
+            "Drain-reload the profile gateways listed in "
+            "`gateway.reload_profiles` (config.yaml), reloading the current "
+            "default gateway last. Runs only from the default profile and "
+            "only signals a graceful drain-restart — it never stops or kills "
+            "a gateway. Empty allowlist by default (feature disabled)."
+        ),
+    )
+    gateway_reload_profiles.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show which allowlisted profiles would be reloaded without signalling them",
+    )
+
     # gateway status
     gateway_status = gateway_subparsers.add_parser("status", help="Show gateway status")
     gateway_status.add_argument("--deep", action="store_true", help="Deep status check")

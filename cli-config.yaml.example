@@ -914,6 +914,25 @@ agent:
     hype: "YOOO LET'S GOOOO!!! 🔥🔥🔥 I am SO PUMPED to help you today! Every question is AMAZING and we're gonna CRUSH IT together! This is gonna be LEGENDARY! ARE YOU READY?! LET'S DO THIS! 💪😤🚀"
 
 # =============================================================================
+# Gateway (messaging gateway lifecycle)
+# =============================================================================
+# gateway:
+#   # Allowlist of profile gateways that `hermes gateway reload-profiles` is
+#   # permitted to drain-reload. Empty/omitted by default (feature disabled).
+#   #
+#   # `hermes gateway reload-profiles` runs ONLY from the default profile and
+#   # only signals a graceful drain-restart (SIGUSR1) — it never stops or kills
+#   # a gateway. Each named, currently-registered profile is drain-reloaded;
+#   # if "default" is listed, the current default gateway is reloaded LAST.
+#   # Use this to let the trusted default assistant pick up config changes
+#   # across a fixed set of sibling profile gateways without hand-running
+#   # `restart` per bot.
+#   reload_profiles:
+#     - assistant_a
+#     - assistant_b
+#     - default        # optional; always reloaded last when present
+
+# =============================================================================
 # Toolsets
 # =============================================================================
 # Control which tools the agent has access to.

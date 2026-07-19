@@ -5351,6 +5351,15 @@ class TurnRunner:
             _output_toks = getattr(_agent, "session_completion_tokens", 0)
             _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
         _resolved_model = getattr(_agent, "model", None) if _agent else None
+        _resolved_provider = getattr(_agent, "provider", None) if _agent else None
+        _fallback_from = getattr(_agent, "_footer_fallback_from", None) if _agent else None
+        if _agent is not None:
+            # One-shot per turn: the footer reports a fallback only for the
+            # turn it happened in; next turn starts clean.
+            try:
+                _agent._footer_fallback_from = None
+            except Exception:
+                pass
 
         # Sync session_id immediately after run_conversation(). Compression
         # can rotate before a follow-up model call fails; the failure return
@@ -5486,6 +5495,8 @@ class TurnRunner:
                 "input_tokens": _input_toks,
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
+                "provider": _resolved_provider,
+                "fallback_from": _fallback_from,
                 "context_length": _context_length,
             }
 
@@ -5624,6 +5635,8 @@ class TurnRunner:
             "input_tokens": _input_toks,
             "output_tokens": _output_toks,
             "model": _resolved_model,
+            "provider": _resolved_provider,
+            "fallback_from": _fallback_from,
             "context_length": _context_length,
             "session_id": effective_session_id,
             "response_previewed": result.get("response_previewed", False),
@@ -17614,6 +17627,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     context_length=agent_result.get("context_length") or None,
                     cwd=os.environ.get("TERMINAL_CWD", ""),
                     turn_seconds=_turn_seconds,
+                    provider=agent_result.get("provider"),
+                    fallback_from=agent_result.get("fallback_from"),
                 )
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)

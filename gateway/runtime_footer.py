@@ -13,6 +13,7 @@ Config (``~/.hermes/config.yaml``)::
 
 Available fields:
     model        — bare model id, vendor prefix dropped (``gpt-5.4``)
+    provider     — compact provider label (``codex``)
     context_pct  — last-call context occupancy as a percent (``5%``)
     latency      — wall-clock duration of the turn (``22s``, ``1m05s``)
     cwd          — home-relative working dir (``~``)
@@ -60,6 +61,13 @@ def _model_short(model: Optional[str]) -> str:
     if not model:
         return ""
     return model.rsplit("/", 1)[-1]
+
+
+def _provider_short(provider: Optional[str]) -> str:
+    """Compact provider label (``openai-codex`` → ``codex``)."""
+    if not provider:
+        return ""
+    return {"openai-codex": "codex"}.get(provider, provider)
 
 
 def resolve_footer_config(
@@ -115,6 +123,8 @@ def format_runtime_footer(
     context_length: Optional[int],
     cwd: Optional[str] = None,
     turn_seconds: Optional[float] = None,
+    provider: Optional[str] = None,
+    fallback_from: Optional[str] = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
 ) -> str:
     """Render the footer line, or return "" if no fields have data.
@@ -127,7 +137,15 @@ def format_runtime_footer(
         if field == "model":
             m = _model_short(model)
             if m:
-                parts.append(m)
+                fb = _model_short(fallback_from)
+                if fb and fb != m:
+                    parts.append(f"{fb} → {m} (fallback)")
+                else:
+                    parts.append(m)
+        elif field == "provider":
+            p = _provider_short(provider)
+            if p:
+                parts.append(p)
         elif field == "context_pct":
             if context_length and context_length > 0 and context_tokens >= 0:
                 pct = max(0, min(100, round((context_tokens / context_length) * 100)))
@@ -157,6 +175,8 @@ def build_footer_line(
     context_length: Optional[int],
     cwd: Optional[str] = None,
     turn_seconds: Optional[float] = None,
+    provider: Optional[str] = None,
+    fallback_from: Optional[str] = None,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
 
@@ -177,5 +197,7 @@ def build_footer_line(
         context_length=context_length,
         cwd=cwd,
         turn_seconds=turn_seconds,
+        provider=provider,
+        fallback_from=fallback_from,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
     )

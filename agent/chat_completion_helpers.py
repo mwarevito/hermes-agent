@@ -2050,6 +2050,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             f"🔄 Switched to fallback model: {old_model} via {old_provider} "
             f"→ {fb_model} via {fb_provider}"
         )
+        # Remember the model we fell FROM so the runtime footer can render
+        # "primary → fallback". Only the first activation in a turn wins, so a
+        # chained fallback still points back at the original primary. Cleared
+        # by the gateway after each turn's footer is built.
+        if not getattr(agent, "_footer_fallback_from", None):
+            agent._footer_fallback_from = old_model
         logger.info(
             "Fallback activated: %s → %s (%s)",
             old_model, fb_model, fb_provider,

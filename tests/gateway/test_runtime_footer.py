@@ -317,3 +317,49 @@ def test_default_build_footer_line_ignores_turn_seconds(monkeypatch):
     with_timing = build_footer_line(**common, turn_seconds=125.0)
     assert baseline == "gpt-5.4 · 5% · /var/data"
     assert with_timing == baseline
+
+# ---------------------------------------------------------------------------
+# provider + fallback rendering
+# ---------------------------------------------------------------------------
+
+def test_footer_provider_field():
+    line = format_runtime_footer(
+        model="gpt-5.5", context_tokens=10, context_length=100,
+        provider="openai-codex", fields=["model", "provider", "context_pct"],
+    )
+    assert line == "gpt-5.5 · codex · 10%"
+
+
+def test_footer_provider_passthrough_for_unknown():
+    line = format_runtime_footer(
+        model="x", context_tokens=0, context_length=0,
+        provider="openrouter", fields=["provider"],
+    )
+    assert line == "openrouter"
+
+
+def test_footer_fallback_arrow():
+    line = format_runtime_footer(
+        model="anthropic/claude-haiku-4.5", context_tokens=33, context_length=100,
+        provider="openrouter", fallback_from="gpt-5.6-sol",
+        fields=["model", "provider", "context_pct"],
+    )
+    assert line == "gpt-5.6-sol → claude-haiku-4.5 (fallback) · openrouter · 33%"
+
+
+def test_footer_no_arrow_when_fallback_same_as_model():
+    line = format_runtime_footer(
+        model="gpt-5.5", context_tokens=0, context_length=0,
+        fallback_from="gpt-5.5", fields=["model"],
+    )
+    assert line == "gpt-5.5"
+
+
+def test_build_footer_line_passes_provider_and_fallback():
+    cfg = {"display": {"runtime_footer": {"enabled": True, "fields": ["model", "provider"]}}}
+    line = build_footer_line(
+        user_config=cfg, platform_key=None, model="anthropic/claude-haiku-4.5",
+        context_tokens=0, context_length=0,
+        provider="openrouter", fallback_from="gpt-5.5",
+    )
+    assert line == "gpt-5.5 → claude-haiku-4.5 (fallback) · openrouter"

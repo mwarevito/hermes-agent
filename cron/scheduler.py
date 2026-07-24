@@ -3023,6 +3023,13 @@ def run_job(
     # don't clobber each other's targets (os.environ is process-global).
     from gateway.session_context import set_session_vars, clear_session_vars, _VAR_MAP
 
+    # Mark this job's execution context as a cron session so the approval
+    # system can apply cron_mode. ContextVar, NOT os.environ: the scheduler
+    # shares its process with the gateway, and a process-wide env var leaked
+    # the cron marker into every later interactive session (their approvals
+    # then ran in cron_mode=deny -- e.g. execute_code hard-blocked in DMs).
+    _VAR_MAP["HERMES_CRON_SESSION"].set("1")
+
     # Cron execution is an internal scheduler context, not a live inbound
     # gateway message. Do not seed HERMES_SESSION_* contextvars from the
     # stored ``origin`` (which is delivery routing metadata, not a sender

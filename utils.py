@@ -31,7 +31,21 @@ def is_truthy_value(value: Any, default: bool = False) -> bool:
 
 
 def env_var_enabled(name: str, default: str = "") -> bool:
-    """Return True when an environment variable is set to a truthy value."""
+    """Return True when an environment variable is set to a truthy value.
+
+    Names registered in ``gateway.session_context._VAR_MAP`` resolve
+    ContextVar-first (falling back to ``os.environ`` only when the variable
+    was never set in this context). This keeps per-session markers like
+    ``HERMES_CRON_SESSION`` from leaking across sessions of a long-lived
+    gateway process; plain environment variables behave exactly as before.
+    """
+    try:
+        from gateway.session_context import _VAR_MAP, get_session_env
+
+        if name in _VAR_MAP:
+            return is_truthy_value(get_session_env(name, default), default=False)
+    except Exception:  # pragma: no cover - fail safe to plain os.environ
+        pass
     return is_truthy_value(os.getenv(name, default), default=False)
 
 

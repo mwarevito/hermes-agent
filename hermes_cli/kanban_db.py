@@ -9996,6 +9996,36 @@ def rewind_notify_cursor(
     return cur.rowcount > 0
 
 
+def claim_notify_ownership(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    profile: str,
+) -> bool:
+    """CAS-set ``notifier_profile`` for an ownerless subscription.
+
+    Stamps ``notifier_profile = profile`` only while the row is still
+    ownerless (``NULL`` or ``''``), so the first gateway that successfully
+    delivers an ownerless sub wins ownership and every other gateway then
+    skips it via the foreign-owner guard in the notifier watcher. No-op
+    (returns ``False``) when ``profile`` is empty or the row is already
+    owned. Returns ``True`` iff this call took ownership.
+    """
+    if not profile:
+        return False
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE kanban_notify_subs SET notifier_profile = ? "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND (notifier_profile IS NULL OR notifier_profile = '')",
+            (profile, task_id, platform, chat_id, thread_id or ""),
+        )
+    return cur.rowcount > 0
+
+
 # ---------------------------------------------------------------------------
 # Retention + garbage collection
 # ---------------------------------------------------------------------------

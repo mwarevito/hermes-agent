@@ -183,6 +183,17 @@ class GatewayKanbanWatchersMixin:
             self, "_kanban_sub_fail_counts", {}
         )
         self._kanban_sub_fail_counts = sub_fail_counts
+        # Ownerless (notifier_profile IS NULL/'') subscriptions that this
+        # gateway process cannot deliver to (wrong Telegram token / dead
+        # chat) are parked here after MAX_SEND_FAILURES so this process
+        # stops re-spinning against them every 5s. The DB row is KEPT —
+        # the true owner gateway (or the Batch-1 cron watchdog that reads
+        # task_events directly) can still deliver. In-memory per process
+        # (a restart re-tries), so it never permanently silences an event.
+        ownerless_skip: set[tuple] = getattr(
+            self, "_kanban_ownerless_skip", set()
+        )
+        self._kanban_ownerless_skip = ownerless_skip
         notifier_profile = getattr(self, "_kanban_notifier_profile", None)
         if not notifier_profile:
             notifier_profile = self._active_profile_name()
@@ -312,6 +323,22 @@ class GatewayKanbanWatchersMixin:
                                                 sub.get("task_id"), owner_profile, notifier_profile,
                                             )
                                             continue
+                                    # An ownerless sub that already exhausted its
+                                    # send budget in THIS process (dead chat for
+                                    # this gateway's token) is parked — skip it so
+                                    # we don't re-claim/re-fail every tick. The row
+                                    # stays in the DB for the true owner / watchdog.
+                                    sub_key = (
+                                        sub["task_id"], sub["platform"],
+                                        sub["chat_id"], sub.get("thread_id") or "",
+                                    )
+                                    if owner_profile is None and sub_key in self._kanban_ownerless_skip:
+                                        logger.debug(
+                                            "kanban notifier: ownerless subscription for %s parked "
+                                            "(undeliverable by this gateway); leaving row for owner/watchdog",
+                                            sub.get("task_id"),
+                                        )
+                                        continue
                                     platform = (sub.get("platform") or "").lower()
                                     if platform not in active_platforms:
                                         logger.debug(
@@ -341,6 +368,11 @@ class GatewayKanbanWatchersMixin:
                                         "events": events,
                                         "task": task,
                                         "board": slug,
+                                        # Raw ownership at collect time: truthy iff
+                                        # confirmed-owned by THIS gateway (foreign
+                                        # subs were already skipped above). Falsy =
+                                        # ownerless — never drop it on send failure.
+                                        "owner_profile": owner_profile,
                                     })
                                 except Exception as sub_exc:
                                     # Isolate per-subscription failures so one
@@ -581,13 +613,42 @@ class GatewayKanbanWatchersMixin:
                                 MAX_SEND_FAILURES, exc,
                             )
                             if fails >= MAX_SEND_FAILURES:
-                                logger.warning(
-                                    "kanban notifier: dropping subscription "
-                                    "%s on %s after %d consecutive send failures",
-                                    sub["task_id"], platform_str, fails,
-                                )
-                                await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
-                                sub_fail_counts.pop(sub_key, None)
+                                if d.get("owner_profile"):
+                                    # Confirmed-owned by THIS gateway: the chat
+                                    # really is dead (this token is the one that
+                                    # should reach it), so dropping the sub is
+                                    # correct — stops spinning against a dead chat.
+                                    logger.warning(
+                                        "kanban notifier: dropping subscription "
+                                        "%s on %s after %d consecutive send failures",
+                                        sub["task_id"], platform_str, fails,
+                                    )
+                                    await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
+                                    sub_fail_counts.pop(sub_key, None)
+                                else:
+                                    # OWNERLESS sub: another gateway (the real
+                                    # owner) may still be able to deliver, and
+                                    # the Batch-1 cron watchdog reads task_events
+                                    # directly. NEVER delete the row here (that
+                                    # is the 2026-07-27 silent-loss bug). Park it
+                                    # in the in-memory skip set so THIS process
+                                    # stops re-spinning, and rewind the claim so
+                                    # the event stays unseen for whoever can deliver.
+                                    logger.warning(
+                                        "kanban notifier: parking ownerless subscription "
+                                        "%s on %s after %d consecutive send failures "
+                                        "(row kept for owner/watchdog)",
+                                        sub["task_id"], platform_str, fails,
+                                    )
+                                    self._kanban_ownerless_skip.add(sub_key)
+                                    sub_fail_counts.pop(sub_key, None)
+                                    await asyncio.to_thread(
+                                        self._kanban_rewind,
+                                        sub,
+                                        d["cursor"],
+                                        d.get("old_cursor", 0),
+                                        board_slug,
+                                    )
                             else:
                                 await asyncio.to_thread(
                                     self._kanban_rewind,
@@ -598,7 +659,8 @@ class GatewayKanbanWatchersMixin:
                                 )
                             # Rewind the pre-send claim on transient failure so
                             # a later tick can retry. After too many failures,
-                            # dropping the subscription is the terminal action.
+                            # an OWNED subscription is dropped; an ownerless one
+                            # is parked (row kept) — never silently deleted.
                             break
                     else:
                         # All text pings delivered (or intentionally skipped
@@ -703,6 +765,26 @@ class GatewayKanbanWatchersMixin:
                             # Nothing left to deliver on this path (the wake,
                             # if any, already succeeded above).
                             sub_fail_counts.pop(sub_key, None)
+                        # Adopt an ownerless sub on its first successful
+                        # delivery: CAS-stamp notifier_profile to THIS gateway
+                        # so it converges to the single process that can
+                        # actually reach this chat. Every other gateway then
+                        # skips it via the foreign-owner guard in _collect —
+                        # closing the window where multiple gateways all race
+                        # (and non-owners silently drop) the same ownerless sub.
+                        if not d.get("owner_profile"):
+                            try:
+                                await asyncio.to_thread(
+                                    self._kanban_claim_ownership,
+                                    sub,
+                                    notifier_profile,
+                                    board_slug,
+                                )
+                            except Exception as own_exc:
+                                logger.debug(
+                                    "kanban notifier: ownership adopt for %s failed: %s",
+                                    sub["task_id"], own_exc,
+                                )
                         # Unsubscribe only when the task has reached a truly
                         # final status (done / archived). For blocked /
                         # gave_up / crashed / timed_out the subscription is
@@ -837,6 +919,28 @@ class GatewayKanbanWatchersMixin:
                 thread_id=sub.get("thread_id") or "",
                 claimed_cursor=claimed_cursor,
                 old_cursor=old_cursor,
+            )
+        finally:
+            conn.close()
+
+    def _kanban_claim_ownership(
+        self, sub: dict, notifier_profile: str, board: Optional[str] = None,
+    ) -> bool:
+        """Sync helper: CAS-stamp notifier_profile on an ownerless sub.
+
+        Runs in to_thread. No-op if the row is already owned (some other
+        gateway won the race) or ``notifier_profile`` is empty.
+        """
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            return _kb.claim_notify_ownership(
+                conn,
+                task_id=sub["task_id"],
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+                profile=notifier_profile,
             )
         finally:
             conn.close()

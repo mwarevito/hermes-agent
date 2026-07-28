@@ -3895,7 +3895,22 @@ class TelegramAdapter(BasePlatformAdapter):
             self._app.add_handler(BusinessMessagesDeletedHandler(self._handle_business_messages_deleted))  # type: ignore[misc]
             # Handle inline keyboard button callbacks (update prompts)
             self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
-            
+
+            # Register a generic approval-card sender so in-process producers
+            # (e.g. the prod-approvals gate running in a tool_execution
+            # middleware) can push interactive cards to a bound chat/thread and
+            # receive the button click through _handle_callback_query's generic
+            # dispatch. Bound to this adapter's running event loop.
+            try:
+                from gateway.approval_cards import register_card_sender
+                self._card_loop = asyncio.get_running_loop()
+                register_card_sender(Platform.TELEGRAM.value, self._card_sender_sync)
+            except Exception:
+                logger.debug(
+                    "[%s] approval-card sender registration skipped",
+                    self.name, exc_info=True,
+                )
+
             # Start polling — retry initialize() for transient TLS resets.
             # Each attempt is capped by _init_timeout so a single unreachable
             # fallback-IP chain can't block startup indefinitely.
@@ -4387,6 +4402,14 @@ class TelegramAdapter(BasePlatformAdapter):
             pass
 
         await self._cancel_pending_delivery_tasks()
+
+        # Drop the generic approval-card sender bound to this (now closing) loop.
+        try:
+            from gateway.approval_cards import unregister_card_sender
+            unregister_card_sender(Platform.TELEGRAM.value, self._card_sender_sync)
+        except Exception:
+            pass
+        self._card_loop = None
 
         if self._app:
             try:
@@ -5524,6 +5547,82 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_exec_approval failed: %s", self.name, _redact_telegram_error_text(e))
             return SendResult(success=False, error=_redact_telegram_error_text(e))
 
+    async def send_action_card(self, card: Any) -> "SendResult":
+        """Deliver a generic interactive approval card (gateway.approval_cards).
+
+        Renders ``card.buttons`` (rows of ``(label, callback_data)``) as an
+        inline keyboard and sends ``card.text`` to ``card.chat_id`` / optional
+        ``card.thread_id``. Button clicks arrive at ``_handle_callback_query``
+        and are routed to the owning plugin via ``dispatch_gateway_action``.
+        """
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        try:
+            rows = []
+            for brow in (card.buttons or []):
+                built = [
+                    InlineKeyboardButton(label, callback_data=data)
+                    for (label, data) in brow
+                    if label and data
+                ]
+                if built:
+                    rows.append(built)
+            keyboard = InlineKeyboardMarkup(rows) if rows else None
+
+            text = _html.escape(str(card.text or ""))
+            metadata = {"thread_id": card.thread_id} if getattr(card, "thread_id", "") else None
+            thread_id = self._metadata_thread_id(metadata)
+            kwargs: Dict[str, Any] = {
+                "chat_id": int(card.chat_id),
+                "text": text,
+                "parse_mode": ParseMode.HTML,
+                "reply_markup": keyboard,
+                **self._link_preview_kwargs(),
+            }
+            kwargs.update(
+                self._thread_kwargs_for_send(
+                    str(card.chat_id),
+                    thread_id,
+                    metadata,
+                    reply_to_message_id=None,
+                    reply_to_mode=self._reply_to_mode,
+                )
+            )
+            msg = await self._send_message_with_thread_fallback(**kwargs)
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            logger.warning("[%s] send_action_card failed: %s", self.name, e)
+            return SendResult(success=False, error=str(e))
+
+    def _card_sender_sync(self, card: Any) -> bool:
+        """Sync bridge used by ``gateway.approval_cards.deliver_card``.
+
+        Called from the agent/tool-execution thread; schedules the async send
+        onto this adapter's captured event loop and waits briefly. Returns True
+        iff the card was delivered. Never raises — a False return lets the
+        producer fall back and (for a security gate) still fail closed.
+        """
+        if not self._bot:
+            return False
+        loop = getattr(self, "_card_loop", None)
+        if loop is None:
+            return False
+        from agent.async_utils import safe_schedule_threadsafe
+
+        fut = safe_schedule_threadsafe(
+            self.send_action_card(card),
+            loop,
+            logger=logger,
+            log_message="send_action_card scheduling error",
+        )
+        if fut is None:
+            return False
+        try:
+            res = fut.result(timeout=15)
+        except Exception:
+            return False
+        return bool(getattr(res, "success", False))
+
     async def send_slash_confirm(
         self, chat_id: str, title: str, message: str, session_key: str,
         confirm_id: str, metadata: Optional[Dict[str, Any]] = None,
@@ -6656,6 +6755,70 @@ class TelegramAdapter(BasePlatformAdapter):
                         "Telegram clarify button: resolve_gateway_clarify returned False (id=%s)",
                         clarify_id,
                     )
+            return
+
+        # --- Plugin-registered gateway actions (e.g. prod-approvals pa:*) ---
+        # Generic inline-button dispatch: any plugin that registered a
+        # callback_data prefix via ctx.register_gateway_action_handler resolves
+        # its own click here, after the gateway's own authorization check.
+        try:
+            from hermes_cli.plugins import (
+                get_gateway_action_handlers,
+                dispatch_gateway_action,
+            )
+            _gw_handlers = get_gateway_action_handlers()
+        except Exception:
+            _gw_handlers = []
+        if _gw_handlers and any(data.startswith(p) for (p, _cb, _pl) in _gw_handlers):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to approve this.")
+                return
+            clicker = {
+                "platform": Platform.TELEGRAM.value,
+                "chat_id": str(query_chat_id) if query_chat_id is not None else "",
+                "thread_id": str(query_thread_id) if query_thread_id is not None else "",
+                "user_id": caller_id,
+                "user_name": query_user_name or "",
+            }
+            try:
+                result = dispatch_gateway_action(data, clicker)
+            except Exception as exc:
+                logger.error(
+                    "[%s] gateway action dispatch failed: %s", self.name, exc, exc_info=True,
+                )
+                result = None
+            if result is None:
+                await query.answer(text="This action was already resolved or is not recognized.")
+                return
+            if isinstance(result, dict):
+                answer_text = result.get("answer_text", "") or "Done"
+                edit_text = result.get("edit_text")
+                remove_buttons = result.get("remove_buttons", True)
+            else:
+                answer_text = getattr(result, "answer_text", "") or "Done"
+                edit_text = getattr(result, "edit_text", None)
+                remove_buttons = getattr(result, "remove_buttons", True)
+            await query.answer(text=str(answer_text)[:200])
+            if edit_text is not None:
+                try:
+                    await query.edit_message_text(
+                        text=self.format_message(str(edit_text)),
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                        reply_markup=None if remove_buttons else (
+                            query.message.reply_markup if query.message else None
+                        ),
+                    )
+                except Exception:
+                    pass  # non-fatal if edit fails
+            if query_chat_id is not None:
+                self.resume_typing_for_chat(str(query_chat_id))
             return
 
         # --- Update prompt callbacks ---

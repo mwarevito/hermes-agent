@@ -1059,6 +1059,55 @@ class PluginContext:
             action_id,
         )
 
+    # -- generic gateway action handler (inline-button clicks) --------------
+
+    def register_gateway_action_handler(
+        self,
+        prefix: str,
+        callback: Callable,
+    ) -> None:
+        """Register a handler for platform inline-button clicks (callback data).
+
+        This is the platform-agnostic sibling of
+        :meth:`register_slack_action_handler`. Gateway adapters that support
+        inline keyboards (e.g. Telegram) route a button click whose
+        ``callback_data`` starts with *prefix* to the registered *callback*
+        after their own authorization check.
+
+        Callback signature::
+
+            def handler(data: str, clicker: dict) -> GatewayActionResult | dict | None
+
+        where ``data`` is the full callback_data string and ``clicker`` carries
+        the authoritative identity of whoever clicked (``platform``, ``chat_id``,
+        ``thread_id``, ``user_id``). Returning ``None`` means "not handled".
+
+        Args:
+            prefix: The callback_data prefix this plugin owns (e.g. ``"pa:"``).
+            callback: Callable receiving ``(data, clicker)``.
+
+        Raises:
+            ValueError: if *callback* is not callable or *prefix* is empty.
+        """
+        if not callable(callback):
+            raise ValueError(
+                f"Plugin '{self.manifest.name}' tried to register a gateway "
+                f"action handler with a non-callable callback."
+            )
+        if not prefix or not str(prefix).strip():
+            raise ValueError(
+                f"Plugin '{self.manifest.name}' tried to register a gateway "
+                f"action handler with an empty prefix."
+            )
+        self._manager._gateway_action_handlers.append(
+            (str(prefix), callback, self.manifest.name)
+        )
+        logger.debug(
+            "Plugin %s registered gateway action handler: %s",
+            self.manifest.name,
+            prefix,
+        )
+
     # -- hook registration --------------------------------------------------
 
     # -- auxiliary task registration ---------------------------------------
@@ -1290,10 +1339,39 @@ class PluginManager:
         # ``re.Pattern``, or a constraint dict); ``callback`` is an async
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
+        # Generic gateway inline-button action handlers registered by plugins.
+        # Each entry is (prefix, callback, plugin_name); a gateway adapter that
+        # supports inline keyboards routes a button click whose callback_data
+        # starts with ``prefix`` to ``callback(data, clicker)``. Platform-
+        # agnostic sibling of ``_slack_action_handlers``.
+        self._gateway_action_handlers: List[tuple] = []
 
     # -----------------------------------------------------------------------
     # Public
     # -----------------------------------------------------------------------
+
+    def dispatch_gateway_action(self, data: str, clicker: Dict[str, Any]) -> Any:
+        """Route an inline-button ``callback_data`` to a plugin handler.
+
+        Returns the handler's result (a ``GatewayActionResult``/dict) or
+        ``None`` if no registered prefix matched or the handler declined.
+        Each handler is isolated: an exception is logged and treated as
+        unhandled rather than propagating into the gateway callback loop.
+        """
+        for prefix, callback, plugin_name in list(self._gateway_action_handlers):
+            if not data.startswith(prefix):
+                continue
+            try:
+                result = callback(data, clicker)
+            except Exception:
+                logger.warning(
+                    "Gateway action handler %s (%s) raised for data prefix %r",
+                    plugin_name, prefix, prefix, exc_info=True,
+                )
+                return None
+            if result is not None:
+                return result
+        return None
 
     def discover_and_load(self, force: bool = False) -> None:
         """Scan all plugin sources and load each plugin found.
@@ -1319,6 +1397,7 @@ class PluginManager:
             self._plugin_skills.clear()
             self._aux_tasks.clear()
             self._slack_action_handlers.clear()
+            self._gateway_action_handlers.clear()
             self._context_engine = None
         # Set the flag up front as a re-entrancy guard (a plugin's register()
         # can transitively trigger discovery again), but reset it if the sweep
@@ -2365,6 +2444,20 @@ def get_plugin_command_handler(name: str) -> Optional[Callable]:
     """Return the handler for a plugin-registered slash command, or ``None``."""
     entry = _ensure_plugins_discovered()._plugin_commands.get(name)
     return entry["handler"] if entry else None
+
+
+def get_gateway_action_handlers() -> List[tuple]:
+    """Return registered ``(prefix, callback, plugin_name)`` gateway handlers."""
+    return list(_ensure_plugins_discovered()._gateway_action_handlers)
+
+
+def dispatch_gateway_action(data: str, clicker: Dict[str, Any]) -> Any:
+    """Module-level convenience: route an inline-button click to a plugin.
+
+    Triggers idempotent discovery so gateway adapters can dispatch without a
+    prior explicit discover call. Returns the handler result or ``None``.
+    """
+    return _ensure_plugins_discovered().dispatch_gateway_action(data, clicker)
 
 
 _PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS = 30.0

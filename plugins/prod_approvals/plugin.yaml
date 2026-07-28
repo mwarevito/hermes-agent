@@ -1,0 +1,9 @@
+name: prod-approvals
+version: 0.1.0
+description: "Task-scoped one-tap / bundle approval for custom production-write gates (Railway variable-set, restart, read-only verify). Structural action classifier + durable fenced SQLite store + nonce-scoped /approve-prod. Fail-closed backstop shell hook is the floor when the plugin is not loaded."
+author: NousResearch
+kind: standalone
+platforms:
+  - linux
+  - macos
+hooks: []

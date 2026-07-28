@@ -555,3 +555,402 @@ async def test_rich_reply_records_and_recovers_text(monkeypatch, tmp_path):
     assert event.reply_to_text == "Your morning briefing: CI is green."
 
 
+@pytest.mark.asyncio
+async def test_rich_reply_lookup_miss_leaves_text_none(monkeypatch, tmp_path):
+    """No recorded entry -> reply_to_text stays None, no crash."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway.platforms.base import MessageType
+
+    adapter = _make_adapter()
+    event = adapter._build_message_event(
+        _reply_message("404"), MessageType.TEXT,
+    )
+    assert event.reply_to_message_id == "404"
+    assert event.reply_to_text is None
+
+
+@pytest.mark.asyncio
+async def test_rich_reply_native_quote_wins_over_lookup(monkeypatch, tmp_path):
+    """A native partial quote takes precedence over the send-time index."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway.platforms.base import MessageType
+    from gateway import rich_sent_store
+
+    rich_sent_store.record("12345", "678", "full recorded body")
+    adapter = _make_adapter()
+    event = adapter._build_message_event(
+        _reply_message("678", quote_text="just this part"), MessageType.TEXT,
+    )
+    assert event.reply_to_text == "just this part"
+
+
+@pytest.mark.asyncio
+async def test_rich_reply_caption_wins_over_lookup(monkeypatch, tmp_path):
+    """When Telegram DOES echo a caption, it wins over the index fallback."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway.platforms.base import MessageType
+    from gateway import rich_sent_store
+
+    rich_sent_store.record("12345", "678", "recorded body")
+    adapter = _make_adapter()
+    event = adapter._build_message_event(
+        _reply_message("678", reply_caption="echoed caption"), MessageType.TEXT,
+    )
+    assert event.reply_to_text == "echoed caption"
+
+
+# --------------------------------------------------------------------------
+# Channel-origin rich-reply recovery: a rich message posted to a channel and
+# forwarded into another chat is recorded under the ORIGIN's
+# (chat_id, message_id). A reply to the forwarded copy has a different local
+# message id in a different chat, so recovery must resolve via the
+# authoritative channel forward origin. Only MessageOriginChannel is
+# authoritative — user/hidden/chat/malformed origins never resolve cross-chat.
+# --------------------------------------------------------------------------
+
+
+def _forwarded_reply_message(
+    *,
+    current_chat_id,
+    local_reply_id,
+    forward_origin=None,
+    to_dict=None,
+    api_kwargs=None,
+    forward_from_chat=None,
+    forward_from_message_id=None,
+    reply_text=None,
+    reply_caption=None,
+    quote_text=None,
+):
+    """Inbound reply, in ``current_chat_id``, to a forwarded message."""
+    replied = SimpleNamespace(
+        message_id=int(local_reply_id),
+        text=reply_text,
+        caption=reply_caption,
+        forward_origin=forward_origin,
+        forward_from_chat=forward_from_chat,
+        forward_from_message_id=forward_from_message_id,
+        api_kwargs=api_kwargs,
+    )
+    if to_dict is not None:
+        replied.to_dict = lambda: to_dict
+    quote = SimpleNamespace(text=quote_text) if quote_text is not None else None
+    return SimpleNamespace(
+        message_id=999,
+        chat=SimpleNamespace(
+            id=current_chat_id, type="supergroup", title="Feed group", full_name=None
+        ),
+        from_user=SimpleNamespace(
+            id=42, username="u", first_name="U", last_name=None,
+            full_name="U", is_bot=False,
+        ),
+        text="what did this mean?",
+        caption=None,
+        reply_to_message=replied,
+        quote=quote,
+        message_thread_id=None,
+        is_topic_message=False,
+        entities=[],
+        date=None,
+    )
+
+
+def _channel_origin(chat_id, message_id):
+    return SimpleNamespace(
+        type="channel",
+        chat=SimpleNamespace(id=chat_id),
+        message_id=message_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_forwarded_channel_rich_reply_recovers_from_origin(monkeypatch, tmp_path):
+    """Reply to a forwarded channel post recovers via (origin chat, origin id)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway.platforms.base import MessageType
+    from gateway import rich_sent_store
+
+    # Rich message was posted to channel -100123 as message 678.
+    rich_sent_store.record("-100123", "678", "channel briefing body")
+    adapter = _make_adapter()
+
+    # The forwarded copy lives in the discussion group -100999 as a DIFFERENT
+    # local message id (555); same-chat lookup on (-100999, 555) misses.
+    event = adapter._build_message_event(
+        _forwarded_reply_message(
+            current_chat_id=-100999,
+            local_reply_id=555,
+            forward_origin=_channel_origin(-100123, 678),
+        ),
+        MessageType.TEXT,
+    )
+    assert event.reply_to_message_id == "555"
+    assert event.reply_to_text == "channel briefing body"
+
+
+@pytest.mark.asyncio
+async def test_forwarded_channel_rich_reply_recovers_from_raw_shape(monkeypatch, tmp_path):
+    """Recovery also works from the raw serialized forward_origin dict."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway.platforms.base import MessageType
+    from gateway import rich_sent_store
+
+    rich_sent_store.record("-100123", "678", "channel briefing body")
+    adapter = _make_adapter()
+
+    # No forward_origin object; only the raw to_dict() serialized shape.
+    event = adapter._build_message_event(
+        _forwarded_reply_message(
+            current_chat_id=-100999,
+            local_reply_id=555,
+            forward_origin=None,
+            to_dict={
+                "message_id": 555,
+                "forward_origin": {
+                    "type": "channel",
+                    "chat": {"id": -100123},
+                    "message_id": 678,
+                },
+            },
+        ),
+        MessageType.TEXT,
+    )
+    assert event.reply_to_text == "channel briefing body"
+
+
+@pytest.mark.asyncio
+async def test_forwarded_channel_rich_reply_recovers_from_legacy_fields(monkeypatch, tmp_path):
+    """Legacy forward_from_chat + forward_from_message_id also recover."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway.platforms.base import MessageType
+    from gateway import rich_sent_store
+
+    rich_sent_store.record("-100123", "678", "channel briefing body")
+    adapter = _make_adapter()
+
+    event = adapter._build_message_event(
+        _forwarded_reply_message(
+            current_chat_id=-100999,
+            local_reply_id=555,
+            forward_origin=None,
+            forward_from_chat=SimpleNamespace(id=-100123, type="channel"),
+            forward_from_message_id=678,
+        ),
+        MessageType.TEXT,
+    )
+    assert event.reply_to_text == "channel briefing body"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "origin",
+    [
+        # MessageOriginUser — no message id, not authoritative.
+        SimpleNamespace(type="user", sender_user=SimpleNamespace(id=-100123)),
+        # MessageOriginHiddenUser — sender name only.
+        SimpleNamespace(type="hidden_user", sender_user_name="X"),
+        # MessageOriginChat — sender_chat but NO message id.
+        SimpleNamespace(type="chat", sender_chat=SimpleNamespace(id=-100123)),
+        # Malformed channel origin — missing message id.
+        SimpleNamespace(type="channel", chat=SimpleNamespace(id=-100123), message_id=None),
+        # Malformed channel origin — missing chat.
+        SimpleNamespace(type="channel", chat=None, message_id=678),
+    ],
+)
+async def test_non_channel_or_malformed_origin_never_recovers(monkeypatch, tmp_path, origin):
+    """User/hidden/chat/malformed origins never resolve text cross-chat."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway.platforms.base import MessageType
+    from gateway import rich_sent_store
+
+    # Text recorded under -100123:678 must NOT leak into the -100999 group via
+    # a non-authoritative origin (privacy / message-id collision boundary).
+    rich_sent_store.record("-100123", "678", "private channel body")
+    adapter = _make_adapter()
+
+    event = adapter._build_message_event(
+        _forwarded_reply_message(
+            current_chat_id=-100999,
+            local_reply_id=678,  # collision: same numeric id, different chat
+            forward_origin=origin,
+        ),
+        MessageType.TEXT,
+    )
+    assert event.reply_to_text is None
+
+
+@pytest.mark.asyncio
+async def test_forwarded_channel_native_quote_wins_over_origin(monkeypatch, tmp_path):
+    """A native partial quote still beats channel-origin recovery."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway.platforms.base import MessageType
+    from gateway import rich_sent_store
+
+    rich_sent_store.record("-100123", "678", "full channel body")
+    adapter = _make_adapter()
+
+    event = adapter._build_message_event(
+        _forwarded_reply_message(
+            current_chat_id=-100999,
+            local_reply_id=555,
+            forward_origin=_channel_origin(-100123, 678),
+            quote_text="just this slice",
+        ),
+        MessageType.TEXT,
+    )
+    assert event.reply_to_text == "just this slice"
+
+
+# --------------------------------------------------------------------------
+# Cron-feed send bypass: scheduled cron deliveries carry cron_delivery=True so
+# the adapter uses legacy sendMessage (real text survives forwarding/reply)
+# rather than a rich message. Ordinary sends still go rich.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cron_delivery_metadata_bypasses_rich_send():
+    adapter = _make_adapter()
+
+    result = await adapter.send(
+        "12345", RICH_CONTENT, metadata={"cron_delivery": True},
+    )
+
+    assert result.success is True
+    # Legacy path only — rich endpoint untouched.
+    adapter._bot.do_api_request.assert_not_called()
+    adapter._bot.send_message.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ordinary_send_still_uses_rich():
+    adapter = _make_adapter()
+
+    result = await adapter.send("12345", RICH_CONTENT, metadata={})
+
+    assert result.success is True
+    adapter._bot.do_api_request.assert_awaited_once()
+    adapter._bot.send_message.assert_not_called()
+
+
+# --------------------------------------------------------------------------
+# Explicit privacy-boundary proofs for channel-origin recovery. The positive
+# tests above prove the path fires when it should; these prove it does NOT
+# leak across the store's trust boundaries: per-account (HERMES_HOME) store
+# isolation, cache miss / eviction / restart, and malformed / non-authoritative
+# RAW (api_kwargs / to_dict) origins.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_channel_origin_across_separate_hermes_home_stores_cannot_cross(
+    monkeypatch, tmp_path
+):
+    """A (chat_id, message_id) recorded under one HERMES_HOME never resolves
+    under a different HERMES_HOME (separate account/profile store)."""
+    from gateway.platforms.base import MessageType
+    from gateway import rich_sent_store
+
+    home_a = tmp_path / "account_a"
+    home_b = tmp_path / "account_b"
+
+    # Account A recorded the rich channel post.
+    monkeypatch.setenv("HERMES_HOME", str(home_a))
+    rich_sent_store.record("-100123", "678", "account A private body")
+
+    # Account B (different store) must not see it — same channel+message tuple.
+    monkeypatch.setenv("HERMES_HOME", str(home_b))
+    adapter = _make_adapter()
+    event = adapter._build_message_event(
+        _forwarded_reply_message(
+            current_chat_id=-100999,
+            local_reply_id=555,
+            forward_origin=_channel_origin(-100123, 678),
+        ),
+        MessageType.TEXT,
+    )
+    assert event.reply_to_text is None
+
+    # Sanity: under account A's store the SAME reply DOES resolve — proves the
+    # None above is store isolation, not a broken origin/helper (non-vacuous).
+    monkeypatch.setenv("HERMES_HOME", str(home_a))
+    event_a = adapter._build_message_event(
+        _forwarded_reply_message(
+            current_chat_id=-100999,
+            local_reply_id=555,
+            forward_origin=_channel_origin(-100123, 678),
+        ),
+        MessageType.TEXT,
+    )
+    assert event_a.reply_to_text == "account A private body"
+
+
+@pytest.mark.asyncio
+async def test_channel_origin_cache_miss_returns_none(monkeypatch, tmp_path):
+    """A well-formed channel origin whose tuple is absent from the store
+    (eviction / restart / never-recorded) resolves to None, not a leak."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway.platforms.base import MessageType
+    from gateway import rich_sent_store
+
+    # A DIFFERENT channel message is in the store; the replied-to tuple is not.
+    rich_sent_store.record("-100123", "999", "some other channel body")
+    adapter = _make_adapter()
+
+    event = adapter._build_message_event(
+        _forwarded_reply_message(
+            current_chat_id=-100999,
+            local_reply_id=555,
+            forward_origin=_channel_origin(-100123, 678),  # not recorded
+        ),
+        MessageType.TEXT,
+    )
+    assert event.reply_to_text is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("carrier", ["api_kwargs", "to_dict"])
+@pytest.mark.parametrize(
+    "raw_origin",
+    [
+        # Malformed channel — missing message_id.
+        {"type": "channel", "chat": {"id": -100123}},
+        # Malformed channel — missing chat.
+        {"type": "channel", "message_id": 678},
+        # Malformed channel — chat present but no id.
+        {"type": "channel", "chat": {}, "message_id": 678},
+        # Non-authoritative raw user origin.
+        {"type": "user", "sender_user": {"id": -100123}},
+        # Non-authoritative raw hidden_user origin.
+        {"type": "hidden_user", "sender_user_name": "X"},
+        # Non-authoritative raw chat origin (no message id).
+        {"type": "chat", "sender_chat": {"id": -100123}},
+    ],
+)
+async def test_raw_malformed_or_nonauthoritative_origin_never_recovers(
+    monkeypatch, tmp_path, carrier, raw_origin
+):
+    """Raw serialized (api_kwargs / to_dict) origins that are malformed channel
+    or non-channel never trigger a cross-chat lookup, even on an id collision."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway.platforms.base import MessageType
+    from gateway import rich_sent_store
+
+    # Text under -100123:678 must not leak into -100999 via a raw origin.
+    rich_sent_store.record("-100123", "678", "private channel body")
+    adapter = _make_adapter()
+
+    kwargs = dict(
+        current_chat_id=-100999,
+        local_reply_id=678,  # collision: same numeric id, different chat
+        forward_origin=None,
+    )
+    if carrier == "api_kwargs":
+        kwargs["api_kwargs"] = {"forward_origin": raw_origin}
+    else:
+        kwargs["to_dict"] = {"message_id": 678, "forward_origin": raw_origin}
+
+    event = adapter._build_message_event(
+        _forwarded_reply_message(**kwargs), MessageType.TEXT,
+    )
+    assert event.reply_to_text is None

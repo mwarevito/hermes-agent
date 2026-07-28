@@ -1714,8 +1714,17 @@ class TelegramAdapter(BasePlatformAdapter):
     def _should_attempt_rich(
         self, content: str, metadata: Optional[Dict[str, Any]] = None
     ) -> bool:
+        md = metadata or {}
+        # Cron auto-deliveries to a feed chat must carry real text: Telegram
+        # does NOT propagate a rich message's content through a forward/reply
+        # (a reply to a forwarded rich post arrives with empty text), so a
+        # bot-authored cron feed that fans out via forwarding would lose its
+        # body. Force those deliveries onto the legacy sendMessage/MarkdownV2
+        # path (flag set at the cron delivery boundary). Ordinary sends are
+        # unaffected — rich is NOT disabled globally.
         return bool(
-            not (metadata or {}).get("expect_edits")
+            not md.get("expect_edits")
+            and not md.get("cron_delivery")
             and self._rich_eligible(content)
         )
 
@@ -8868,6 +8877,88 @@ class TelegramAdapter(BasePlatformAdapter):
                         payload[key] = message_dict[key]
         return payload
 
+    @staticmethod
+    def _normalize_message_origin_type(value) -> str:
+        """Lower-case leaf of a MessageOrigin ``type`` (enum, str, or None)."""
+        return str(getattr(value, "value", value) or "").split(".")[-1].lower()
+
+    @classmethod
+    def _telegram_channel_forward_origin(cls, reply_message) -> Optional[tuple]:
+        """Authoritative ``(chat_id, message_id)`` for a forwarded channel reply.
+
+        A rich message posted to a channel and then forwarded into another
+        chat cannot echo its own content on reply (see
+        :mod:`gateway.rich_sent_store`), so recovery must key on the ORIGIN's
+        own ``(chat_id, message_id)`` — the pair we recorded at send time.
+
+        Only ``MessageOriginChannel`` exposes BOTH an authoritative source
+        chat id AND a message id. ``MessageOriginUser`` /
+        ``MessageOriginHiddenUser`` / ``MessageOriginChat`` carry no message
+        id (and no cross-chat-safe chat id), so this returns ``None`` for
+        them — the caller must never resolve text across a privacy or
+        message-id-collision boundary. Malformed origins (missing chat id or
+        message id) also return ``None``.
+
+        Handles the PTB ``forward_origin`` object, the raw
+        ``api_kwargs``/``to_dict()`` dict shape (older/partial PTB models), and
+        the legacy ``forward_from_chat`` + ``forward_from_message_id`` pair.
+        """
+        if reply_message is None:
+            return None
+
+        # 1) PTB MessageOrigin object.
+        origin = getattr(reply_message, "forward_origin", None)
+        if origin is not None and cls._normalize_message_origin_type(
+            getattr(origin, "type", None)
+        ) == "channel":
+            chat_id = getattr(getattr(origin, "chat", None), "id", None)
+            message_id = getattr(origin, "message_id", None)
+            if chat_id is not None and message_id is not None:
+                return str(chat_id), str(message_id)
+
+        # 2) Raw serialized shape (api_kwargs or to_dict) — for PTB builds that
+        #    don't fully model forward_origin as an object.
+        raw_origin = None
+        api_kwargs = getattr(reply_message, "api_kwargs", None)
+        if isinstance(api_kwargs, dict) and isinstance(
+            api_kwargs.get("forward_origin"), dict
+        ):
+            raw_origin = api_kwargs["forward_origin"]
+        if raw_origin is None:
+            to_dict = getattr(reply_message, "to_dict", None)
+            if callable(to_dict):
+                try:
+                    message_dict = to_dict()
+                except Exception:
+                    message_dict = None
+                if isinstance(message_dict, dict) and isinstance(
+                    message_dict.get("forward_origin"), dict
+                ):
+                    raw_origin = message_dict["forward_origin"]
+        if isinstance(raw_origin, dict) and cls._normalize_message_origin_type(
+            raw_origin.get("type")
+        ) == "channel":
+            chat = raw_origin.get("chat")
+            chat_id = chat.get("id") if isinstance(chat, dict) else None
+            message_id = raw_origin.get("message_id")
+            if chat_id is not None and message_id is not None:
+                return str(chat_id), str(message_id)
+
+        # 3) Legacy pre-forward_origin fields (older Bot API payloads).
+        legacy_chat = getattr(reply_message, "forward_from_chat", None)
+        legacy_message_id = getattr(reply_message, "forward_from_message_id", None)
+        if (
+            legacy_chat is not None
+            and legacy_message_id is not None
+            and cls._normalize_message_origin_type(getattr(legacy_chat, "type", None))
+            == "channel"
+        ):
+            chat_id = getattr(legacy_chat, "id", None)
+            if chat_id is not None:
+                return str(chat_id), str(legacy_message_id)
+
+        return None
+
     @classmethod
     def _telegram_api_kwargs_quote_text(cls, message: Message) -> Optional[str]:
         quote = cls._telegram_raw_payload(message).get("quote")
@@ -10469,11 +10560,31 @@ class TelegramAdapter(BasePlatformAdapter):
                     # older/unrecoverable reply payloads.
                     reply_to_text = self._extract_rich_reply_text(message.reply_to_message)
                 if not reply_to_text:
+                    # Rich messages (sendRichMessage — the launchd briefings and
+                    # the gateway's own rich finals) are NOT echoed with their
+                    # content in reply_to_message; Telegram sends no text,
+                    # caption, or api_kwargs for them. Recover the text we sent
+                    # from our local send-time index, keyed by message id.
+                    #
+                    # Only replies in the SAME chat resolve directly. A rich
+                    # message posted to a channel and forwarded into another
+                    # chat is recorded under the ORIGIN's (chat_id, message_id),
+                    # so recover it via the authoritative channel forward origin
+                    # (never user/hidden/chat origins — see
+                    # _telegram_channel_forward_origin).
                     try:
                         from gateway import rich_sent_store
                         reply_to_text = rich_sent_store.lookup(
                             str(chat.id), reply_to_id
                         )
+                        if not reply_to_text:
+                            origin = self._telegram_channel_forward_origin(
+                                message.reply_to_message
+                            )
+                            if origin is not None:
+                                reply_to_text = rich_sent_store.lookup(
+                                    origin[0], origin[1]
+                                )
                     except Exception:
                         reply_to_text = None
                 if not reply_to_text:

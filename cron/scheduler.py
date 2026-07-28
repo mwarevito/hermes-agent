@@ -1757,6 +1757,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             route_via_dm_topic = is_ambiguous_telegram_topic and _is_channel_dm_topic(
                 runtime_adapter, chat_id, loop, job["id"],
             )
+            # ``cron_delivery`` (on BOTH branches below) flags this as a
+            # scheduled feed delivery so the Telegram adapter uses the legacy
+            # sendMessage/MarkdownV2 path instead of a rich message — rich
+            # content is not carried through Telegram forwarding/reply, which
+            # breaks bot-authored feeds that fan out by forwarding (see
+            # TelegramAdapter._should_attempt_rich).
             if route_via_dm_topic:
                 # Genuine Bot API channel Direct-Messages topic (#22773 mode 2):
                 # routed via direct_messages_topic_id, no bare thread_id.
@@ -1764,10 +1770,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 route_metadata = {
                     "direct_messages_topic_id": str(thread_id),
                     "job_id": job["id"],
+                    "cron_delivery": True,
                 }
                 # Media metadata mirrors the text routing so attachments land in
                 # the same DM topic instead of the General lane (#22773).
-                media_metadata = {"direct_messages_topic_id": str(thread_id)}
+                media_metadata = {
+                    "direct_messages_topic_id": str(thread_id),
+                    "cron_delivery": True,
+                }
             else:
                 # Forum-style topic (private chat / supergroup) or non-topic
                 # target: route via message_thread_id (#52060).  Put thread_id in
@@ -1778,10 +1788,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # anchor, so the metadata key bypasses that check and lets the
                 # adapter route via a plain message_thread_id.
                 route_thread_id = str(thread_id) if thread_id is not None else None
-                route_metadata = {"job_id": job["id"]}
+                route_metadata = {"job_id": job["id"], "cron_delivery": True}
                 if route_thread_id:
                     route_metadata["thread_id"] = route_thread_id
-                media_metadata = {"thread_id": thread_id} if thread_id else None
+                media_metadata = {"cron_delivery": True}
+                if thread_id:
+                    media_metadata["thread_id"] = thread_id
 
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content.

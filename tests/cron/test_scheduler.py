@@ -1287,6 +1287,76 @@ class TestParallelTick:
         assert seen["dc-job"] == {"platform": "discord", "chat_id": "222"}
 
 
+class TestCronDeliveryFlagRidesRouteMetadata:
+    """A live cron delivery must carry ``cron_delivery: True`` in its metadata.
+
+    Telegram does NOT propagate a rich message's content through a
+    forward/reply, so a bot-authored cron feed that fans out by forwarding
+    loses its body. ``TelegramAdapter._should_attempt_rich`` therefore forces
+    the legacy sendMessage/MarkdownV2 path whenever this flag is present, and
+    the flag is set here — at the cron delivery boundary. Ordinary sends are
+    unaffected.
+    """
+
+    def _capture_route_metadata(self, deliver):
+        from gateway.config import Platform
+
+        adapter = AsyncMock()
+        adapter.send.return_value = MagicMock(success=True)
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        pconfig.extra = {}
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        captured = {}
+
+        class _Router:
+            def __init__(self, *_a, **_kw):
+                pass
+
+            async def _deliver_to_platform(self, target, text, metadata):
+                captured["target"] = target
+                captured["text"] = text
+                captured["metadata"] = metadata
+                return MagicMock(success=True)
+
+        def fake_schedule(coro, _loop):
+            import asyncio as _asyncio
+            from concurrent.futures import Future
+
+            fut = Future()
+            fut.set_result(_asyncio.new_event_loop().run_until_complete(coro))
+            return fut
+
+        job = {"id": "flag-job", "deliver": deliver}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("gateway.delivery.DeliveryRouter", _Router), \
+             patch("agent.async_utils.safe_schedule_threadsafe", side_effect=fake_schedule):
+            _deliver_result(
+                job,
+                "Hello world",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+        return captured
+
+    def test_flat_target_metadata_has_cron_delivery(self):
+        captured = self._capture_route_metadata("telegram:226252250")
+        assert captured["metadata"]["cron_delivery"] is True
+
+    def test_thread_target_keeps_thread_id_and_cron_delivery(self):
+        captured = self._capture_route_metadata("telegram:-1002222222222:7072")
+        assert captured["metadata"]["cron_delivery"] is True
+        assert captured["metadata"]["thread_id"] == "7072"
+
+
 class TestDeliverResultTimeoutCancelsFuture:
     """When future.result(timeout=60) raises TimeoutError in the live adapter
     delivery path, the outcome depends on whether the coroutine was already

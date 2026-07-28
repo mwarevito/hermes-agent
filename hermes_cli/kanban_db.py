@@ -1364,6 +1364,33 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Durable per-event delivery disposition for terminal notifications. One
+-- row per (subscription, event). The gateway notifier watcher *leases* a
+-- batch of unseen terminal events (status='pending', claimed_by=<gateway
+-- profile>, lease_expires=<now+lease>), attempts delivery, then records the
+-- outcome durably: 'sent' on confirmed delivery, 'failed' with an
+-- incremented attempt counter on a retryable error, 'dead' once attempts
+-- exhaust the bound. The subscription cursor (kanban_notify_subs.last_event_id)
+-- only advances across the contiguous prefix of terminal ('sent'/'dead')
+-- rows — so a crash between the lease and a confirmed send leaves the event
+-- replayable (the lease expires and any gateway re-leases it) instead of
+-- silently lost. This table is what makes the notifier at-least-once: it
+-- decouples "this event was claimed" from "this event was delivered".
+CREATE TABLE IF NOT EXISTS kanban_notify_deliveries (
+    task_id       TEXT NOT NULL,
+    platform      TEXT NOT NULL,
+    chat_id       TEXT NOT NULL,
+    thread_id     TEXT NOT NULL DEFAULT '',
+    event_id      INTEGER NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'pending',
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    claimed_by    TEXT,
+    lease_expires INTEGER NOT NULL DEFAULT 0,
+    last_error    TEXT,
+    updated_at    INTEGER NOT NULL,
+    PRIMARY KEY (task_id, platform, chat_id, thread_id, event_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1374,6 +1401,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_notify_deliv_status   ON kanban_notify_deliveries(status);
 """
 
 
@@ -6336,6 +6364,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM kanban_notify_deliveries WHERE task_id = ?", (task_id,))
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
 
@@ -6359,6 +6388,7 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM kanban_notify_deliveries WHERE task_id = ?", (task_id,))
     recompute_ready(conn)
     return True
 
@@ -9612,6 +9642,52 @@ def _decode_notify_delivery_metadata(raw: Any) -> dict[str, Any]:
     }
 
 
+# Bounded per-event delivery retry before an event is dead-lettered. Each
+# failed delivery attempt increments ``kanban_notify_deliveries.attempts``;
+# once it reaches this bound the row is marked 'dead' (operator-visible,
+# never re-tried) and the cursor is allowed to advance past it so a
+# permanently-undeliverable chat does not wedge the whole subscription.
+DEFAULT_NOTIFY_RETRY_LIMIT = 5
+# How long a claimed (pending) delivery lease is honored before another
+# gateway tick may re-lease it. Covers the crash-between-lease-and-send
+# window: if the leasing gateway dies, the lease expires and the event is
+# re-delivered rather than silently lost. Kept well above a normal send.
+DEFAULT_NOTIFY_LEASE_SECONDS = 120
+
+
+def resolve_notifier_profile() -> str:
+    """Return the authoritative notifier-owner profile for a new subscription.
+
+    This is the single source of truth every subscription-creation path
+    (tool auto-subscribe, ``hermes kanban notify-subscribe``, and the
+    gateway ``/kanban`` slash handler) must agree on, so a subscription is
+    owned by the same gateway identity that will later deliver it. The
+    gateway notifier watcher identifies itself as
+    ``get_active_profile_name() or "default"`` (``gateway.run._active_profile_name``);
+    this resolver returns a matching, never-empty value.
+
+    Resolution order (never returns ``None``/``''``):
+
+    1. ``HERMES_PROFILE`` / ``HERMES_PROFILE_NAME`` env (set for worker
+       subprocesses and ``hermes -p <name>`` invocations) — matches the
+       long-standing CLI ``_profile_author`` behaviour.
+    2. ``get_active_profile_name()`` derived from ``HERMES_HOME`` — the
+       exact string the gateway watcher uses as its own identity, so a
+       default-profile session resolves to ``"default"`` instead of the
+       ``NULL`` that ``os.environ.get("HERMES_PROFILE")`` alone produced
+       (the 2026-07-27 silent-loss root cause).
+    3. ``"default"`` as a last-resort floor.
+    """
+    prof = os.environ.get("HERMES_PROFILE") or os.environ.get("HERMES_PROFILE_NAME")
+    if prof:
+        return prof
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        return get_active_profile_name() or "default"
+    except Exception:
+        return "default"
+
+
 def add_notify_sub(
     conn: sqlite3.Connection,
     *,
@@ -9847,6 +9923,15 @@ def remove_notify_sub(
             "AND platform = ? AND chat_id = ? AND thread_id = ?",
             (task_id, platform, chat_id, thread_id or ""),
         )
+        # Drop the durable delivery ledger for this exact subscription so a
+        # re-subscribe with the same (task, platform, chat, thread) starts
+        # from a clean disposition rather than inheriting stale 'sent'/'dead'
+        # rows that would suppress redelivery.
+        conn.execute(
+            "DELETE FROM kanban_notify_deliveries WHERE task_id = ? "
+            "AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (task_id, platform, chat_id, thread_id or ""),
+        )
     return cur.rowcount > 0
 
 
@@ -10024,6 +10109,374 @@ def claim_notify_ownership(
             (profile, task_id, platform, chat_id, thread_id or ""),
         )
     return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Durable per-event delivery disposition (kanban_notify_deliveries)
+#
+# These replace the "advance the cursor at claim time and hope the send
+# succeeds" model with an at-least-once lease/confirm protocol. The cursor
+# is never advanced before a delivery is durably 'sent' (or 'dead'), so a
+# crash — or a send that returns without actually reaching the user — can no
+# longer silently skip a terminal event. See the table comment in SCHEMA_SQL
+# and the 2026-07-27 silent-loss incident.
+# ---------------------------------------------------------------------------
+
+def lease_unseen_deliveries(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    kinds: Optional[Iterable[str]] = None,
+    claimer: str,
+    lease_seconds: int = DEFAULT_NOTIFY_LEASE_SECONDS,
+    retry_limit: int = DEFAULT_NOTIFY_RETRY_LIMIT,
+) -> list[Event]:
+    """Atomically lease this subscription's undelivered terminal events.
+
+    Returns the events (ascending ``id``) that ``claimer`` now owns and
+    should attempt to deliver. For every unseen terminal event (``id >
+    last_event_id`` and ``kind IN kinds``) a durable
+    ``kanban_notify_deliveries`` row is upserted inside a ``BEGIN IMMEDIATE``
+    transaction:
+
+    * no row yet                                   -> insert 'pending', lease to claimer
+    * status 'sent' or 'dead'                       -> skip (already terminal)
+    * status 'pending' with a *live* lease held by
+      another claimer                              -> skip (in flight elsewhere)
+    * status 'pending' with an expired lease, OR
+      already leased by this claimer, OR 'failed'   -> (re)lease to claimer
+
+    ``claimer`` MUST be unique per running process (e.g. ``profile:pid:nonce``),
+    not the shared ``notifier_profile``: two concurrent same-profile gateway
+    processes otherwise carry the *same* claimer and would each treat the
+    other's live pending lease as "already leased by this claimer" and both
+    deliver. Subscription *ownership* (``notifier_profile``) is a separate,
+    profile-scoped concept adopted via :func:`claim_notify_ownership`; the
+    lease is purely a per-process in-flight token, stored in ``claimed_by``.
+
+    The subscription cursor is **not** advanced here — that only happens via
+    :func:`advance_notify_cursor_over_confirmed` once a send is confirmed.
+    Serializing on SQLite's writer lock makes the lease single-owner across
+    concurrent gateway watchers pointed at the same board DB, even when the
+    subscription itself is still ownerless (legacy ``notifier_profile IS
+    NULL``): at most one process holds a live lease on a given event, so a
+    non-delivering gateway can no longer claim-and-advance past it.
+    """
+    thread = thread_id or ""
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT last_event_id FROM kanban_notify_subs "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (task_id, platform, chat_id, thread),
+        ).fetchone()
+        if row is None:
+            return []
+        cursor = int(row["last_event_id"])
+        _new_cursor, candidates = unseen_events_for_sub(
+            conn,
+            task_id=task_id,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread,
+            kinds=kinds,
+        )
+        leased: list[Event] = []
+        for ev in candidates:
+            disp = conn.execute(
+                "SELECT status, claimed_by, lease_expires, attempts "
+                "FROM kanban_notify_deliveries "
+                "WHERE task_id = ? AND platform = ? AND chat_id = ? "
+                "AND thread_id = ? AND event_id = ?",
+                (task_id, platform, chat_id, thread, ev.id),
+            ).fetchone()
+            if disp is None:
+                conn.execute(
+                    "INSERT INTO kanban_notify_deliveries "
+                    "(task_id, platform, chat_id, thread_id, event_id, status, "
+                    " attempts, claimed_by, lease_expires, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)",
+                    (task_id, platform, chat_id, thread, ev.id,
+                     claimer, now + int(lease_seconds), now),
+                )
+                leased.append(ev)
+                continue
+            status = disp["status"]
+            if status in ("sent", "dead"):
+                continue
+            # 'pending' held by a *different* claimer whose lease is still
+            # live: another gateway owns this delivery right now — skip it.
+            if (
+                status == "pending"
+                and disp["claimed_by"] not in (None, "", claimer)
+                and int(disp["lease_expires"] or 0) > now
+            ):
+                continue
+            # Re-lease: expired pending, our own pending, or a prior 'failed'
+            # attempt eligible for retry.
+            conn.execute(
+                "UPDATE kanban_notify_deliveries "
+                "SET status = 'pending', claimed_by = ?, lease_expires = ?, "
+                "    updated_at = ? "
+                "WHERE task_id = ? AND platform = ? AND chat_id = ? "
+                "AND thread_id = ? AND event_id = ?",
+                (claimer, now + int(lease_seconds), now,
+                 task_id, platform, chat_id, thread, ev.id),
+            )
+            leased.append(ev)
+        return leased
+
+
+def confirm_notify_sent(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    event_id: int,
+    lease_owner: Optional[str] = None,
+) -> bool:
+    """Durably record that ``event_id`` was delivered for this subscription.
+
+    Marks the disposition row 'sent' and clears its lease. Never advances
+    the cursor itself — call :func:`advance_notify_cursor_over_confirmed`
+    after the batch so the cursor only moves across a contiguous confirmed
+    prefix (preserving ordered dedupe).
+
+    When ``lease_owner`` is given the write is *fenced* to that exact live
+    lease holder (``claimed_by = lease_owner``): a stale owner whose lease
+    already expired and was re-leased by another process cannot overwrite the
+    new owner's row. Returns ``True`` iff a row was updated (fence held).
+    """
+    thread = thread_id or ""
+    now = int(time.time())
+    with write_txn(conn):
+        if lease_owner is not None:
+            cur = conn.execute(
+                "UPDATE kanban_notify_deliveries "
+                "SET status = 'sent', claimed_by = NULL, lease_expires = 0, "
+                "    last_error = NULL, updated_at = ? "
+                "WHERE task_id = ? AND platform = ? AND chat_id = ? "
+                "AND thread_id = ? AND event_id = ? AND claimed_by = ?",
+                (now, task_id, platform, chat_id, thread, event_id, lease_owner),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE kanban_notify_deliveries "
+                "SET status = 'sent', claimed_by = NULL, lease_expires = 0, "
+                "    last_error = NULL, updated_at = ? "
+                "WHERE task_id = ? AND platform = ? AND chat_id = ? "
+                "AND thread_id = ? AND event_id = ?",
+                (now, task_id, platform, chat_id, thread, event_id),
+            )
+    return cur.rowcount > 0
+
+
+def record_notify_failure(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    event_id: int,
+    error: str,
+    retry_limit: int = DEFAULT_NOTIFY_RETRY_LIMIT,
+    allow_dead: bool = True,
+    lease_owner: Optional[str] = None,
+) -> str:
+    """Record a failed delivery attempt; dead-letter once attempts exhaust.
+
+    Increments ``attempts``, stores the (truncated) error, and clears the
+    lease so a later tick can retry. Returns the resulting status:
+    ``'failed'`` (retryable) or ``'dead'`` (bound reached — operator-visible,
+    never retried; the cursor is then allowed to advance past it so one dead
+    chat can't wedge the subscription). Never writes 'sent', so a send
+    exception can never masquerade as a delivered event.
+
+    ``allow_dead`` gates the terminal 'dead' transition. It MUST be ``False``
+    for an *ownerless* (legacy ``notifier_profile IS NULL``) subscription: a
+    gateway holding the wrong platform token would otherwise burn the shared
+    retry budget on a chat it can never reach and dead-letter a *still
+    deliverable* event before the correctly-tokened gateway ever leases it —
+    reopening the 2026-07-27 silent-loss class. With ``allow_dead=False`` the
+    row stays durably 'failed' (retryable forever) until a gateway that can
+    actually deliver adopts ownership via :func:`claim_notify_ownership`.
+
+    ``lease_owner`` fences the write to the exact live lease holder
+    (``claimed_by = lease_owner``): a stale owner whose lease already expired
+    and was re-leased by another process is a no-op and returns ``'stale'``
+    rather than mutating the new owner's row.
+    """
+    thread = thread_id or ""
+    now = int(time.time())
+    with write_txn(conn):
+        if lease_owner is not None:
+            cur = conn.execute(
+                "SELECT attempts FROM kanban_notify_deliveries "
+                "WHERE task_id = ? AND platform = ? AND chat_id = ? "
+                "AND thread_id = ? AND event_id = ? AND claimed_by = ?",
+                (task_id, platform, chat_id, thread, event_id, lease_owner),
+            ).fetchone()
+            if cur is None:
+                # Fenced out: another process re-leased (or already resolved)
+                # this row. Do not touch it.
+                return "stale"
+        else:
+            cur = conn.execute(
+                "SELECT attempts FROM kanban_notify_deliveries "
+                "WHERE task_id = ? AND platform = ? AND chat_id = ? "
+                "AND thread_id = ? AND event_id = ?",
+                (task_id, platform, chat_id, thread, event_id),
+            ).fetchone()
+        attempts = (int(cur["attempts"]) if cur else 0) + 1
+        status = "dead" if (allow_dead and attempts >= int(retry_limit)) else "failed"
+        conn.execute(
+            "UPDATE kanban_notify_deliveries "
+            "SET status = ?, attempts = ?, claimed_by = NULL, lease_expires = 0, "
+            "    last_error = ?, updated_at = ? "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? "
+            "AND thread_id = ? AND event_id = ?",
+            (status, attempts, (error or "")[:500], now,
+             task_id, platform, chat_id, thread, event_id),
+        )
+    return status
+
+
+def release_notify_leases(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    event_ids: Iterable[int],
+    lease_owner: Optional[str] = None,
+) -> None:
+    """Release pending leases without counting an attempt.
+
+    Used when delivery is abandoned for a reason that is not a send failure
+    (adapter disconnected between lease and send, unknown platform). The
+    events return to unleased 'pending' so the next tick — or another
+    gateway — re-leases and retries them; ``attempts`` is untouched so a
+    transient disconnect never burns the retry budget.
+
+    ``lease_owner`` fences the release to the exact live lease holder so a
+    stale owner cannot yank a row another process has already re-leased.
+    """
+    thread = thread_id or ""
+    now = int(time.time())
+    ids = [int(e) for e in event_ids]
+    if not ids:
+        return
+    with write_txn(conn):
+        for eid in ids:
+            if lease_owner is not None:
+                conn.execute(
+                    "UPDATE kanban_notify_deliveries "
+                    "SET claimed_by = NULL, lease_expires = 0, updated_at = ? "
+                    "WHERE task_id = ? AND platform = ? AND chat_id = ? "
+                    "AND thread_id = ? AND event_id = ? AND status = 'pending' "
+                    "AND claimed_by = ?",
+                    (now, task_id, platform, chat_id, thread, eid, lease_owner),
+                )
+            else:
+                conn.execute(
+                    "UPDATE kanban_notify_deliveries "
+                    "SET claimed_by = NULL, lease_expires = 0, updated_at = ? "
+                    "WHERE task_id = ? AND platform = ? AND chat_id = ? "
+                    "AND thread_id = ? AND event_id = ? AND status = 'pending'",
+                    (now, task_id, platform, chat_id, thread, eid),
+                )
+
+
+def advance_notify_cursor_over_confirmed(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    kinds: Optional[Iterable[str]] = None,
+) -> int:
+    """Advance the subscription cursor across the contiguous confirmed prefix.
+
+    Walks terminal-kind events with ``id > last_event_id`` in ascending
+    order and moves the cursor forward only while each event has a durable
+    disposition of 'sent' or 'dead'. Stops at the first event that is still
+    'pending'/'failed'/unrecorded, so an undelivered event blocks the cursor
+    (and is retried next tick) while ordering and dedupe are preserved. The
+    UPDATE is CAS-guarded on the observed cursor so a concurrent watcher
+    can't clobber newer progress. Returns the new cursor value.
+    """
+    thread = thread_id or ""
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT last_event_id FROM kanban_notify_subs "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (task_id, platform, chat_id, thread),
+        ).fetchone()
+        if row is None:
+            return 0
+        cursor = int(row["last_event_id"])
+        kind_list = list(kinds) if kinds else None
+        q = (
+            "SELECT id FROM task_events WHERE task_id = ? AND id > ? "
+            + ("AND kind IN (" + ",".join("?" * len(kind_list)) + ") " if kind_list else "")
+            + "ORDER BY id ASC"
+        )
+        params: list[Any] = [task_id, cursor]
+        if kind_list:
+            params.extend(kind_list)
+        new_cursor = cursor
+        for ev_row in conn.execute(q, params).fetchall():
+            eid = int(ev_row["id"])
+            disp = conn.execute(
+                "SELECT status FROM kanban_notify_deliveries "
+                "WHERE task_id = ? AND platform = ? AND chat_id = ? "
+                "AND thread_id = ? AND event_id = ?",
+                (task_id, platform, chat_id, thread, eid),
+            ).fetchone()
+            if disp is not None and disp["status"] in ("sent", "dead"):
+                new_cursor = eid
+            else:
+                break
+        if new_cursor != cursor:
+            conn.execute(
+                "UPDATE kanban_notify_subs SET last_event_id = ? "
+                "WHERE task_id = ? AND platform = ? AND chat_id = ? "
+                "AND thread_id = ? AND last_event_id = ?",
+                (new_cursor, task_id, platform, chat_id, thread, cursor),
+            )
+        return new_cursor
+
+
+def list_dead_letter_deliveries(
+    conn: sqlite3.Connection, task_id: Optional[str] = None,
+) -> list[dict]:
+    """Return dead-lettered deliveries (operator-visible failed notifications).
+
+    A non-empty result means one or more terminal events could not be
+    delivered after the bounded retries and were given up on. Surfaced for
+    ``hermes kanban`` diagnostics so a silently-undeliverable chat is
+    inspectable rather than invisible.
+    """
+    if task_id is not None:
+        rows = conn.execute(
+            "SELECT * FROM kanban_notify_deliveries "
+            "WHERE status = 'dead' AND task_id = ? ORDER BY event_id ASC",
+            (task_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM kanban_notify_deliveries "
+            "WHERE status = 'dead' ORDER BY task_id, event_id ASC",
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------

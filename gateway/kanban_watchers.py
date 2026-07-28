@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import secrets
 import sqlite3
 import time
 from pathlib import Path
@@ -23,6 +24,26 @@ from agent.i18n import t
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
+
+# Terminal event kinds the notifier delivers. Module-level so tests can extend
+# it (e.g. inject a future kind with no message template) to prove the watcher
+# never wedges the cursor on an unrenderable-but-leased event.
+#
+# "status" covers dashboard drag-drop and `_set_status_direct()` writes.
+# "archived"/"unblocked" are leased but intentionally SILENT (see SILENT_KINDS):
+# they must still be claimed so they can't wedge a later completed/blocked event
+# behind an unresolved row. "block_loop_detected" is the triage hand-off that
+# exists to force human attention, so it gets its own loud message.
+TERMINAL_KINDS = (
+    "completed", "blocked", "gave_up", "crashed", "timed_out",
+    "status", "archived", "unblocked", "block_loop_detected",
+)
+
+# Terminal kinds that are leased for cursor hygiene but never messaged to the
+# user: an archive needs no ping and `unblocked` is an internal transition.
+# They are confirmed in the ledger without a send (and are excluded from the
+# wake kinds), so they advance the cursor without notifying anyone.
+SILENT_KINDS = ("archived", "unblocked")
 
 
 def _resolve_auto_decompose_settings(
@@ -153,9 +174,11 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
 
-        # "status" covers dashboard drag-drop and `_set_status_direct()`
-        # writes — surface those transitions to subscribers too.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected")
+        # Terminal kinds come from the MODULE-level ``TERMINAL_KINDS`` (top of
+        # this file) instead of a method-local copy: tests monkeypatch it to
+        # inject a future kind with no message template and prove the watcher
+        # never wedges the cursor on an unrenderable-but-leased event.
+        #
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -165,39 +188,77 @@ class GatewayKanbanWatchersMixin:
         # crash because the subscription was deleted after the first event.
         # Same shape as the reblock-after-unblock cycle that PR #22941
         # fixed for `blocked`. Keeping the subscription alive until the
-        # task is genuinely done lets the cursor (advanced atomically by
-        # claim_unseen_events_for_sub) handle dedup, and any retry-loop
-        # event reaches the user.
-        # Per-subscription send-failure counter. Adapter.send raising
-        # means the chat is dead (deleted, bot kicked, etc.) — after N
-        # consecutive send failures the sub is dropped so we don't spin
-        # against a dead chat every 5 seconds forever.
-        # Raised from 3 to 12 (~60s at the 5s tick cadence): now that a
-        # reported SendResult(success=False) also lands here (see the
-        # delivery loop below), a transient Telegram/API outage of a few
-        # ticks must NOT permanently unsubscribe a live review-gate channel.
-        # A genuinely dead chat still drops, just ~60s later — a fine trade
-        # for an unattended gate where a false drop means silent work pileup.
-        MAX_SEND_FAILURES = 12
-        sub_fail_counts: dict[tuple, int] = getattr(
-            self, "_kanban_sub_fail_counts", {}
-        )
-        self._kanban_sub_fail_counts = sub_fail_counts
-        # Ownerless (notifier_profile IS NULL/'') subscriptions that this
-        # gateway process cannot deliver to (wrong Telegram token / dead
-        # chat) are parked here after MAX_SEND_FAILURES so this process
-        # stops re-spinning against them every 5s. The DB row is KEPT —
-        # the true owner gateway (or the Batch-1 cron watchdog that reads
-        # task_events directly) can still deliver. In-memory per process
-        # (a restart re-tries), so it never permanently silences an event.
-        ownerless_skip: set[tuple] = getattr(
-            self, "_kanban_ownerless_skip", set()
-        )
-        self._kanban_ownerless_skip = ownerless_skip
+        # task is genuinely done lets the durable delivery ledger
+        # (kanban_notify_deliveries) handle dedup, and any retry-loop event
+        # reaches the user.
+        #
+        # Delivery durability: instead of advancing the cursor at claim time
+        # and hoping the send succeeds, each terminal event is *leased* into
+        # kanban_notify_deliveries, delivered, then durably marked 'sent'
+        # (cursor advances) or 'failed'/'dead' (cursor holds, retry later).
+        # A crash — or a send that returns without reaching the user — can no
+        # longer silently skip an event: the lease expires and it is
+        # redelivered. For an OWNED subscription, bounded retries then
+        # dead-letter (operator-visible via
+        # kanban_db.list_dead_letter_deliveries) so one genuinely-dead chat
+        # can't wedge the subscription. An OWNERLESS (legacy notifier_profile
+        # IS NULL) sub is NEVER dead-lettered here: a wrong-token gateway must
+        # not burn the shared retry budget and give up on an event the
+        # correctly-tokened gateway could still deliver — it stays durably
+        # 'failed' until that gateway delivers and adopts ownership. This is
+        # the 2026-07-27 silent-loss fix; the old in-memory MAX_SEND_FAILURES /
+        # _kanban_ownerless_skip parking is gone because durability now lives
+        # in the DB.
+        #
+        # The knobs are read here (not via a module-level constant) so a
+        # config.yaml override applies; kanban_db carries the code-level
+        # fallback, so an older config without them still works. The notifier
+        # itself is NOT gated on kanban.dispatch_in_gateway — delivery
+        # ownership is independent of dispatch ownership.
+        kanban_cfg: dict = {}
+        try:
+            from hermes_cli.config import load_config as _load_config
+            _cfg = _load_config()
+            if isinstance(_cfg, dict):
+                kanban_cfg = _cfg.get("kanban", {}) or {}
+        except Exception as _cfg_exc:
+            logger.debug(
+                "kanban notifier: config unavailable for delivery knobs (%s); "
+                "using kanban_db defaults", _cfg_exc,
+            )
+        try:
+            retry_limit = int(
+                kanban_cfg.get("notify_retry_limit", _kb.DEFAULT_NOTIFY_RETRY_LIMIT)
+            )
+        except (TypeError, ValueError):
+            retry_limit = _kb.DEFAULT_NOTIFY_RETRY_LIMIT
+        if retry_limit < 1:
+            retry_limit = _kb.DEFAULT_NOTIFY_RETRY_LIMIT
+        try:
+            lease_seconds = int(
+                kanban_cfg.get("notify_lease_seconds", _kb.DEFAULT_NOTIFY_LEASE_SECONDS)
+            )
+        except (TypeError, ValueError):
+            lease_seconds = _kb.DEFAULT_NOTIFY_LEASE_SECONDS
+        if lease_seconds < 1:
+            lease_seconds = _kb.DEFAULT_NOTIFY_LEASE_SECONDS
         notifier_profile = getattr(self, "_kanban_notifier_profile", None)
         if not notifier_profile:
             notifier_profile = self._active_profile_name()
             self._kanban_notifier_profile = notifier_profile
+
+        # Delivery LEASE owner — distinct from subscription OWNERSHIP.
+        # ``notifier_profile`` is the profile-scoped ownership identity (shared
+        # across restarts, CAS-adopted, used for the foreign-owner skip). The
+        # lease token must instead be unique per *running process*, so two
+        # concurrent same-profile gateways never see each other's live pending
+        # lease as their own and double-deliver. profile:pid:nonce is enough;
+        # it is fenced into confirm/failure/release so a stale owner can't
+        # mutate a row another process has re-leased.
+        lease_owner = getattr(self, "_kanban_lease_owner", None)
+        if not lease_owner:
+            lease_owner = f"{notifier_profile}:{os.getpid()}:{secrets.token_hex(4)}"
+            self._kanban_lease_owner = lease_owner
 
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
@@ -323,22 +384,6 @@ class GatewayKanbanWatchersMixin:
                                                 sub.get("task_id"), owner_profile, notifier_profile,
                                             )
                                             continue
-                                    # An ownerless sub that already exhausted its
-                                    # send budget in THIS process (dead chat for
-                                    # this gateway's token) is parked — skip it so
-                                    # we don't re-claim/re-fail every tick. The row
-                                    # stays in the DB for the true owner / watchdog.
-                                    sub_key = (
-                                        sub["task_id"], sub["platform"],
-                                        sub["chat_id"], sub.get("thread_id") or "",
-                                    )
-                                    if owner_profile is None and sub_key in self._kanban_ownerless_skip:
-                                        logger.debug(
-                                            "kanban notifier: ownerless subscription for %s parked "
-                                            "(undeliverable by this gateway); leaving row for owner/watchdog",
-                                            sub.get("task_id"),
-                                        )
-                                        continue
                                     platform = (sub.get("platform") or "").lower()
                                     if platform not in active_platforms:
                                         logger.debug(
@@ -346,32 +391,40 @@ class GatewayKanbanWatchersMixin:
                                             sub.get("task_id"), platform or "<missing>",
                                         )
                                         continue
-                                    old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
+                                    # Durably lease this sub's unseen terminal
+                                    # events. The cursor is NOT advanced here —
+                                    # only a confirmed send advances it. The
+                                    # lease is single-owner (per process) across
+                                    # concurrent gateways (even for a still-
+                                    # ownerless legacy sub), so a non-delivering
+                                    # gateway can't claim-and-skip.
+                                    events = _kb.lease_unseen_deliveries(
                                         conn,
                                         task_id=sub["task_id"],
                                         platform=sub["platform"],
                                         chat_id=sub["chat_id"],
                                         thread_id=sub.get("thread_id") or "",
                                         kinds=TERMINAL_KINDS,
+                                        claimer=lease_owner,
+                                        lease_seconds=lease_seconds,
+                                        retry_limit=retry_limit,
                                     )
                                     if not events:
                                         continue
                                     task = _kb.get_task(conn, sub["task_id"])
                                     logger.debug(
-                                        "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
-                                        len(events), sub["task_id"], slug, old_cursor, cursor,
+                                        "kanban notifier: leased %d event(s) for %s on board %s",
+                                        len(events), sub["task_id"], slug,
                                     )
                                     deliveries.append({
                                         "sub": sub,
-                                        "old_cursor": old_cursor,
-                                        "cursor": cursor,
                                         "events": events,
                                         "task": task,
                                         "board": slug,
                                         # Raw ownership at collect time: truthy iff
                                         # confirmed-owned by THIS gateway (foreign
                                         # subs were already skipped above). Falsy =
-                                        # ownerless — never drop it on send failure.
+                                        # ownerless — adopt on first successful send.
                                         "owner_profile": owner_profile,
                                     })
                                 except Exception as sub_exc:
@@ -392,13 +445,21 @@ class GatewayKanbanWatchersMixin:
                     task = d["task"]
                     board_slug = d.get("board")
                     platform_str = (sub["platform"] or "").lower()
+                    event_ids = [ev.id for ev in d["events"]]
+                    # Confirmed-owned by THIS gateway? Only an owned sub may
+                    # dead-letter — an ownerless (legacy NULL) sub whose send
+                    # fails here might just be the wrong-token gateway, so it
+                    # must stay retryable for whoever can actually deliver.
+                    owned = bool(d.get("owner_profile"))
                     try:
                         plat = _Platform(platform_str)
                     except ValueError:
-                        # Unknown platform string; skip and advance cursor so
-                        # we don't replay forever.
+                        # Unknown/undeliverable platform: release the leases so
+                        # they revert to unclaimed 'pending' (no attempt burned)
+                        # and do NOT advance the cursor. Defensive — such subs
+                        # are already filtered by active_platforms in _collect.
                         await asyncio.to_thread(
-                            self._kanban_advance, sub, d["cursor"], board_slug,
+                            self._kanban_release_leases, sub, event_ids, board_slug, lease_owner,
                         )
                         continue
                     sub_profile = sub.get("notifier_profile") or ""
@@ -414,27 +475,33 @@ class GatewayKanbanWatchersMixin:
                     adapter = self._authorization_adapter(plat, sub_profile or None)
                     if adapter is None:
                         logger.debug(
-                            "kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",
+                            "kanban notifier: adapter %s disconnected before delivery for %s; releasing lease",
                             platform_str, sub["task_id"],
                         )
                         await asyncio.to_thread(
-                            self._kanban_rewind,
-                            sub,
-                            d["cursor"],
-                            d.get("old_cursor", 0),
-                            board_slug,
+                            self._kanban_release_leases, sub, event_ids, board_slug, lease_owner,
                         )
                         continue
                     title = (task.title if task else sub["task_id"])[:120]
                     board_tag = f"[{board_slug}] " if board_slug else ""
-                    # Per-subscription failure-counter key. Hoisted out of the
-                    # event loop: the wake self-post path (in the loop's
-                    # ``else`` clause) needs it even when every event in the
-                    # claim was skipped before reaching the send site.
-                    sub_key = (
-                        sub["task_id"], sub["platform"],
-                        sub["chat_id"], sub.get("thread_id") or "",
-                    )
+                    from gateway.wake import adapter_supports_push as _adapter_push_ok
+
+                    # Adapters with no push channel (the API server —
+                    # ``supports_async_delivery = False``) can NEVER satisfy a
+                    # text-send: ``send()`` always reports
+                    # SendResult(success=False) by design (see
+                    # ApiServerAdapter.send()). Counting that as a delivery
+                    # failure would burn the retry budget and eventually
+                    # dead-letter an event the wake self-post CAN deliver. So
+                    # for non-push adapters the doomed send is skipped and the
+                    # event is resolved by the self-post below instead.
+                    _is_push_adapter = _adapter_push_ok(adapter)
+                    delivered_all = True
+                    # Leased events whose text ping was intentionally skipped
+                    # for a non-push adapter. Held (NOT confirmed) until the
+                    # wake self-post below confirms or fails them — so a failed
+                    # self-post can never silently advance the cursor past them.
+                    wake_deferred_ids: "list[int]" = []
                     for ev in d["events"]:
                         kind = ev.kind
                         # Identity prefix: attribute terminal pings to the
@@ -515,13 +582,30 @@ class GatewayKanbanWatchersMixin:
                                 f" — needs a human decision{rc}{reason}"
                             )
                         else:
-                            # archived / unblocked are claimed by TERMINAL_KINDS
-                            # (so the cursor advances past them and they can't
-                            # wedge a later completed/blocked event behind an
-                            # unclaimed row) but are intentionally SILENT: an
-                            # archive needs no user ping, and unblocked is an
-                            # internal transition. They are also excluded from
-                            # _WAKE_KINDS below, so they never wake the creator.
+                            # Kinds claimed for cursor hygiene but never
+                            # messaged: `archived` needs no user ping and
+                            # `unblocked` is an internal transition (both are
+                            # excluded from _WAKE_KINDS below, so they never
+                            # wake the creator either). Anything else landing
+                            # here is a terminal kind this build has no message
+                            # template for (e.g. a newer kind added to
+                            # TERMINAL_KINDS after this gateway was deployed).
+                            # Either way the event was LEASED, so leaving it
+                            # unresolved would wedge the cursor forever: confirm
+                            # it (fenced to our lease) so the cursor can advance
+                            # past it, and log loudly for the unrenderable case.
+                            # At-least-once is preserved for every kind we
+                            # *can* render.
+                            if kind not in SILENT_KINDS:
+                                logger.warning(
+                                    "kanban notifier: no message template for terminal "
+                                    "kind %r on %s; confirming to avoid wedging the "
+                                    "cursor (upgrade the gateway to render it)",
+                                    kind, sub["task_id"],
+                                )
+                            await asyncio.to_thread(
+                                self._kanban_confirm_sent, sub, ev.id, board_slug, lease_owner,
+                            )
                             continue
                         delivery_metadata = sub.get("delivery_metadata")
                         metadata: dict[str, Any] = (
@@ -531,32 +615,17 @@ class GatewayKanbanWatchersMixin:
                         )
                         if sub.get("thread_id") and not metadata.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
-                        # Adapters with no push channel (the API server —
-                        # ``supports_async_delivery = False``) can NEVER
-                        # satisfy a text-send: ``send()`` always reports
-                        # SendResult(success=False) by design (see
-                        # ApiServerAdapter.send()). Treating that as a
-                        # delivery failure would rewind/drop the subscription
-                        # forever and — because the wake dispatch below lives
-                        # in this loop's ``else`` clause — would also make the
-                        # wake-on-completion path (the actual fix for the
-                        # api_server wrong-session bug) unreachable. So for
-                        # non-push adapters, skip the doomed send attempt
-                        # entirely: there is nothing to text-notify, the
-                        # creator is woken via the self-post below instead.
-                        from gateway.wake import adapter_supports_push
-
-                        if not adapter_supports_push(adapter):
+                        if not _is_push_adapter:
                             logger.debug(
                                 "kanban notifier: adapter %s has no push "
                                 "channel; skipping text ping for %s, relying "
                                 "on wake self-post instead",
                                 platform_str, sub["task_id"],
                             )
-                            # Do NOT reset the failure counter here: on this
-                            # path the wake self-post below IS the delivery,
-                            # so the counter is resolved (reset or bumped) by
-                            # the self-post outcome, not by skipping the send.
+                            # Held, NOT confirmed: the self-post below is this
+                            # event's real delivery and resolves it in the
+                            # ledger (confirm on success, failure otherwise).
+                            wake_deferred_ids.append(ev.id)
                             continue
                         try:
                             _send_res = await adapter.send(
@@ -601,116 +670,87 @@ class GatewayKanbanWatchersMixin:
                                         "kanban notifier: artifact delivery for %s failed: %s",
                                         sub["task_id"], art_exc,
                                     )
-                            # Reset the failure counter on success.
-                            sub_fail_counts.pop(sub_key, None)
+                            # Durably mark this event delivered BEFORE the
+                            # cursor moves. A crash after this point still sees
+                            # the event 'sent' — never re-sent, never lost.
+                            # Fenced to our lease: if our lease already expired
+                            # and another process re-leased, this is a no-op and
+                            # the event is (at-least-once) re-sent by that owner.
+                            await asyncio.to_thread(
+                                self._kanban_confirm_sent, sub, ev.id, board_slug, lease_owner,
+                            )
                         except Exception as exc:
-                            fails = sub_fail_counts.get(sub_key, 0) + 1
-                            sub_fail_counts[sub_key] = fails
-                            logger.warning(
-                                "kanban notifier: send failed for %s on %s "
-                                "(attempt %d/%d): %s",
-                                sub["task_id"], platform_str, fails,
-                                MAX_SEND_FAILURES, exc,
+                            # Record a durable failed attempt (never 'sent', so
+                            # a send exception can't masquerade as delivered).
+                            # Returns 'failed' (retryable), 'dead' (bound reached
+                            # — only for an OWNED sub), or 'stale' (our lease was
+                            # taken over — no-op). ``allow_dead=owned`` keeps an
+                            # ownerless sub retryable so a wrong-token gateway
+                            # can't dead-letter an event another gateway could
+                            # still deliver.
+                            status = await asyncio.to_thread(
+                                self._kanban_record_failure,
+                                sub, ev.id, str(exc), retry_limit, board_slug,
+                                owned, lease_owner,
                             )
-                            if fails >= MAX_SEND_FAILURES:
-                                if d.get("owner_profile"):
-                                    # Confirmed-owned by THIS gateway: the chat
-                                    # really is dead (this token is the one that
-                                    # should reach it), so dropping the sub is
-                                    # correct — stops spinning against a dead chat.
-                                    logger.warning(
-                                        "kanban notifier: dropping subscription "
-                                        "%s on %s after %d consecutive send failures",
-                                        sub["task_id"], platform_str, fails,
-                                    )
-                                    await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
-                                    sub_fail_counts.pop(sub_key, None)
-                                else:
-                                    # OWNERLESS sub: another gateway (the real
-                                    # owner) may still be able to deliver, and
-                                    # the Batch-1 cron watchdog reads task_events
-                                    # directly. NEVER delete the row here (that
-                                    # is the 2026-07-27 silent-loss bug). Park it
-                                    # in the in-memory skip set so THIS process
-                                    # stops re-spinning, and rewind the claim so
-                                    # the event stays unseen for whoever can deliver.
-                                    logger.warning(
-                                        "kanban notifier: parking ownerless subscription "
-                                        "%s on %s after %d consecutive send failures "
-                                        "(row kept for owner/watchdog)",
-                                        sub["task_id"], platform_str, fails,
-                                    )
-                                    self._kanban_ownerless_skip.add(sub_key)
-                                    sub_fail_counts.pop(sub_key, None)
-                                    await asyncio.to_thread(
-                                        self._kanban_rewind,
-                                        sub,
-                                        d["cursor"],
-                                        d.get("old_cursor", 0),
-                                        board_slug,
-                                    )
-                            else:
-                                await asyncio.to_thread(
-                                    self._kanban_rewind,
-                                    sub,
-                                    d["cursor"],
-                                    d.get("old_cursor", 0),
-                                    board_slug,
+                            if status == "dead":
+                                logger.warning(
+                                    "kanban notifier: DEAD-LETTER — event %s (%s) for "
+                                    "%s on %s undeliverable after %d attempts: %s "
+                                    "(inspect via kanban_db.list_dead_letter_deliveries)",
+                                    ev.id, kind, sub["task_id"], platform_str,
+                                    retry_limit, exc,
                                 )
-                            # Rewind the pre-send claim on transient failure so
-                            # a later tick can retry. After too many failures,
-                            # an OWNED subscription is dropped; an ownerless one
-                            # is parked (row kept) — never silently deleted.
+                            else:
+                                logger.warning(
+                                    "kanban notifier: send failed for %s on %s "
+                                    "(event %s, will retry): %s",
+                                    sub["task_id"], platform_str, ev.id, exc,
+                                )
+                            # Stop the batch so a retryable event blocks later
+                            # events (ordering) and is retried next tick. The
+                            # subscription row is NEVER deleted here — durable
+                            # dead-lettering, not sub-drop, bounds a dead chat.
+                            delivered_all = False
                             break
-                    else:
-                        # All text pings delivered (or intentionally skipped
-                        # for non-push adapters, whose delivery is the wake
-                        # self-post below). Whether the cursor may advance now
-                        # depends on the adapter class:
-                        #
-                        # * push-capable: the text send WAS the delivery, so
-                        #   advance immediately (pre-existing behavior); the
-                        #   wake injection below stays best-effort.
-                        # * non-push (api_server): the wake self-post IS the
-                        #   delivery. Advancing first would let a failed /
-                        #   retry-exhausted self-post (swallowed by the
-                        #   best-effort except) permanently lose the event.
-                        #   So the self-post runs FIRST and the cursor only
-                        #   advances after it succeeds — a failure rewinds the
-                        #   claim exactly like a failed send() above, so the
-                        #   next tick retries.
-                        task_terminal = task and task.status in {"done", "archived"}
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
-                        _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
-                        from gateway.wake import adapter_supports_push as _adapter_push_ok
+                    # -------------------------------------------------------
+                    # Wake the creator's agent session. Computed once per
+                    # subscription batch; used by both adapter classes.
+                    # -------------------------------------------------------
+                    task_terminal = task and task.status in {"done", "archived"}
+                    _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
+                    _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
+                    _session_key = ""
+                    _synth = ""
+                    if _wake_kinds:
+                        _session_key = getattr(task, "session_id", None) or ""
+                    if _wake_kinds and _session_key:
+                        _title = (task.title if task else sub["task_id"])[:120]
+                        _assignee = task.assignee if task else ""
+                        _parts = []
+                        if "completed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.completed"))
+                        if "gave_up" in _wake_kinds: _parts.append(t("gateway.kanban.wake.gave_up"))
+                        if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
+                        if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
+                        if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
+                        _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
+                        _synth = t(
+                            "gateway.kanban.wake.message",
+                            task_id=sub["task_id"],
+                            status=_status,
+                            title=_title,
+                            assignee=_assignee,
+                            board=board_slug,
+                        )
 
-                        _is_push_adapter = _adapter_push_ok(adapter)
-                        _session_key = ""
-                        _synth = ""
-                        if _wake_kinds:
-                            _session_key = getattr(task, "session_id", None) or ""
+                    if not _is_push_adapter and wake_deferred_ids:
+                        # Non-push adapter (api_server): the wake self-post IS
+                        # the delivery, so it must succeed BEFORE the deferred
+                        # events are confirmed — and only confirmed events move
+                        # the cursor. A failed self-post therefore cannot
+                        # silently lose the event; it stays retryable and, for
+                        # an OWNED sub, eventually dead-letters.
                         if _wake_kinds and _session_key:
-                            _title = (task.title if task else sub["task_id"])[:120]
-                            _assignee = task.assignee if task else ""
-                            _parts = []
-                            if "completed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.completed"))
-                            if "gave_up" in _wake_kinds: _parts.append(t("gateway.kanban.wake.gave_up"))
-                            if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
-                            if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
-                            if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
-                            _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
-                            _synth = t(
-                                "gateway.kanban.wake.message",
-                                task_id=sub["task_id"],
-                                status=_status,
-                                title=_title,
-                                assignee=_assignee,
-                                board=board_slug,
-                            )
-
-                        if not _is_push_adapter and _wake_kinds and _session_key:
-                            # Wake self-post IS the delivery on this path —
-                            # it must succeed BEFORE the cursor advances.
                             from gateway.wake import deliver_wake
 
                             try:
@@ -723,55 +763,72 @@ class GatewayKanbanWatchersMixin:
                                     "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
                                     sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,
                                 )
-                                sub_fail_counts.pop(sub_key, None)
-                            except Exception as _wk_err:
-                                fails = sub_fail_counts.get(sub_key, 0) + 1
-                                sub_fail_counts[sub_key] = fails
-                                logger.warning(
-                                    "kanban notifier: wake self-post failed "
-                                    "for %s (attempt %d/%d): %s",
-                                    sub["task_id"], fails,
-                                    MAX_SEND_FAILURES, _wk_err, exc_info=True,
-                                )
-                                if fails >= MAX_SEND_FAILURES:
-                                    logger.warning(
-                                        "kanban notifier: dropping subscription "
-                                        "%s on %s after %d consecutive wake failures",
-                                        sub["task_id"], platform_str, fails,
-                                    )
-                                    await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
-                                    sub_fail_counts.pop(sub_key, None)
-                                else:
-                                    # Rewind the pre-send claim so the next
-                                    # tick retries the self-post — the event
-                                    # is NOT lost.
+                                for _ev_id in wake_deferred_ids:
                                     await asyncio.to_thread(
-                                        self._kanban_rewind,
-                                        sub,
-                                        d["cursor"],
-                                        d.get("old_cursor", 0),
-                                        board_slug,
+                                        self._kanban_confirm_sent,
+                                        sub, _ev_id, board_slug, lease_owner,
                                     )
-                                continue
+                            except Exception as _wk_err:
+                                logger.warning(
+                                    "kanban notifier: wake self-post failed for %s "
+                                    "(event(s) %s stay retryable): %s",
+                                    sub["task_id"], wake_deferred_ids, _wk_err,
+                                    exc_info=True,
+                                )
+                                for _ev_id in wake_deferred_ids:
+                                    _fail_status = await asyncio.to_thread(
+                                        self._kanban_record_failure,
+                                        sub, _ev_id,
+                                        f"wake self-post failed: {_wk_err}",
+                                        retry_limit, board_slug, owned, lease_owner,
+                                    )
+                                    if _fail_status == "dead":
+                                        logger.warning(
+                                            "kanban notifier: DEAD-LETTER — event %s for %s "
+                                            "on %s undeliverable after %d wake attempts: %s "
+                                            "(inspect via kanban_db.list_dead_letter_deliveries)",
+                                            _ev_id, sub["task_id"], platform_str,
+                                            retry_limit, _wk_err,
+                                        )
+                                delivered_all = False
+                        else:
+                            # Nothing wake-worthy (no wake kind, or the task has
+                            # no creator session): a non-push adapter has no
+                            # other delivery path, so confirm the leased events
+                            # instead of wedging the cursor on them forever.
+                            for _ev_id in wake_deferred_ids:
+                                await asyncio.to_thread(
+                                    self._kanban_confirm_sent,
+                                    sub, _ev_id, board_slug, lease_owner,
+                                )
+                        wake_deferred_ids = []
 
-                        # Delivery complete (text ping for push adapters, wake
-                        # self-post for non-push): advance cursor. The cursor
-                        # is the dedup mechanism — it prevents re-delivery
-                        # of the same event on subsequent ticks.
+                    if wake_deferred_ids:
+                        # Defensive: events deferred to a self-post that never
+                        # ran are released (unclaimed, no attempt burned) so the
+                        # next tick re-leases and retries them.
                         await asyncio.to_thread(
-                            self._kanban_advance, sub, d["cursor"], board_slug,
+                            self._kanban_release_leases,
+                            sub, wake_deferred_ids, board_slug, lease_owner,
                         )
-                        if not _is_push_adapter:
-                            # Nothing left to deliver on this path (the wake,
-                            # if any, already succeeded above).
-                            sub_fail_counts.pop(sub_key, None)
-                        # Adopt an ownerless sub on its first successful
+
+                    # Advance the cursor across the contiguous confirmed
+                    # ('sent'/'dead') prefix only. A still-pending/failed event
+                    # holds the cursor so it stays replayable next tick; a
+                    # dead-lettered event is stepped over so it can't wedge the
+                    # subscription. This is the sole cursor-advance path — the
+                    # lease deliberately does NOT advance it.
+                    await asyncio.to_thread(
+                        self._kanban_advance_confirmed, sub, TERMINAL_KINDS, board_slug,
+                    )
+                    if delivered_all:
+                        # Every leased event was actually delivered this tick.
+                        # Adopt an ownerless sub on first fully-successful
                         # delivery: CAS-stamp notifier_profile to THIS gateway
-                        # so it converges to the single process that can
-                        # actually reach this chat. Every other gateway then
-                        # skips it via the foreign-owner guard in _collect —
-                        # closing the window where multiple gateways all race
-                        # (and non-owners silently drop) the same ownerless sub.
+                        # so it converges to the single process that can reach
+                        # this chat. Only a gateway that DID deliver adopts, so
+                        # a wrong-token gateway can never steal a legacy NULL
+                        # subscription.
                         if not d.get("owner_profile"):
                             try:
                                 await asyncio.to_thread(
@@ -785,13 +842,6 @@ class GatewayKanbanWatchersMixin:
                                     "kanban notifier: ownership adopt for %s failed: %s",
                                     sub["task_id"], own_exc,
                                 )
-                        # Unsubscribe only when the task has reached a truly
-                        # final status (done / archived). For blocked /
-                        # gave_up / crashed / timed_out the subscription is
-                        # kept alive so the user gets notified again if the
-                        # dispatcher respawns the task and it cycles into the
-                        # same state. See the longer comment on TERMINAL_KINDS
-                        # above for the failure mode this prevents.
                         if _is_push_adapter and _wake_kinds and _session_key:
                             try:
                                 from gateway.session import SessionSource
@@ -829,8 +879,8 @@ class GatewayKanbanWatchersMixin:
                                 # deliver_wake preserves the synthetic
                                 # MessageEvent/handle_message path for
                                 # push-capable adapters (the non-push /
-                                # self-post branch is handled BEFORE the
-                                # cursor advance above).
+                                # self-post branch ran BEFORE the cursor
+                                # advance above).
                                 await deliver_wake(
                                     adapter,
                                     text=_synth,
@@ -852,6 +902,13 @@ class GatewayKanbanWatchersMixin:
                                     "kanban notifier: wakeup injection failed for %s: %s",
                                     sub["task_id"], _wk_err, exc_info=True,
                                 )
+                        # Unsubscribe only when the task has reached a truly
+                        # final status (done / archived). For blocked /
+                        # gave_up / crashed / timed_out the subscription is
+                        # kept alive so the user gets notified again if the
+                        # dispatcher respawns the task and it cycles into the
+                        # same state. See the longer comment on TERMINAL_KINDS
+                        # above for the failure mode this prevents.
                         if task_terminal:
                             await asyncio.to_thread(
                                 self._kanban_unsub, sub, board_slug,
@@ -941,6 +998,110 @@ class GatewayKanbanWatchersMixin:
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",
                 profile=notifier_profile,
+            )
+        finally:
+            conn.close()
+
+    def _kanban_confirm_sent(
+        self, sub: dict, event_id: int, board: Optional[str] = None,
+        lease_owner: Optional[str] = None,
+    ) -> None:
+        """Sync helper: durably mark one leased event 'sent'. Runs in to_thread.
+
+        ``lease_owner`` fences the write to this process's live lease.
+        """
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            _kb.confirm_notify_sent(
+                conn,
+                task_id=sub["task_id"],
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+                event_id=event_id,
+                lease_owner=lease_owner,
+            )
+        finally:
+            conn.close()
+
+    def _kanban_record_failure(
+        self,
+        sub: dict,
+        event_id: int,
+        error: str,
+        retry_limit: int,
+        board: Optional[str] = None,
+        owned: bool = True,
+        lease_owner: Optional[str] = None,
+    ) -> str:
+        """Sync helper: record a failed delivery attempt / dead-letter.
+
+        Returns ``'failed'`` (retryable), ``'dead'`` (bound reached; only for
+        an owned sub), or ``'stale'`` (fenced out). ``owned`` gates the 'dead'
+        transition; ``lease_owner`` fences the write. Runs in to_thread.
+        """
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            return _kb.record_notify_failure(
+                conn,
+                task_id=sub["task_id"],
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+                event_id=event_id,
+                error=error,
+                retry_limit=retry_limit,
+                allow_dead=owned,
+                lease_owner=lease_owner,
+            )
+        finally:
+            conn.close()
+
+    def _kanban_release_leases(
+        self, sub: dict, event_ids: "list[int]", board: Optional[str] = None,
+        lease_owner: Optional[str] = None,
+    ) -> None:
+        """Sync helper: release pending leases without burning an attempt.
+
+        Used when delivery is abandoned for a non-failure reason (adapter
+        disconnected between lease and send, unknown platform). ``lease_owner``
+        fences the release to this process's live lease. Runs in to_thread.
+        """
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            _kb.release_notify_leases(
+                conn,
+                task_id=sub["task_id"],
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+                event_ids=event_ids,
+                lease_owner=lease_owner,
+            )
+        finally:
+            conn.close()
+
+    def _kanban_advance_confirmed(
+        self, sub: dict, kinds, board: Optional[str] = None,
+    ) -> None:
+        """Sync helper: advance the cursor over the confirmed prefix. to_thread.
+
+        Delegates to :func:`kanban_db.advance_notify_cursor_over_confirmed`,
+        which only moves the cursor past events durably marked 'sent'/'dead'.
+        """
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            _kb.advance_notify_cursor_over_confirmed(
+                conn,
+                task_id=sub["task_id"],
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+                kinds=kinds,
             )
         finally:
             conn.close()

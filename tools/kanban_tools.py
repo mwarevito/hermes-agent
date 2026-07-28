@@ -1414,16 +1414,10 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
         chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or None
         message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "") or ""
-        notifier_profile = (
-            get_session_env("HERMES_SESSION_PROFILE", "")
-            or os.environ.get("HERMES_PROFILE")
-        )
-        if not notifier_profile:
-            try:
-                from hermes_cli.profiles import get_active_profile_name
-                notifier_profile = get_active_profile_name() or "default"
-            except Exception:
-                notifier_profile = "default"
+        # Upstream v2026.8.3 prefers the per-session profile env here; keep that
+        # preference, but the never-NULL floor stays our single source of truth
+        # (_kb.resolve_notifier_profile, applied below).
+        session_profile = get_session_env("HERMES_SESSION_PROFILE", "") or ""
         delivery_metadata: dict[str, Any] = {}
         if thread_id:
             delivery_metadata["thread_id"] = thread_id
@@ -1442,6 +1436,13 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
 
         # Lazy-import to keep the module-level dependency light
         from hermes_cli import kanban_db as _kb
+        # Authoritative, never-NULL owner. Using os.environ["HERMES_PROFILE"]
+        # alone silently stored NULL for the default profile (which does not
+        # export that env var), leaving the subscription ownerless — the
+        # 2026-07-27 silent terminal-notification loss. resolve_notifier_profile
+        # falls back to get_active_profile_name(), the exact identity the
+        # gateway notifier watcher uses, so default-profile subs are owned.
+        notifier_profile = session_profile or _kb.resolve_notifier_profile()
         _kb.add_notify_sub(
             conn, task_id=task_id,
             platform=platform, chat_id=chat_id,

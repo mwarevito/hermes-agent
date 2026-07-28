@@ -2302,6 +2302,18 @@ DEFAULT_CONFIG = {
         # large bulk-load of triage tasks from spending a burst of aux
         # LLM calls in one tick. Excess tasks defer to the next tick.
         "auto_decompose_per_tick": 3,
+        # Terminal-notification delivery durability (kanban_notify_deliveries).
+        # notify_retry_limit: bounded per-event gateway send attempts before
+        # the event is dead-lettered (operator-visible via
+        # kanban_db.list_dead_letter_deliveries, never re-tried) so one
+        # permanently-undeliverable chat can't wedge the subscription.
+        # notify_lease_seconds: how long a claimed (in-flight) delivery lease
+        # is honored before another gateway tick may re-lease it — covers the
+        # crash-between-lease-and-send window so a dead gateway's claim does
+        # not silently swallow the event. Both have code-level fallbacks in
+        # kanban_db, so an older config.yaml without them still works.
+        "notify_retry_limit": 5,
+        "notify_lease_seconds": 120,
         # Stale detection: running tasks that have exceeded this many
         # seconds without a heartbeat (since ``last_heartbeat_at``) are
         # auto-reclaimed to ``ready`` on the next dispatcher tick. The

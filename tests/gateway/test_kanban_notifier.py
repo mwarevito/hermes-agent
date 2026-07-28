@@ -413,9 +413,15 @@ def _unseen_terminal_events_for(tid, chat_id):
 def test_kanban_notifier_isolates_per_subscription_failure(tmp_path, monkeypatch):
     """One bad subscription must not block delivery for all others.
 
-    Regression for #59269: when claim_unseen_events_for_sub raises for one
+    Regression for #59269: when the per-subscription event claim raises for one
     subscription, the entire notifier tick used to abort — silently blocking
     delivery for every other subscription.
+
+    The claim step here is ``lease_unseen_deliveries`` (the durable
+    kanban_notify_deliveries ledger), which replaced the cursor-advancing
+    ``claim_unseen_events_for_sub`` in the notifier loop. The isolation
+    guarantee under test — one raising subscription must not abort the tick —
+    is unchanged; only the function the fault is injected into moved.
     """
     db_path = tmp_path / "isolation.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
@@ -440,14 +446,14 @@ def test_kanban_notifier_isolates_per_subscription_failure(tmp_path, monkeypatch
     finally:
         conn.close()
 
-    original_claim = kb.claim_unseen_events_for_sub
+    original_claim = kb.lease_unseen_deliveries
 
     def selective_claim(conn, task_id, **kwargs):
         if task_id == tid_bad:
             raise RuntimeError("simulated DB corruption for bad task")
         return original_claim(conn, task_id=task_id, **kwargs)
 
-    monkeypatch.setattr(kb, "claim_unseen_events_for_sub", selective_claim)
+    monkeypatch.setattr(kb, "lease_unseen_deliveries", selective_claim)
 
     # Force the failing subscription to be iterated FIRST regardless of the
     # unordered SELECT's scan order.

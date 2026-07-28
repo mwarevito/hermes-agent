@@ -2100,11 +2100,25 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             defer_logical_completion=True,
         )
 
-    summary_request = (
-        "You've reached the maximum number of tool-calling iterations allowed. "
-        "Please provide a final response summarizing what you've found and accomplished so far, "
-        "without calling any more tools."
-    )
+    # A dispatched kanban worker gets a structured CHECKPOINT so a retry can
+    # resume; every other session (interactive personal bot, customer-facing
+    # clinic patient chats) gets a natural summary -- a developer CHECKPOINT
+    # would be bizarre in a patient chat (adversarial-review, 2026-07-28).
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        summary_request = (
+            "You've reached the maximum tool-calling iterations. Without "
+            "calling any more tools, write a CHECKPOINT for whoever resumes "
+            "this task: (1) DONE -- what you completed and verified, with "
+            "concrete artifact refs (file paths, commands, IDs); "
+            "(2) REMAINING -- what is left; (3) NEXT STEP -- the single exact "
+            "next action. Be specific enough to resume without redoing work."
+        )
+    else:
+        summary_request = (
+            "You've reached the maximum number of tool-calling iterations "
+            "allowed. Please provide a final response summarizing what you've "
+            "found and accomplished so far, without calling any more tools."
+        )
     messages.append({"role": "user", "content": summary_request})
 
     try:

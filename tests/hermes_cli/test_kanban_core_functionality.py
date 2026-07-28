@@ -504,6 +504,111 @@ def test_migration_backfills_inflight_run_for_legacy_db(kanban_home):
 
 
 
+def test_cli_runs_verb(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.claim_task(conn, tid)
+        kb.complete_task(conn, tid, result="ok", summary="shipped")
+    finally:
+        conn.close()
+    out = run_slash(f"runs {tid}")
+    assert "completed" in out
+    assert "shipped" in out
+    assert "worker" in out
+
+
+def test_cli_runs_json(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.claim_task(conn, tid)
+        kb.complete_task(
+            conn, tid, result="ok", summary="shipped",
+            metadata={"files": 1},
+        )
+    finally:
+        conn.close()
+    out = run_slash(f"runs {tid} --json")
+    data = json.loads(out)
+    assert len(data) == 1
+    assert data[0]["outcome"] == "completed"
+    assert data[0]["metadata"] == {"files": 1}
+
+
+def test_cli_complete_with_summary_and_metadata(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    # JSON metadata must round-trip through shlex + argparse.
+    meta = '{"files": 3}'
+    out = run_slash(
+        "complete " + tid + " --summary \"done it\" --metadata '" + meta + "'"
+    )
+    assert "Completed" in out
+    conn = kb.connect()
+    try:
+        r = kb.latest_run(conn, tid)
+    finally:
+        conn.close()
+    assert r.summary == "done it"
+    assert r.metadata == {"files": 3}
+
+
+def test_cli_edit_backfills_result_on_done_task(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.complete_task(conn, tid)
+    finally:
+        conn.close()
+
+    meta = '{"source": "dashboard-recovery"}'
+    out = run_slash(
+        "edit " + tid
+        + " --result \"DECIDED: done\""
+        + " --summary \"DECIDED: done\""
+        + " --metadata '" + meta + "'"
+    )
+
+    assert "Edited" in out
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        run = kb.latest_run(conn, tid)
+        events = kb.list_events(conn, tid)
+    finally:
+        conn.close()
+    assert task.result.startswith("DECIDED: done")
+    assert run.summary == "DECIDED: done"
+    assert run.metadata == {"source": "dashboard-recovery"}
+    assert events[-1].kind == "edited"
+
+
+def test_cli_edit_rejects_non_done_task(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+    finally:
+        conn.close()
+
+    out = run_slash(f"edit {tid} --result nope")
+
+    assert "not done" in out
+
+
+def test_cli_complete_bad_metadata_exits_nonzero(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    out = run_slash(f"complete {tid} --metadata not-json")
+    assert "metadata" in out.lower()
 
 
 # -------------------------------------------------------------------------
@@ -1408,3 +1513,123 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         conn.close()
 
 
+def test_dispatch_once_integrates_stale_detection(kanban_home, monkeypatch):
+    """dispatch_once with stale_timeout_seconds reclaims stale running tasks."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="stale-dispatch", assignee="worker")
+        kb.claim_task(conn, t)
+        kb._set_worker_pid(conn, t, 99999)  # fake PID — avoid killing test
+
+        five_hours_ago = int(time.time()) - (5 * 3600)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET started_at = ? WHERE id = ?", (five_hours_ago, t)
+            )
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? "
+                "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (five_hours_ago, t),
+            )
+
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda tsk, ws: None,
+            stale_timeout_seconds=14400,
+        )
+        assert t in res.stale, "Stale task should appear in result.stale"
+        assert kb.get_task(conn, t).status == "ready"
+
+
+def test_dispatch_once_stale_disabled_when_timeout_zero(kanban_home, monkeypatch):
+    """dispatch_once with stale_timeout_seconds=0 skips stale detection."""
+    # Use os.getpid() so _pid_alive → True, preventing detect_crashed_workers
+    # from reclaiming. Only stale detection (disabled via timeout=0) is tested.
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="skip-stale", assignee="worker")
+        kb.claim_task(conn, t)
+        # Claim sets worker_pid to 0 initially. Set it to os.getpid() so the
+        # crash detector sees a live PID and skips it.
+        kb._set_worker_pid(conn, t, os.getpid())
+
+        five_hours_ago = int(time.time()) - (5 * 3600)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET started_at = ? WHERE id = ?", (five_hours_ago, t)
+            )
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? "
+                "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (five_hours_ago, t),
+            )
+
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda tsk, ws: None,
+            stale_timeout_seconds=0,
+        )
+        assert res.stale == [], "stale_timeout_seconds=0 should disable detection"
+        assert kb.get_task(conn, t).status == "running"
+
+
+# ---- FIX D checkpoint-summary persistence tests (batch 3) ----------------
+
+def test_record_task_failure_persists_summary_timed_out(kanban_home, all_assignees_spawnable):
+    """A timed_out (budget-exhausted) run now carries the model's checkpoint
+    summary so the retry can resume from it via build_worker_context."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="big", assignee="worker")
+        kb.claim_task(conn, tid)
+        kb._record_task_failure(
+            conn, tid, error="budget", outcome="timed_out",
+            release_claim=True, end_run=True,
+            summary="CHECKPOINT: DONE x; REMAINING y; NEXT z",
+            failure_limit=5,
+        )
+        run = kb.latest_run(conn, tid)
+        ctx = kb.build_worker_context(conn, tid)
+    finally:
+        conn.close()
+    assert run.summary and "NEXT z" in run.summary
+    assert "NEXT z" in ctx
+
+
+def test_record_task_failure_persists_summary_gave_up(kanban_home, all_assignees_spawnable):
+    """The gave_up (circuit-breaker) branch persists the summary too."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="big", assignee="worker", max_retries=1)
+        kb.claim_task(conn, tid)
+        tripped = kb._record_task_failure(
+            conn, tid, error="budget", outcome="timed_out",
+            release_claim=True, end_run=True,
+            summary="CHECKPOINT gave up here", failure_limit=1,
+        )
+        assert tripped is True
+        run = kb.latest_run(conn, tid)
+    finally:
+        conn.close()
+    assert run.summary and "gave up here" in run.summary
+
+
+def test_record_task_failure_summary_capped(kanban_home, all_assignees_spawnable):
+    """An oversized checkpoint is capped to _CTX_MAX_FIELD_BYTES on write."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="big", assignee="worker")
+        kb.claim_task(conn, tid)
+        big = "x" * (kb._CTX_MAX_FIELD_BYTES + 5000)
+        kb._record_task_failure(
+            conn, tid, error="budget", outcome="timed_out",
+            release_claim=True, end_run=True, summary=big, failure_limit=5,
+        )
+        run = kb.latest_run(conn, tid)
+    finally:
+        conn.close()
+    assert run.summary is not None
+    assert len(run.summary) <= kb._CTX_MAX_FIELD_BYTES

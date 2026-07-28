@@ -1162,12 +1162,20 @@ class GatewayKanbanWatchersMixin:
                 for p in paths:
                     _add(p)
 
-        # 3. Legacy: paths embedded in task.result.
+        # 3. Legacy: paths embedded in task.result. Fix F now backfills
+        # tasks.result with the FULL multi-line run summary, so scanning it
+        # wholesale would auto-upload any file path a worker names in a
+        # checkpoint (incl. input refs) to the card's Telegram subscribers.
+        # Scan only the first line (mirrors the source-2 summary cap) so the
+        # egress surface is unchanged by the auditable-done backfill
+        # (adversarial-review M3, 2026-07-28).
         if task is not None and getattr(task, "result", None):
-            result_text = str(task.result)
-            paths, _ = adapter.extract_local_files(result_text)
-            for p in paths:
-                _add(p)
+            _rlines = str(task.result).splitlines()
+            result_text = _rlines[0] if _rlines else ""
+            if result_text:
+                paths, _ = adapter.extract_local_files(result_text)
+                for p in paths:
+                    _add(p)
 
         if not candidates:
             return
@@ -1360,6 +1368,25 @@ class GatewayKanbanWatchersMixin:
             )
             stale_timeout_seconds = 0
 
+        # FIX C (2026-07-28): worker-scoped wall-clock cap the dispatcher
+        # stamps on claimed tasks with no explicit runtime limit. Unset ->
+        # code default; 0/negative -> disabled. Only dispatcher-claimed
+        # kanban tasks; interactive/agent sessions are unaffected.
+        raw_default_runtime = kanban_cfg.get(
+            "default_max_runtime_seconds", _kb.DEFAULT_WORKER_MAX_RUNTIME_SECONDS)
+        try:
+            default_max_runtime_seconds = int(raw_default_runtime)
+        except (TypeError, ValueError):
+            logger.warning(
+                "kanban dispatcher: invalid kanban.default_max_runtime_seconds=%r; "
+                "using default %d", raw_default_runtime, _kb.DEFAULT_WORKER_MAX_RUNTIME_SECONDS)
+            default_max_runtime_seconds = _kb.DEFAULT_WORKER_MAX_RUNTIME_SECONDS
+        if default_max_runtime_seconds <= 0:
+            default_max_runtime_seconds = None
+            logger.info("kanban dispatcher: default worker runtime cap disabled")
+        else:
+            logger.info("kanban dispatcher: default_max_runtime_seconds=%d", default_max_runtime_seconds)
+
         # Read kanban.default_assignee — fallback profile for tasks
         # created without an explicit assignee (e.g. via the dashboard).
         # When set, the dispatcher applies it to unassigned ready tasks
@@ -1496,6 +1523,7 @@ class GatewayKanbanWatchersMixin:
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
+                    default_max_runtime_seconds=default_max_runtime_seconds,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):

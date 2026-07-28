@@ -167,6 +167,7 @@ def finalize_turn(
                             "iterations"
                         ),
                         outcome="timed_out",
+                        summary=final_response,
                         release_claim=True,
                         end_run=True,
                         event_payload_extra={

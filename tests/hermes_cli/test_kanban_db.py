@@ -1583,3 +1583,32 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---- FIX F auditable-done tests (batch 3) --------------------------------
+
+def test_complete_backfills_result_from_summary(kanban_home):
+    """A summary-only handoff (the canonical worker path) leaves an
+    auditable tasks.result backfilled from the run summary, not NULL."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="work")
+        assert kb.complete_task(
+            conn, t,
+            summary="shipped 3 files, ran tests",
+            metadata={"changed_files": ["a.py"], "tests_run": ["t1"]},
+        )
+        task = kb.get_task(conn, t)
+        latest = kb.latest_summary(conn, t)
+    assert task.status == "done"
+    assert task.result and "shipped 3 files, ran tests" in task.result
+    assert "handoff metadata" in task.result
+    assert latest == "shipped 3 files, ran tests"
+
+
+def test_complete_explicit_result_not_overwritten(kanban_home):
+    """An explicit result wins; the summary backfill only fills a blank."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="w")
+        assert kb.complete_task(conn, t, result="explicit log line", summary="the summary")
+        task = kb.get_task(conn, t)
+    assert task.result == "explicit log line"

@@ -4932,6 +4932,23 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
+        # FIX F (auditable done, 2026-07-28): the canonical worker handoff is
+        # the structured ``summary``; ``result`` is a legacy log line workers
+        # usually omit, which left ``tasks.result`` NULL while the deliverable
+        # lived only on ``task_runs.summary``/``metadata`` -- a done card was
+        # then unreadable without digging into task_runs. Backfill result from
+        # the run summary (+ a short metadata-keys note) when no explicit
+        # result was given. A dedicated local keeps ``result`` unchanged for
+        # the prose-scan, the completed-event result_len, and _end_run.
+        effective_result = result
+        if not (effective_result and effective_result.strip()):
+            _backfill = (summary or "").strip()
+            if isinstance(metadata, dict) and metadata:
+                _keys = ", ".join(sorted(str(k) for k in metadata))
+                _note = f"[handoff metadata: {_keys}]"
+                _backfill = f"{_backfill}\n\n{_note}" if _backfill else _note
+            if _backfill:
+                effective_result = _backfill
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -4947,7 +4964,7 @@ def complete_task(
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
                 """,
-                (result, now, task_id),
+                (effective_result, now, task_id),
             )
         else:
             cur = conn.execute(
@@ -4965,7 +4982,7 @@ def complete_task(
                    AND status IN ('running', 'ready', 'blocked')
                    AND current_run_id = ?
                 """,
-                (result, now, task_id, int(expected_run_id)),
+                (effective_result, now, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
             return False
@@ -6773,6 +6790,19 @@ DEFAULT_FAILURE_LIMIT = 2
 # Legacy alias — callers / tests still reference the old name.
 DEFAULT_SPAWN_FAILURE_LIMIT = DEFAULT_FAILURE_LIMIT
 
+# Worker-scoped wall-clock cap the dispatcher stamps on a claimed task that
+# has no explicit max_runtime_seconds. Enforced by enforce_max_runtime()
+# against tasks with a live worker_pid only -- never touches interactive /
+# agent sessions. 45 min sits above the observed p-max successful worker run
+# Set to 2h (not 45min): kanban workers exist for LONG jobs (outreach/multi-
+# source research). At 2h the timeout-then-breaker block threshold is ~4h,
+# which equals the existing dispatch_stale_timeout ceiling -- so this cap adds
+# a backstop for a runaway worker without introducing any NEW permanent-block
+# risk beyond the 4h policy already in force. Iteration-exhaustion is handled
+# separately (checkpoint+resume). Long single tasks can set an explicit
+# max_runtime_seconds/max_retries to override. 0 disables.
+DEFAULT_WORKER_MAX_RUNTIME_SECONDS = 2 * 60 * 60
+
 # Max bytes to keep in a single worker log file. The dispatcher truncates
 # and rotates on spawn if the file is larger than this at spawn time.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
@@ -7212,6 +7242,28 @@ def heartbeat_worker(
             run_id=run_id,
         )
     return True
+
+
+def _apply_default_max_runtime(conn: sqlite3.Connection, task_id: str, seconds: int) -> None:
+    """Stamp a default max_runtime_seconds onto a just-claimed worker task.
+
+    Writes the tasks column (what enforce_max_runtime reads) and mirrors it
+    onto the open run row, then emits an audit event. Callers invoke this
+    only when the task column is currently NULL.
+    """
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET max_runtime_seconds = ? WHERE id = ? "
+            "AND max_runtime_seconds IS NULL",
+            (int(seconds), task_id),
+        )
+        conn.execute(
+            "UPDATE task_runs SET max_runtime_seconds = ? WHERE task_id = ? "
+            "AND ended_at IS NULL AND max_runtime_seconds IS NULL",
+            (int(seconds), task_id),
+        )
+        _append_event(conn, task_id, "max_runtime_defaulted",
+                      {"seconds": int(seconds), "source": "kanban.default_max_runtime_seconds"})
 
 
 def enforce_max_runtime(
@@ -7826,6 +7878,7 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    summary: Optional[str] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -7922,6 +7975,7 @@ def _record_task_failure(
                     conn, task_id,
                     outcome="gave_up", status="gave_up",
                     error=error[:500],
+                    summary=(summary[:_CTX_MAX_FIELD_BYTES] if summary else None),
                     metadata={
                         "failures": failures,
                         "trigger_outcome": outcome,
@@ -7967,6 +8021,7 @@ def _record_task_failure(
                     conn, task_id,
                     outcome=outcome, status=outcome,
                     error=error[:500],
+                    summary=(summary[:_CTX_MAX_FIELD_BYTES] if summary else None),
                     metadata={"failures": failures},
                 )
                 _append_event(
@@ -8244,6 +8299,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    default_max_runtime_seconds: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -8278,6 +8334,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            default_max_runtime_seconds=default_max_runtime_seconds,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -8294,6 +8351,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            default_max_runtime_seconds=default_max_runtime_seconds,
         )
         # Still under the dispatch lock: opportunistically truncate the WAL
         # at a coarse interval so it cannot grow unbounded between restarts.
@@ -8314,6 +8372,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    default_max_runtime_seconds: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -8561,6 +8620,17 @@ def _dispatch_once_locked(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        # FIX C (2026-07-28): worker-scoped default runtime cap. A dispatcher-
+        # spawned worker whose task set no explicit limit gets a wall-clock
+        # ceiling so it cannot grind for hours (the 105-min zero-result
+        # incident). enforce_max_runtime reads tasks.max_runtime_seconds, so we
+        # stamp the task column; only dispatcher claims reach here, so human-
+        # pulled lanes are never auto-killed.
+        if (default_max_runtime_seconds is not None
+                and default_max_runtime_seconds > 0
+                and claimed.max_runtime_seconds is None):
+            _apply_default_max_runtime(conn, claimed.id, int(default_max_runtime_seconds))
+            claimed.max_runtime_seconds = int(default_max_runtime_seconds)
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -8653,6 +8723,10 @@ def _dispatch_once_locked(
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        # NOTE: the default runtime cap is intentionally NOT stamped on the
+        # review lane -- enforce_max_runtime requeues a timed-out task to
+        # status='ready' (not 'review'), which would silently downgrade a
+        # review agent to a plain worker (adversarial-review M1, 2026-07-28).
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":

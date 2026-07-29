@@ -2074,6 +2074,33 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
 
 
+def _max_iterations_summary_request(agent) -> str:
+    """The final-turn prompt when a session hits max tool iterations.
+
+    Batch-4 D4: only the ROOT kanban worker gets the resumable CHECKPOINT
+    (DONE / REMAINING / NEXT STEP) so a retry can continue. A delegated
+    subagent (e.g. a plan critic) runs in the SAME process and inherits
+    HERMES_KANBAN_TASK via os.environ, but it is not the worker -- it, and
+    every interactive / clinic-patient session, gets the plain summary.
+    Discriminates on the per-agent parent_session_id (set for subagents,
+    None for the root worker session), NOT the process-global env.
+    """
+    if os.environ.get("HERMES_KANBAN_TASK") and not getattr(agent, "_parent_session_id", None):
+        return (
+            "You've reached the maximum tool-calling iterations. Without "
+            "calling any more tools, write a CHECKPOINT for whoever resumes "
+            "this task: (1) DONE -- what you completed and verified, with "
+            "concrete artifact refs (file paths, commands, IDs); "
+            "(2) REMAINING -- what is left; (3) NEXT STEP -- the single exact "
+            "next action. Be specific enough to resume without redoing work."
+        )
+    return (
+        "You've reached the maximum number of tool-calling iterations "
+        "allowed. Please provide a final response summarizing what you've "
+        "found and accomplished so far, without calling any more tools."
+    )
+
+
 def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
     print(f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary...")
@@ -2104,21 +2131,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     # resume; every other session (interactive personal bot, customer-facing
     # clinic patient chats) gets a natural summary -- a developer CHECKPOINT
     # would be bizarre in a patient chat (adversarial-review, 2026-07-28).
-    if os.environ.get("HERMES_KANBAN_TASK"):
-        summary_request = (
-            "You've reached the maximum tool-calling iterations. Without "
-            "calling any more tools, write a CHECKPOINT for whoever resumes "
-            "this task: (1) DONE -- what you completed and verified, with "
-            "concrete artifact refs (file paths, commands, IDs); "
-            "(2) REMAINING -- what is left; (3) NEXT STEP -- the single exact "
-            "next action. Be specific enough to resume without redoing work."
-        )
-    else:
-        summary_request = (
-            "You've reached the maximum number of tool-calling iterations "
-            "allowed. Please provide a final response summarizing what you've "
-            "found and accomplished so far, without calling any more tools."
-        )
+    summary_request = _max_iterations_summary_request(agent)
     messages.append({"role": "user", "content": summary_request})
 
     try:

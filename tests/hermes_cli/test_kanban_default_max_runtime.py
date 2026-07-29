@@ -14,11 +14,34 @@ import pytest
 def isolated_kanban_home(monkeypatch):
     test_home = tempfile.mkdtemp(prefix="kanban_default_maxrt_test_")
     monkeypatch.setenv("HERMES_HOME", test_home)
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
-    from hermes_cli import kanban_db
-    yield kanban_db, test_home
+    # Purge + re-import so module-level HERMES_HOME-derived state is rebuilt
+    # against the temp home. The purged entries MUST be restored afterwards:
+    # leaving a second, freshly-imported hermes_cli.kanban_db in sys.modules
+    # splits its module-level one-shot state (connect fallback/warn latches)
+    # from the instance other already-imported test modules hold, which
+    # silently breaks THEIR assertions when they run after this file
+    # (tests/hermes_cli/test_kanban_db.py caplog checks, 2026-08-06).
+    _purged = {
+        name: mod
+        for name, mod in list(sys.modules.items())
+        if name.startswith("hermes_cli")
+        or name.startswith("hermes_state")
+        or name == "hermes_constants"
+    }
+    for name in _purged:
+        del sys.modules[name]
+    try:
+        from hermes_cli import kanban_db
+        yield kanban_db, test_home
+    finally:
+        for name in [
+            n for n in list(sys.modules)
+            if n.startswith("hermes_cli")
+            or n.startswith("hermes_state")
+            or n == "hermes_constants"
+        ]:
+            del sys.modules[name]
+        sys.modules.update(_purged)
 
 
 def _fake_spawn(*args, **kwargs):

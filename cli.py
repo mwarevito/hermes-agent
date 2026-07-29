@@ -18262,6 +18262,29 @@ def main(
             single_query_image_urls: list[str] = []
             _kanban_task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
             if _kanban_task_id:
+                # Batch-4 R1: stamp THIS worker session as the owner of its
+                # run row before the first turn, so a delegated subagent (plan
+                # critic) running later in this same process -- sharing the
+                # HERMES_KANBAN_* env but holding a different per-agent
+                # session_id -- cannot complete/block the task out from under
+                # the worker. First-writer-wins; best-effort, never blocks boot.
+                _kb_run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
+                if _kb_run_id_raw:
+                    try:
+                        from hermes_cli import kanban_db as _kb_owner
+                        _oconn = _kb_owner.connect()
+                        try:
+                            _kb_owner.stamp_run_owner_session(
+                                _oconn, int(_kb_run_id_raw),
+                                cli.session_id or "",
+                            )
+                        finally:
+                            try:
+                                _oconn.close()
+                            except Exception:
+                                pass
+                    except Exception as _oexc:
+                        logger.debug("kanban owner-stamp failed: %s", _oexc)
                 try:
                     from hermes_cli import kanban_db as _kb
                     from agent.image_routing import extract_image_refs as _extract_refs

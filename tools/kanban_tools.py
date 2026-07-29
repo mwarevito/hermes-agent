@@ -751,6 +751,8 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    caller_session_id=kw.get("session_id") or "",
+                    require_owner=bool(os.environ.get("HERMES_KANBAN_TASK")),
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -850,6 +852,8 @@ def _handle_block(args: dict, **kw) -> str:
                 reason=reason,
                 kind=kind,
                 expected_run_id=_worker_run_id(tid),
+                caller_session_id=kw.get("session_id") or "",
+                require_owner=bool(os.environ.get("HERMES_KANBAN_TASK")),
             )
             if not ok:
                 return tool_error(

@@ -130,6 +130,27 @@ def _release_singleton_lock(handle) -> None:
         pass
 
 
+def _artifact_paths_from_payload(event_payload) -> list:
+    """Batch-4 D2: the ONLY egress source for kanban artifact delivery.
+
+    A file reaches the card's Telegram subscribers only when the worker
+    deliberately calls ``kanban_complete(artifacts=[...])``. Scanning the
+    free-text ``summary`` / ``task.result`` for file paths was removed: it
+    auto-uploaded any path a worker merely *mentioned* (input refs,
+    checkpoints, examples) -- including to the 4 clinic/patient bots. Returns
+    the explicit string paths in order; callers still validate existence and
+    apply ``filter_local_delivery_paths`` before sending.
+    """
+    out = []
+    if isinstance(event_payload, dict):
+        raw = event_payload.get("artifacts")
+        if isinstance(raw, (list, tuple)):
+            for item in raw:
+                if isinstance(item, str) and item:
+                    out.append(item)
+    return out
+
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
@@ -1122,10 +1143,11 @@ class GatewayKanbanWatchersMixin:
         the deliverable as a native upload instead of a path printed in
         chat.
 
-        Sources scanned, in priority order:
-          1. ``event_payload['artifacts']`` (explicit list — preferred)
-          2. ``event_payload['summary']`` (truncated first line)
-          3. ``task.result`` (legacy fallback)
+        Only the explicit ``event_payload['artifacts']`` list is
+        delivered (Batch-4 D2). Free-text summary / task.result path
+        scanning was removed: it auto-uploaded any path a worker merely
+        mentioned to the card's Telegram subscribers (incl. the
+        clinic/patient bots).
 
         Files are deduplicated, missing files are silently skipped (the
         path may have been mentioned for reference only), and delivery
@@ -1147,35 +1169,9 @@ class GatewayKanbanWatchersMixin:
             seen.add(expanded)
             candidates.append(expanded)
 
-        # 1. Explicit artifacts list in payload.
-        if isinstance(event_payload, dict):
-            raw = event_payload.get("artifacts")
-            if isinstance(raw, (list, tuple)):
-                for item in raw:
-                    if isinstance(item, str):
-                        _add(item)
-
-            # 2. Paths embedded in the payload summary.
-            summary = event_payload.get("summary")
-            if isinstance(summary, str) and summary:
-                paths, _ = adapter.extract_local_files(summary)
-                for p in paths:
-                    _add(p)
-
-        # 3. Legacy: paths embedded in task.result. Fix F now backfills
-        # tasks.result with the FULL multi-line run summary, so scanning it
-        # wholesale would auto-upload any file path a worker names in a
-        # checkpoint (incl. input refs) to the card's Telegram subscribers.
-        # Scan only the first line (mirrors the source-2 summary cap) so the
-        # egress surface is unchanged by the auditable-done backfill
-        # (adversarial-review M3, 2026-07-28).
-        if task is not None and getattr(task, "result", None):
-            _rlines = str(task.result).splitlines()
-            result_text = _rlines[0] if _rlines else ""
-            if result_text:
-                paths, _ = adapter.extract_local_files(result_text)
-                for p in paths:
-                    _add(p)
+        # D2 (Batch-4): explicit, validated artifacts list ONLY.
+        for _p in _artifact_paths_from_payload(event_payload):
+            _add(_p)
 
         if not candidates:
             return

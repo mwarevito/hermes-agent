@@ -1326,7 +1326,8 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    owner_session_id    TEXT
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -2621,6 +2622,21 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             (new, old),
         )
 
+    # Batch-4 R1: task_runs.owner_session_id pins the worker session that
+    # legitimately owns a run, so a delegated subagent (e.g. a plan critic)
+    # sharing the process env cannot complete/block the worker's task.
+    # task_runs is otherwise only rebuilt on TYPE drift, so this additive
+    # pass is the only place the column reaches legacy DBs.
+    _has_task_runs = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_runs'"
+    ).fetchone()
+    if _has_task_runs:
+        _run_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")}
+        if "owner_session_id" not in _run_cols:
+            _add_column_if_missing(
+                conn, "task_runs", "owner_session_id", "owner_session_id TEXT"
+            )
+
     _rebuild_drifted_tables(conn)
 
 
@@ -2663,7 +2679,7 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
-        " error TEXT)",
+        " error TEXT, owner_session_id TEXT)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",
@@ -4257,6 +4273,7 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    default_max_runtime_seconds: Optional[int] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -4362,6 +4379,30 @@ def claim_task(
             {"lock": lock, "expires": expires, "run_id": run_id},
             run_id=run_id,
         )
+        # D5 (Batch-4): fold the dispatcher's default runtime-cap stamp INTO
+        # the claim txn so there is no window where a claimed worker runs
+        # without its wall-clock ceiling. Only stamps when the task set no
+        # explicit cap; emits max_runtime_defaulted so D1 (review-cap cleanup)
+        # can tell an auto-cap from a human-set one. Targets the just-created
+        # run row by id (precise) and the task column enforce_max_runtime reads.
+        if (default_max_runtime_seconds is not None
+                and default_max_runtime_seconds > 0
+                and (trow is None or trow["max_runtime_seconds"] is None)):
+            _cap = int(default_max_runtime_seconds)
+            conn.execute(
+                "UPDATE tasks SET max_runtime_seconds = ? WHERE id = ?",
+                (_cap, task_id),
+            )
+            conn.execute(
+                "UPDATE task_runs SET max_runtime_seconds = ? WHERE id = ?",
+                (_cap, run_id),
+            )
+            _append_event(
+                conn, task_id, "max_runtime_defaulted",
+                {"seconds": _cap,
+                 "source": "kanban.default_max_runtime_seconds"},
+                run_id=run_id,
+            )
         claimed = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
@@ -4371,6 +4412,37 @@ def claim_task(
         run_id=run_id,
     )
     return claimed
+
+
+def _is_auto_default_max_runtime(
+    conn: sqlite3.Connection, task_id: str, current_cap: Optional[int]
+) -> bool:
+    """True when tasks.max_runtime_seconds is the dispatcher auto-cap.
+
+    Batch-4 D1: the impl-phase claim (FIX C / D5) persists an auto-cap on
+    ``tasks.max_runtime_seconds`` and emits a ``max_runtime_defaulted`` event.
+    The review lane must NOT keep that auto-cap: ``enforce_max_runtime`` reads
+    the task column and a timed-out run is requeued to ``ready`` (worker),
+    silently downgrading a review to a plain worker task. An EXPLICIT human cap
+    (no such event, or a later value that differs from the last defaulted one)
+    is honoured. Compares the current cap against the most recent
+    ``max_runtime_defaulted`` payload so a human override is never mistaken for
+    the auto-cap.
+    """
+    if current_cap is None:
+        return False
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'max_runtime_defaulted' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if not row or not row["payload"]:
+        return False
+    try:
+        payload = json.loads(row["payload"])
+        return int(payload.get("seconds", -1)) == int(current_cap)
+    except (ValueError, TypeError):
+        return False
 
 
 def claim_review_task(
@@ -4411,6 +4483,25 @@ def claim_review_task(
         )
         if cur.rowcount != 1:
             return None
+        # D1 (Batch-4): a review run must not carry the impl-phase auto-cap.
+        # enforce_max_runtime reads tasks.max_runtime_seconds and requeues a
+        # timed-out run to 'ready' -- silently downgrading review->worker.
+        # Clear ONLY the dispatcher auto-cap (max_runtime_defaulted with a
+        # matching value); an explicit human cap is left intact. Self-heals:
+        # a later impl re-claim re-stamps the auto-cap via claim_task.
+        _pre = conn.execute(
+            "SELECT max_runtime_seconds FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        _pre_cap = _pre["max_runtime_seconds"] if _pre else None
+        if _is_auto_default_max_runtime(conn, task_id, _pre_cap):
+            conn.execute(
+                "UPDATE tasks SET max_runtime_seconds = NULL WHERE id = ?",
+                (task_id,),
+            )
+            _append_event(
+                conn, task_id, "max_runtime_cap_cleared_for_review",
+                {"cleared_seconds": int(_pre_cap)},
+            )
         trow = conn.execute(
             "SELECT assignee, max_runtime_seconds, current_step_key "
             "FROM tasks WHERE id = ?",
@@ -4861,6 +4952,63 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def stamp_run_owner_session(
+    conn: sqlite3.Connection, run_id: int, session_id: str
+) -> None:
+    """Record the owning worker session on a run row (first-writer-wins).
+
+    Called once at worker boot (cli.py quiet-mode path) with the worker's
+    own ``session_id``. A delegated subagent that runs later in the SAME
+    process holds a *different* per-agent ``session_id`` (agent_init assigns
+    a fresh one), so once the worker has stamped ownership the subagent's
+    completion attempt fails the ownership gate in ``complete_task`` /
+    ``block_task``. Idempotent: the ``owner_session_id IS NULL`` guard means
+    only the first writer wins and a re-stamp is a no-op. Best-effort; a
+    missing/renamed run row simply matches zero rows.
+    """
+    if not session_id or run_id is None:
+        return
+    try:
+        rid = int(run_id)
+    except (TypeError, ValueError):
+        return
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE task_runs SET owner_session_id = ? "
+            "WHERE id = ? AND owner_session_id IS NULL",
+            (session_id, rid),
+        )
+
+
+def carry_run_owner_session(
+    conn: sqlite3.Connection, run_id: int, new_session_id: str,
+) -> None:
+    """Re-stamp a run's owner to the current worker session (self-healing).
+
+    A kanban worker's ``agent.session_id`` rotates when it compacts context
+    (conversation_compression). Without this the boot-stamped owner goes stale
+    and the ownership gate in :func:`complete_task` would FALSE-BLOCK the
+    worker from completing its OWN task (adversarial-review blocker, 2026-07-28).
+    Carries by run_id UNCONDITIONALLY (not ``WHERE owner=old``) so a single
+    transient failure cannot permanently strand ownership: the NEXT rotation
+    re-asserts the current session as owner regardless of the stale value
+    (Codex review P1). Anti-hijack is enforced at the CALL SITE -- only the
+    root worker (``_parent_session_id`` is None) calls this; a fork/subagent
+    never reaches it. Best-effort; a missing/renamed run matches zero rows.
+    """
+    if not new_session_id or run_id is None:
+        return
+    try:
+        rid = int(run_id)
+    except (TypeError, ValueError):
+        return
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE task_runs SET owner_session_id = ? WHERE id = ?",
+            (new_session_id, rid),
+        )
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4870,6 +5018,8 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    caller_session_id: Optional[str] = None,
+    require_owner: bool = False,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -4900,6 +5050,39 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+
+    # Batch-4 R1 ownership gate: only the worker session that booted this
+    # run may complete it. A delegated subagent (plan critic) shares the
+    # process env (HERMES_KANBAN_TASK/RUN_ID) but has a different per-agent
+    # session_id, so it is rejected here. ``require_owner`` is set only on the
+    # worker tool path; CLI/orchestrator/dashboard completions leave it False
+    # and are never gated. owner IS NULL -> fall through (legacy run, or the
+    # boot-stamp has not landed yet; safe, because a subagent can only run
+    # AFTER the worker's first turn, by which point the stamp exists).
+    if require_owner:
+        _rid = expected_run_id
+        if _rid is None:
+            _trow = conn.execute(
+                "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            _rid = _trow["current_run_id"] if _trow else None
+        if _rid is not None:
+            _orow = conn.execute(
+                "SELECT owner_session_id FROM task_runs WHERE id = ?",
+                (int(_rid),),
+            ).fetchone()
+            _owner = _orow["owner_session_id"] if _orow else None
+            if _owner is not None and _owner != (caller_session_id or ""):
+                with write_txn(conn):
+                    _append_event(
+                        conn, task_id, "completion_blocked_ownership",
+                        {
+                            "run_id": int(_rid),
+                            "owner_session": _owner,
+                            "caller_session": caller_session_id or None,
+                        },
+                    )
+                return False
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -5667,6 +5850,8 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    caller_session_id: Optional[str] = None,
+    require_owner: bool = False,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -5699,6 +5884,33 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    # Batch-4 R1 ownership gate (see complete_task): a delegated subagent
+    # may not block the worker's task out from under it. owner IS NULL ->
+    # fall through (legacy / pre-boot-stamp; safe).
+    if require_owner:
+        _rid = expected_run_id
+        if _rid is None:
+            _trow = conn.execute(
+                "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            _rid = _trow["current_run_id"] if _trow else None
+        if _rid is not None:
+            _orow = conn.execute(
+                "SELECT owner_session_id FROM task_runs WHERE id = ?",
+                (int(_rid),),
+            ).fetchone()
+            _owner = _orow["owner_session_id"] if _orow else None
+            if _owner is not None and _owner != (caller_session_id or ""):
+                with write_txn(conn):
+                    _append_event(
+                        conn, task_id, "block_blocked_ownership",
+                        {
+                            "run_id": int(_rid),
+                            "owner_session": _owner,
+                            "caller_session": caller_session_id or None,
+                        },
+                    )
+                return False
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
@@ -7244,28 +7456,6 @@ def heartbeat_worker(
     return True
 
 
-def _apply_default_max_runtime(conn: sqlite3.Connection, task_id: str, seconds: int) -> None:
-    """Stamp a default max_runtime_seconds onto a just-claimed worker task.
-
-    Writes the tasks column (what enforce_max_runtime reads) and mirrors it
-    onto the open run row, then emits an audit event. Callers invoke this
-    only when the task column is currently NULL.
-    """
-    with write_txn(conn):
-        conn.execute(
-            "UPDATE tasks SET max_runtime_seconds = ? WHERE id = ? "
-            "AND max_runtime_seconds IS NULL",
-            (int(seconds), task_id),
-        )
-        conn.execute(
-            "UPDATE task_runs SET max_runtime_seconds = ? WHERE task_id = ? "
-            "AND ended_at IS NULL AND max_runtime_seconds IS NULL",
-            (int(seconds), task_id),
-        )
-        _append_event(conn, task_id, "max_runtime_defaulted",
-                      {"seconds": int(seconds), "source": "kanban.default_max_runtime_seconds"})
-
-
 def enforce_max_runtime(
     conn: sqlite3.Connection,
     *,
@@ -8617,20 +8807,18 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        # FIX C (2026-07-28) + D5 (Batch-4): worker-scoped default runtime
+        # cap, folded INTO the claim txn (atomic) so there is no window where
+        # a claimed worker runs without its wall-clock ceiling. Only dispatcher
+        # claims pass the default, so human-pulled lanes are never auto-killed;
+        # claim_task skips the stamp when the task set an explicit cap and
+        # emits max_runtime_defaulted so D1 can tell auto from explicit.
+        claimed = claim_task(
+            conn, row["id"], ttl_seconds=ttl_seconds,
+            default_max_runtime_seconds=default_max_runtime_seconds,
+        )
         if claimed is None:
             continue
-        # FIX C (2026-07-28): worker-scoped default runtime cap. A dispatcher-
-        # spawned worker whose task set no explicit limit gets a wall-clock
-        # ceiling so it cannot grind for hours (the 105-min zero-result
-        # incident). enforce_max_runtime reads tasks.max_runtime_seconds, so we
-        # stamp the task column; only dispatcher claims reach here, so human-
-        # pulled lanes are never auto-killed.
-        if (default_max_runtime_seconds is not None
-                and default_max_runtime_seconds > 0
-                and claimed.max_runtime_seconds is None):
-            _apply_default_max_runtime(conn, claimed.id, int(default_max_runtime_seconds))
-            claimed.max_runtime_seconds = int(default_max_runtime_seconds)
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":

@@ -163,6 +163,65 @@ class TestRecordFileMutationResult:
 
         assert paths == ["/tmp/project/src/app.py"]
 
+    def _fail_patch(self, agent, path="/tmp/a.md"):
+        """Seed a direct-write failure the verifier is tracking."""
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": path, "old_string": "x", "new_string": "y"},
+            json.dumps({"error": "Could not find old_string"}),
+            is_error=True,
+        )
+        assert path in agent._turn_failed_file_mutations
+
+    def test_read_file_does_not_clear_failure(self):
+        # A read after a failed write proves nothing about whether the write
+        # landed — it must never launder a real failure out of the footer.
+        agent = _bare_agent()
+        self._fail_patch(agent)
+        agent._record_file_mutation_result(
+            "read_file", {"path": "/tmp/a.md"}, "file contents here", is_error=False,
+        )
+        assert "/tmp/a.md" in agent._turn_failed_file_mutations
+
+    def test_successful_terminal_does_not_clear_failure(self):
+        # A terminal command mentioning the path (even one that mutated it via
+        # sed) is opaque — attributing "this exit-0 changed path P" is unsafe,
+        # so terminal success must not clear a tracked direct-write failure.
+        agent = _bare_agent()
+        self._fail_patch(agent)
+        agent._record_file_mutation_result(
+            "terminal",
+            {"command": "sed -i '' 's/x/y/' /tmp/a.md"},
+            json.dumps({"exit_code": 0, "stdout": "", "stderr": ""}),
+            is_error=False,
+        )
+        assert "/tmp/a.md" in agent._turn_failed_file_mutations
+
+    def test_failed_terminal_does_not_clear_failure(self):
+        agent = _bare_agent()
+        self._fail_patch(agent)
+        agent._record_file_mutation_result(
+            "terminal",
+            {"command": "sed -i '' 's/x/y/' /tmp/a.md"},
+            json.dumps({"exit_code": 1, "stdout": "", "stderr": "boom"}),
+            is_error=True,
+        )
+        assert "/tmp/a.md" in agent._turn_failed_file_mutations
+
+    def test_success_on_different_path_does_not_clear_failure(self):
+        # Clearing is scoped to the exact failed path — a successful write to
+        # some OTHER file must leave the original failure standing.
+        agent = _bare_agent()
+        self._fail_patch(agent, path="/tmp/a.md")
+        agent._record_file_mutation_result(
+            "write_file",
+            {"path": "/tmp/b.md", "content": "ok"},
+            json.dumps({"bytes_written": 2}),
+            is_error=False,
+        )
+        assert "/tmp/a.md" in agent._turn_failed_file_mutations
+        assert "/tmp/b.md" not in agent._turn_failed_file_mutations
+
     def test_write_file_with_lint_error_counts_as_landed(self):
         agent = _bare_agent()
         agent._record_file_mutation_result(
@@ -244,10 +303,28 @@ class TestFormatFooter:
         out = AIAgent._format_file_mutation_failure_footer(
             {"/tmp/a.md": {"tool": "patch", "error_preview": "Could not find old_string"}},
         )
-        assert "1 file(s) were NOT modified" in out
+        assert "1 direct write_file/patch attempt(s) failed" in out
+        assert "NOT modified" not in out  # no absolute disk-state claim
         assert "/tmp/a.md" in out
         assert "Could not find old_string" in out
         assert "git status" in out  # user-actionable hint
+
+    def test_wording_states_direct_attempt_not_absolute_disk_state(self):
+        # The footer must describe only the observable fact — a direct
+        # write_file/patch attempt that failed and wasn't superseded — and must
+        # NOT assert the file's final on-disk state, which the verifier cannot
+        # know (another tool may have changed it).  Regression for the
+        # misleading "NOT modified this turn" claim.
+        out = AIAgent._format_file_mutation_failure_footer(
+            {"/tmp/a.md": {"tool": "patch", "error_preview": "Could not find old_string"}},
+        )
+        assert "NOT modified" not in out
+        assert "direct write_file/patch attempt(s) failed" in out
+        # Acknowledges another tool may have changed the file and points at a
+        # real verification step.
+        assert "terminal/execute_code" in out
+        assert "git status" in out
+        assert "read_file" in out
 
     def test_truncation_at_10_entries(self):
         failed = {
@@ -255,7 +332,7 @@ class TestFormatFooter:
             for i in range(15)
         }
         out = AIAgent._format_file_mutation_failure_footer(failed)
-        assert "15 file(s) were NOT modified" in out
+        assert "15 direct write_file/patch attempt(s) failed" in out
         assert "… and 5 more" in out
         # Ten file bullets + header + "and X more" line
         lines = out.split("\n")

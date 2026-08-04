@@ -5350,6 +5350,13 @@ class TurnRunner:
             _input_toks = getattr(_agent, "session_prompt_tokens", 0)
             _output_toks = getattr(_agent, "session_completion_tokens", 0)
             _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
+        # Compression visibility (2026-08-03): the durable signal that a session
+        # has been compacted (and how often) is the runtime footer's
+        # "сжато ×N" field — the in-chat warning bubble is transient. Carry the
+        # count out of the turn so runtime_footer.build() can render it.
+        _compression_count = 0
+        if _agent and hasattr(_agent, "context_compressor"):
+            _compression_count = getattr(_agent.context_compressor, "compression_count", 0) or 0
         _resolved_model = getattr(_agent, "model", None) if _agent else None
         _resolved_provider = getattr(_agent, "provider", None) if _agent else None
         _fallback_from = getattr(_agent, "_footer_fallback_from", None) if _agent else None
@@ -5498,6 +5505,7 @@ class TurnRunner:
                 "provider": _resolved_provider,
                 "fallback_from": _fallback_from,
                 "context_length": _context_length,
+                "compression_count": _compression_count,
             }
 
         # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -5638,6 +5646,7 @@ class TurnRunner:
             "provider": _resolved_provider,
             "fallback_from": _fallback_from,
             "context_length": _context_length,
+            "compression_count": _compression_count,
             "session_id": effective_session_id,
             "response_previewed": result.get("response_previewed", False),
             "response_transformed": result.get("response_transformed", False),
@@ -8634,6 +8643,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return (enriched_text or text).strip()
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+        # --- Internal gateway-forged events (2026-08-03) ---
+        # Background-process completion notifications and other synthetic
+        # turns are forged in-process with internal=True and often carry no
+        # user identity (user_id=None), so the #17775 sender gate below
+        # dropped them silently — and permanently: the process watcher makes
+        # exactly one injection attempt.  The cold path (_handle_message)
+        # already exempts internal events from user authorization; mirror
+        # that here, but never interrupt the running turn and never send a
+        # busy-ack.
+        #
+        # The event goes STRAIGHT TO THE OVERFLOW TAIL, never the head slot:
+        # the head slot is a merge target (run.py _queue_or_replace_pending_event
+        # and base.py merge_pending_message_event), so a notification parked
+        # there would absorb the user's next message — text glued onto the
+        # process dump, or a photo grafted on with the dump as its caption,
+        # collapsing two turns into one and losing the user's identity and
+        # reply anchor.  _promote_queued_event pulls the overflow head when
+        # the slot is empty, so delivery is preserved either way.
+        if getattr(event, "internal", False):
+            adapter = self.adapters.get(event.source.platform)
+            if adapter is None:
+                return True
+            if self._draining:
+                # Shutting down: the in-memory queue dies with the process, so
+                # say so instead of pretending it was delivered.
+                logger.warning(
+                    "Dropping internal follow-up for session %s — gateway is %s.",
+                    session_key,
+                    self._status_action_gerund(),
+                )
+                return True
+            if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
+                logger.warning(
+                    "Dropping internal follow-up for session %s — pending queue at cap (%d).",
+                    session_key,
+                    self._BUSY_QUEUE_MAX_PENDING,
+                )
+                return True
+            queued_events = getattr(self, "_queued_events", None)
+            if queued_events is None:
+                queued_events = {}
+                self._queued_events = queued_events
+            queued_events.setdefault(session_key, []).append(event)
+            logger.info(
+                "Queued internal event for busy session %s (delivered after the current turn)",
+                session_key,
+            )
+            return True
+
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
         # creating a session.  The busy path must enforce the same check;
@@ -17629,6 +17687,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     turn_seconds=_turn_seconds,
                     provider=agent_result.get("provider"),
                     fallback_from=agent_result.get("fallback_from"),
+                    compression_count=agent_result.get("compression_count", 0) or 0,
                 )
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)
@@ -22892,6 +22951,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.get_pending_message(session_key)  # consume and discard
         if _iac_state is not None:
             _iac_state.persistent.pending_command_text = None
+        self._pending_messages.pop(session_key, None)
+        # Overflow too — otherwise a queued follow-up (a /queue item or a
+        # background-process notification) survives /stop and fires as a
+        # surprise turn after the user's next message.  /new already does this
+        # via slash_commands; the interrupt path did not.
+        queued_events = getattr(self, "_queued_events", None)
+        if queued_events:
+            queued_events.pop(session_key, None)
         if release_running_state:
             self._release_running_agent_state(session_key)
             # Evict the cached agent: ``_interrupt_requested`` is only

@@ -3445,8 +3445,15 @@ def compress_context(
         # not just CLI stdout. _emit_status still _vprints for the CLI, and
         # storing it on _compression_warning lets replay_compression_warning
         # re-deliver it once a late-bound gateway status_callback is wired (#36908).
+        #
+        # Latched on the count (``_last_compression_count_warned``): the
+        # warning must fire ONCE per compaction. Without the latch a session
+        # that re-enters this path for the same count re-nags the user in
+        # chat — the durable signal is the runtime footer's compressions
+        # field, this bubble is only the one-shot heads-up (2026-08-03).
         _cc = agent.context_compressor.compression_count
-        if _cc >= 2:
+        if _cc >= 2 and getattr(agent, "_last_compression_count_warned", 0) != _cc:
+            agent._last_compression_count_warned = _cc
             _cc_msg = (
                 f"{agent.log_prefix}⚠️  Session compressed {_cc} times — "
                 f"accuracy may degrade. Consider /new to start fresh."

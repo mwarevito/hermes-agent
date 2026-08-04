@@ -125,6 +125,7 @@ def format_runtime_footer(
     turn_seconds: Optional[float] = None,
     provider: Optional[str] = None,
     fallback_from: Optional[str] = None,
+    compression_count: int = 0,
     fields: Iterable[str] = _DEFAULT_FIELDS,
 ) -> str:
     """Render the footer line, or return "" if no fields have data.
@@ -159,6 +160,12 @@ def format_runtime_footer(
             rel = _home_relative_cwd(cwd or os.environ.get("TERMINAL_CWD", ""))
             if rel:
                 parts.append(rel)
+        elif field == "compressions":
+            # Visible mid-conversation context-loss indicator (2026-08-03):
+            # each compaction discards 60-75 messages, so the reader should
+            # know the session is running on a summarized history.
+            if compression_count and compression_count > 0:
+                parts.append(f"сжато ×{compression_count}")
         # Unknown field names are silently ignored.
 
     if not parts:
@@ -177,6 +184,7 @@ def build_footer_line(
     turn_seconds: Optional[float] = None,
     provider: Optional[str] = None,
     fallback_from: Optional[str] = None,
+    compression_count: int = 0,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
 
@@ -199,5 +207,6 @@ def build_footer_line(
         turn_seconds=turn_seconds,
         provider=provider,
         fallback_from=fallback_from,
+        compression_count=compression_count,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
     )

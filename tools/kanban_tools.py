@@ -1277,9 +1277,22 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
-    board = args.get("board")
     try:
-        kb, conn = _connect(board=board)
+        # Resolve the target board deterministically instead of silently
+        # inheriting the ambient "current" board. An explicit ``board`` arg or
+        # a worker/dispatcher pin wins; otherwise route by profile/content;
+        # ambiguous → default. See kanban_db.resolve_creation_board.
+        from hermes_cli import kanban_db as _kbmod
+        resolved_board = _kbmod.resolve_creation_board(
+            board=args.get("board"),
+            parents=tuple(parents),
+            assignee=str(assignee) if assignee else None,
+            created_by=os.environ.get("HERMES_PROFILE") or None,
+            tenant=tenant,
+            title=str(title),
+            body=body,
+        )
+        kb, conn = _connect(board=resolved_board)
         try:
             # A project link is safe to inherit because ``create_task`` turns
             # it into a fresh per-task worktree. Never inherit the parent's
@@ -1531,12 +1544,13 @@ _DESC_TASK_ID_DEFAULT = (
 )
 
 _DESC_BOARD = (
-    "Kanban board slug to target. When omitted, the call resolves the "
-    "active board the usual way: HERMES_KANBAN_DB env → "
-    "HERMES_KANBAN_BOARD env → the 'current' symlink under the kanban "
-    "home → 'default'. Pass an explicit slug only when the caller (e.g. "
-    "a Telegram routing layer) needs to override the env-pinned active "
-    "board for this one call."
+    "Kanban board slug to target. An explicit slug pins this call to that "
+    "board. When omitted: a worker/dispatcher pin (HERMES_KANBAN_DB / "
+    "HERMES_KANBAN_BOARD) is always honoured so a spawned worker stays on "
+    "its parent's board; otherwise READ calls use the current board and "
+    "CREATE calls are ROUTED deterministically by profile/content to the "
+    "right board, falling back to 'default' (never the persisted current "
+    "board). Pass an explicit slug to override routing for this one call."
 )
 
 
@@ -1593,8 +1607,8 @@ KANBAN_LIST_SCHEMA = {
             "status": {
                 "type": "string",
                 "enum": [
-                    "triage", "todo", "ready", "running",
-                    "blocked", "done", "archived",
+                    "triage", "todo", "scheduled", "ready", "running",
+                    "blocked", "review", "done", "archived",
                 ],
                 "description": "Optional task status filter.",
             },

@@ -33,11 +33,13 @@ from hermes_cli import kanban_swarm as ks
 # ---------------------------------------------------------------------------
 
 _STATUS_ICONS = {
+    "triage":   "⁇",
     "todo":     "◻",
     "ready":    "▶",
     "running":  "●",
     "scheduled":"⏱",
     "blocked":  "⊘",
+    "review":   "◐",
     "done":     "✓",
     "archived": "—",
 }
@@ -231,18 +233,20 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     # --- global --board flag ---
     # Applies to every subcommand below. When set, scopes all reads and
-    # writes to that board's DB. When omitted, resolves via the
-    # HERMES_KANBAN_BOARD env var, then the persisted current-board
-    # file, then "default". See kanban_db.get_current_board().
+    # writes to that board's DB (an authoritative pin). When omitted, reads
+    # use the *current* board (view selection); creates use deterministic
+    # *routing* by profile/content, falling back to 'default' — never the
+    # current board. See kanban_db.get_current_board / resolve_creation_board.
     kanban_parser.add_argument(
         "--board",
         default=None,
         metavar="<slug>",
         help=(
-            "Board slug to operate on. Defaults to the current board "
-            "(set via `hermes kanban boards switch <slug>` or the "
-            "HERMES_KANBAN_BOARD env var). Use `hermes kanban boards list` "
-            "to see all boards."
+            "Board slug to operate on (pins both reads and creates to it). "
+            "Without it, reads use your current board (`boards switch`), but "
+            "new cards are ROUTED by profile/content to the right board and "
+            "fall back to 'default' — they do NOT follow the current board. "
+            "Use `hermes kanban boards list` to see all boards."
         ),
     )
     sub = kanban_parser.add_subparsers(dest="kanban_action")
@@ -302,13 +306,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     b_switch = boards_sub.add_parser(
         "switch", aliases=["use"],
-        help="Set the active board for subsequent CLI calls",
+        help="Set your current (view) board for subsequent CLI reads. "
+             "Does NOT change where new cards are routed — creates route by "
+             "profile/content and fall back to 'default'. Use --board to pin a create.",
     )
     b_switch.add_argument("slug")
 
     boards_sub.add_parser(
         "show", aliases=["current"],
-        help="Print the currently-active board slug",
+        help="Print your current (view) board slug",
     )
 
     b_rename = boards_sub.add_parser(
@@ -435,6 +441,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                              "(set on tasks created from inside an ACP loop)")
     p_list.add_argument("--archived", action="store_true",
                         help="Include archived tasks")
+    p_list.add_argument(
+        "--all", "--history", action="store_true", dest="history",
+        help="History view: include archived and old done tasks "
+             "(default view shows actionable work plus done from the last 3 days)",
+    )
     p_list.add_argument("--json", action="store_true")
     p_list.add_argument(
         "--sort",
@@ -698,6 +709,27 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         default=None,
         help="Permanently delete already-archived task ids from the board",
     )
+
+    # --- cancel / wont-do ---
+    p_cancel = sub.add_parser(
+        "cancel", aliases=["wont-do"],
+        help="Close one or more tasks as cancelled / won't-do (archived, not done)",
+    )
+    p_cancel.add_argument("task_ids", nargs="+", help="Task ids to cancel")
+    p_cancel.add_argument("--reason", default=None,
+                          help="Why the work won't be done (recorded on the card)")
+
+    # --- retain (safe retention sweep) ---
+    p_retain = sub.add_parser(
+        "retain",
+        help="Idempotently archive old done tasks (never active/blocked; no deletes)",
+    )
+    p_retain.add_argument(
+        "--done-older-than-days", type=int, default=30, dest="done_older_than_days",
+        help="Archive done tasks completed more than N days ago (default: 30)")
+    p_retain.add_argument("--dry-run", action="store_true",
+                          help="Show what would be archived without changing anything")
+    p_retain.add_argument("--json", action="store_true")
 
     # --- tail ---
     p_tail = sub.add_parser("tail", help="Follow a task's event stream")
@@ -1068,6 +1100,9 @@ def kanban_command(args: argparse.Namespace) -> int:
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
+            "cancel":   _cmd_cancel,
+            "wont-do":  _cmd_cancel,
+            "retain":   _cmd_retain,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
             "daemon":   _cmd_daemon,
@@ -1495,13 +1530,25 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    with kb.connect_closing() as conn:
+    created_by = args.created_by or _profile_author()
+    # Route to a board deterministically (explicit --board / worker pin wins,
+    # then profile/content, else default) rather than the persisted current
+    # board. See kanban_db.resolve_creation_board.
+    resolved_board = kb.resolve_creation_board(
+        parents=tuple(args.parent or ()),
+        assignee=args.assignee,
+        created_by=created_by,
+        tenant=args.tenant,
+        title=args.title,
+        body=args.body,
+    )
+    with kb.connect_closing(board=resolved_board) as conn:
         task_id = kb.create_task(
             conn,
             title=args.title,
             body=args.body,
             assignee=args.assignee,
-            created_by=args.created_by or _profile_author(),
+            created_by=created_by,
             workspace_kind=ws_kind,
             workspace_path=ws_path,
             branch_name=branch_name,
@@ -1549,7 +1596,16 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
     if not workers:
         print("kanban swarm: at least one --worker is required", file=sys.stderr)
         return 2
-    with kb.connect_closing() as conn:
+    created_by = args.created_by or _profile_author()
+    # All swarm cards land on one deterministically-resolved board (explicit
+    # --board / worker pin wins, then profile/content, else default).
+    resolved_board = kb.resolve_creation_board(
+        created_by=created_by,
+        tenant=args.tenant,
+        title=args.goal,
+        body=args.goal,
+    )
+    with kb.connect_closing(board=resolved_board) as conn:
         created = ks.create_swarm(
             conn,
             goal=args.goal,
@@ -1557,7 +1613,7 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
             verifier_assignee=args.verifier,
             synthesizer_assignee=args.synthesizer,
             tenant=args.tenant,
-            created_by=args.created_by or _profile_author(),
+            created_by=created_by,
             priority=args.priority,
             idempotency_key=getattr(args, "idempotency_key", None),
         )
@@ -1575,23 +1631,54 @@ def _cmd_list(args: argparse.Namespace) -> int:
     assignee = args.assignee
     if args.mine and not assignee:
         assignee = _profile_author()
+    history = bool(getattr(args, "history", False))
+    # An explicit --status / --archived / --history or any advanced filter
+    # forces the full flat listing (backward compatible). A plain `list`/`ls`
+    # shows the fresh *ordinary* view: everything actionable (blocked included)
+    # plus done from the last 3 days. Archived and stale done live in --history.
+    explicit = bool(
+        args.status or args.archived or history
+        or getattr(args, "sort", None) or args.workflow_template_id
+        or args.current_step_key
+    )
+    stale_ids: set[str] = set()
     with kb.connect_closing() as conn:
         # Cheap "mini-dispatch": recompute ready so list output reflects
         # dependencies that may have cleared since the last dispatcher tick.
         kb.recompute_ready(conn)
-        tasks = kb.list_tasks(
-            conn,
-            assignee=assignee,
-            status=args.status,
-            tenant=args.tenant,
-            session_id=args.session,
-            include_archived=args.archived,
-            order_by=getattr(args, "sort", None),
-            workflow_template_id=args.workflow_template_id,
-            current_step_key=args.current_step_key,
-        )
+        if explicit:
+            tasks = kb.list_tasks(
+                conn,
+                assignee=assignee,
+                status=args.status,
+                tenant=args.tenant,
+                session_id=args.session,
+                include_archived=args.archived or history,
+                order_by=getattr(args, "sort", None),
+                workflow_template_id=args.workflow_template_id,
+                current_step_key=args.current_step_key,
+            )
+        else:
+            tasks = kb.list_ordinary(
+                conn,
+                assignee=assignee,
+                tenant=args.tenant,
+                session_id=args.session,
+            )
+            stale_ids = {
+                t.id for t in kb.list_stale_blocked(
+                    conn,
+                    assignee=assignee,
+                    tenant=args.tenant,
+                    session_id=args.session,
+                )
+            }
     if getattr(args, "json", False):
-        print(json.dumps([_task_to_dict(t) for t in tasks], indent=2, ensure_ascii=False))
+        payload = [_task_to_dict(t) for t in tasks]
+        for d, t in zip(payload, tasks):
+            if t.id in stale_ids:
+                d["needs_decision"] = True
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0
     # Passive discoverability: when the user has multiple boards, surface
     # which one they're looking at in the list header. Single-board users
@@ -1612,7 +1699,15 @@ def _cmd_list(args: argparse.Namespace) -> int:
         print("(no matching tasks)")
         return 0
     for t in tasks:
-        print(_fmt_task_line(t))
+        line = _fmt_task_line(t)
+        if t.id in stale_ids:
+            line += "  ⚠ needs-decision"
+        print(line)
+    if stale_ids:
+        print(
+            f"\n⚠ {len(stale_ids)} blocked task(s) need a decision "
+            f"(blocked ≥7d): " + ", ".join(sorted(stale_ids))
+        )
     return 0
 
 
@@ -2415,6 +2510,51 @@ def _cmd_archive(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _cmd_cancel(args: argparse.Namespace) -> int:
+    ids = list(args.task_ids or [])
+    if not ids:
+        print("at least one task_id is required", file=sys.stderr)
+        return 1
+    reason = getattr(args, "reason", None)
+    failed: list[str] = []
+    with kb.connect_closing() as conn:
+        for tid in ids:
+            if not kb.cancel_task(conn, tid, reason=reason):
+                failed.append(tid)
+                print(f"cannot cancel {tid} (already archived?)", file=sys.stderr)
+            else:
+                print(f"Cancelled {tid}" + (f": {reason}" if reason else ""))
+    return 0 if not failed else 1
+
+
+def _cmd_retain(args: argparse.Namespace) -> int:
+    days = int(getattr(args, "done_older_than_days", 30))
+    dry_run = bool(getattr(args, "dry_run", False))
+    now = int(time.time())
+    cutoff = now - days * 86400
+    with kb.connect_closing() as conn:
+        if dry_run:
+            # Same eligibility predicate as sweep_done_tasks, read-only.
+            rows = conn.execute(
+                "SELECT id FROM tasks WHERE status = 'done' "
+                "AND completed_at IS NOT NULL AND completed_at < ?",
+                (cutoff,),
+            ).fetchall()
+            archived = [r["id"] for r in rows]
+        else:
+            archived = kb.sweep_done_tasks(conn, done_within_days=days, now=now)
+    if getattr(args, "json", False):
+        print(json.dumps(
+            {"archived": archived, "count": len(archived),
+             "done_older_than_days": days, "dry_run": dry_run},
+            indent=2, ensure_ascii=False))
+        return 0
+    verb = "Would archive" if dry_run else "Archived"
+    print(f"{verb} {len(archived)} done task(s) older than {days}d"
+          + (": " + ", ".join(archived) if archived else ""))
+    return 0
+
+
 def _cmd_tail(args: argparse.Namespace) -> int:
     last_id = 0
     print(f"Tailing events for {args.task_id}. Ctrl-C to stop.")
@@ -3138,20 +3278,27 @@ _SLASH_KANBAN_HELP = """\
 **/kanban** — manage the shared task board.
 
 Common subcommands:
-  `list` (alias `ls`)   List tasks on the current board
+  `list` (alias `ls`)   Ordinary view: actionable work + done from last 3 days
+                        (`list --all` / `--history` adds archived + old done)
   `show <id>`           Task details + comments + events
   `stats`               Per-status / per-assignee counts
   `create <title>…`     Create a task (auto-subscribes you to events)
   `comment <id> <msg>`  Append a comment
   `attach <id> <path>`  Attach a local file; `attachments <id>` to list
   `complete <id>…`      Mark task(s) done
+  `cancel <id>…`        Close as won't-do (archived, NOT done); `--reason …`
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
+  `retain`              Archive old done tasks (safe/idempotent; never active/blocked)
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards
   `assignees`           Known profiles + counts
   `context <id>`        Full worker-context dump
   `runs <id>`           Attempt history
   `log <id>`            Worker log
+
+Boards: `boards switch <slug>` sets your *view* board for reads. New cards are
+*routed* by profile/content to the right board (fallback `default`), not the
+current board — pass `--board <slug>` to pin a create explicitly.
 
 Run `/kanban <subcommand> -h` for arguments. \
 Read-only commands are safe while an agent is running.\

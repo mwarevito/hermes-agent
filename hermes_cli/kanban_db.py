@@ -534,6 +534,253 @@ def clear_current_board() -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# Deterministic creation routing (board hygiene / domain routing)
+# ---------------------------------------------------------------------------
+#
+# A card's board is chosen *before* ``create_task`` — by which DB ``connect``
+# opens. Historically an unpinned create fell through to the persisted
+# ``<root>/kanban/current`` file, so a card silently inherited whatever board
+# the operator last switched to. :func:`resolve_creation_board` replaces that
+# fallback with a deterministic chain:
+#
+#   1. explicit ``board`` argument (metadata) — always wins
+#   2. authoritative pin — a dispatcher-spawned worker / ``--board`` scope /
+#      dashboard ``?board=`` (``HERMES_KANBAN_BOARD`` env, ``HERMES_KANBAN_DB``
+#      env, or the ``scoped_current_board`` ContextVar). Preserves parent-board
+#      inheritance. The persisted *current* file is deliberately NOT consulted.
+#   3. parent location — when the create names ``parents``, the child MUST land
+#      on the single board that holds every parent id (authoritative structured
+#      metadata). Parents split across boards, or a parent id found nowhere, is
+#      a hard :class:`ValueError` — never a fall-through to profile/content/
+#      current, which could dangle the link or cross boards.
+#   4. structured source/profile/domain metadata (assignee / created_by /
+#      source / tenant) matched against the routing rules
+#   5. content heuristic — keywords in title + body (lowest precedence)
+#   6. ambiguous / no signal → ``DEFAULT_BOARD`` (never the current file)
+#
+# The rules are plain data so a deployment can override them without new env
+# vars; the baked-in default satisfies this installation. A routed board is
+# only returned when it actually exists on disk, so routing is a safe no-op
+# until the target boards are created — keeping the change backward compatible.
+
+# board slug -> {"profiles": [...substrings...], "keywords": [...substrings...]}
+# Matching is case-insensitive substring containment. Order is irrelevant:
+# a signal matching two *different* boards is treated as ambiguous → default.
+DEFAULT_ROUTING_RULES: "list[dict]" = [
+    {
+        "board": "llucky-task-ops",
+        "profiles": [
+            "llucky", "dentor", "dental", "dadvani", "garrison", "kivi",
+        ],
+        "keywords": [
+            "llucky", "dentor", "clinic", "client", "product", "sales",
+            "rollout", "outreach", "dental", "receptly",
+        ],
+    },
+    {
+        "board": "hermes-infra",
+        "profiles": [
+            "tony", "hermes", "hermes-system", "givi", "workbot",
+        ],
+        "keywords": [
+            "hermes", "plugin", "gateway", "gate", "model", "cron",
+            "memory", "dispatcher", "kanban", "deploy", "infra", "bot",
+        ],
+    },
+]
+
+
+def _pinned_board() -> Optional[str]:
+    """Return the authoritative board pin, or ``None`` when unpinned.
+
+    A *pin* is an explicit, authoritative selection: the ``scoped_current_board``
+    ContextVar (set by CLI ``--board`` / the dashboard), or the
+    ``HERMES_KANBAN_BOARD`` / ``HERMES_KANBAN_DB`` env vars the dispatcher
+    injects into a spawned worker so it inherits its parent task's board. The
+    persisted ``<root>/kanban/current`` file is NOT a pin — it is the operator's
+    passive *view* selection and must never route new cards.
+    """
+    scoped = (_CURRENT_BOARD_OVERRIDE.get() or "").strip()
+    if scoped:
+        try:
+            n = _normalize_board_slug(scoped)
+            if n and board_exists(n):
+                return n
+        except ValueError:
+            pass
+    env = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+    if env:
+        try:
+            n = _normalize_board_slug(env)
+            if n and board_exists(n):
+                return n
+        except ValueError:
+            pass
+    # ``HERMES_KANBAN_DB`` pins the physical file directly; the slug is
+    # irrelevant to the write target (``kanban_db_path`` honours the override
+    # first) but its presence signals an authoritative pin, so we keep today's
+    # resolution rather than routing.
+    if os.environ.get("HERMES_KANBAN_DB", "").strip():
+        return get_current_board()
+    return None
+
+
+def _match_boards(text: Optional[str], key: str, rules: "list[dict]") -> "set[str]":
+    """Return the set of distinct boards whose ``key`` substrings hit ``text``."""
+    if not text:
+        return set()
+    hay = str(text).casefold()
+    hits: "set[str]" = set()
+    for rule in rules:
+        for needle in rule.get(key, ()):
+            if needle and str(needle).casefold() in hay:
+                hits.add(rule["board"])
+                break
+    return hits
+
+
+def _board_db_file(slug: Optional[str]) -> Path:
+    """On-disk ``kanban.db`` for ``slug``, ignoring the ``HERMES_KANBAN_DB`` pin.
+
+    Unlike :func:`kanban_db_path` this never honours the env override, so it can
+    scan *each* board's own file independently (parent-location discovery).
+    """
+    normed = _normalize_board_slug(slug) or DEFAULT_BOARD
+    if normed == DEFAULT_BOARD:
+        return kanban_home() / "kanban.db"
+    return board_dir(normed) / "kanban.db"
+
+
+def find_parents_board(parents: "Iterable[str]") -> str:
+    """Return the single existing board whose DB holds *every* id in ``parents``.
+
+    Parent location is authoritative structured metadata: a child card must be
+    created on the same board as its parents, or the link would dangle. Scans
+    ``default`` + every discoverable board strictly read-only (``mode=ro``, no
+    schema init / migration side effects) and:
+
+    * returns that board's slug when all parents resolve to exactly one board;
+    * raises :class:`ValueError` when a parent id is not found on any board, or
+      when the parents are split across two or more boards.
+
+    Never routes by profile / content — an unresolved or split parent set is a
+    hard error so a child link can never silently cross boards.
+    """
+    wanted = [str(p) for p in parents if p]
+    if not wanted:
+        raise ValueError("find_parents_board requires at least one parent id")
+    placeholders = ",".join("?" * len(wanted))
+    location: dict[str, str] = {}  # parent id -> board slug
+    for meta in list_boards(include_archived=True):
+        slug = meta.get("slug") or DEFAULT_BOARD
+        db_file = _board_db_file(slug)
+        if not db_file.exists():
+            continue
+        try:
+            conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+        except sqlite3.Error:
+            continue
+        try:
+            rows = conn.execute(
+                f"SELECT id FROM tasks WHERE id IN ({placeholders})", wanted
+            ).fetchall()
+        except sqlite3.Error:
+            rows = []
+        finally:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+        for r in rows:
+            location[r["id"]] = slug
+    missing = sorted(set(wanted) - set(location))
+    if missing:
+        raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+    boards = set(location.values())
+    if len(boards) != 1:
+        raise ValueError(
+            "parent tasks span multiple boards ("
+            + ", ".join(sorted(boards))
+            + "); create the child with an explicit --board"
+        )
+    return next(iter(boards))
+
+
+def resolve_creation_board(
+    *,
+    board: Optional[str] = None,
+    parents: "Iterable[str]" = (),
+    assignee: Optional[str] = None,
+    created_by: Optional[str] = None,
+    source: Optional[str] = None,
+    tenant: Optional[str] = None,
+    title: Optional[str] = None,
+    body: Optional[str] = None,
+    rules: Optional["list[dict]"] = None,
+) -> str:
+    """Deterministically resolve the board a new card should be created on.
+
+    See the module comment above for the precedence chain. No clock and no
+    randomness, so the decision is testable and auditable. A routed board is
+    only returned when it exists on disk; anything ambiguous or unresolved
+    returns :data:`DEFAULT_BOARD`. When ``parents`` are named (and no explicit
+    board / pin overrides), the child is routed to the parents' board and a
+    split/missing parent set raises :class:`ValueError`.
+    """
+    # 1. Explicit board argument wins outright.
+    if board:
+        try:
+            normed = _normalize_board_slug(board)
+        except ValueError:
+            normed = None
+        if normed:
+            return normed
+
+    # 2. Authoritative pin (worker/parent inheritance, --board, dashboard).
+    pinned = _pinned_board()
+    if pinned:
+        return pinned
+
+    # 3. Parent location is authoritative: a child lives with its parents.
+    #    Raises on a split/missing parent set — never falls through to routing.
+    parent_ids = [p for p in (parents or ()) if p]
+    if parent_ids:
+        return find_parents_board(parent_ids)
+
+    rules = DEFAULT_ROUTING_RULES if rules is None else rules
+
+    def _pick(candidates: "set[str]") -> Optional[str]:
+        # Exactly one candidate that exists → route there. Zero or a genuine
+        # tie (>1 distinct board) is ambiguous and handled by the caller.
+        if len(candidates) == 1:
+            slug = next(iter(candidates))
+            return slug if board_exists(slug) else None
+        return None
+
+    # 4. Structured metadata: profile / source / tenant signals.
+    meta_hits: "set[str]" = set()
+    for value in (assignee, created_by, source, tenant):
+        meta_hits |= _match_boards(value, "profiles", rules)
+    routed = _pick(meta_hits)
+    if routed:
+        return routed
+    # A metadata tie is authoritative-ambiguous → default (do not fall to
+    # content, which is weaker and could break the tie the wrong way).
+    if len(meta_hits) > 1:
+        return DEFAULT_BOARD
+
+    # 5. Content heuristic: keywords in title + body.
+    content = " ".join(p for p in (title, body) if p)
+    routed = _pick(_match_boards(content, "keywords", rules))
+    if routed:
+        return routed
+
+    # 6. Ambiguous / unresolved → default. Never the persisted current board.
+    return DEFAULT_BOARD
+
+
 def board_dir(board: Optional[str] = None) -> Path:
     """Return the on-disk directory for ``board``.
 
@@ -3459,6 +3706,98 @@ def list_tasks(
         query += " ORDER BY priority DESC, created_at ASC"
     if limit:
         query += f" LIMIT {int(limit)}"
+    rows = conn.execute(query, params).fetchall()
+    return [Task.from_row(r) for r in rows]
+
+
+# Everything a human can still act on — every status except the terminal
+# ``done``/``archived``. ``blocked`` is intentionally here: it is actionable
+# (it needs a human) and must never be hidden by a view or a retention sweep.
+ACTIONABLE_STATUSES: "tuple[str, ...]" = (
+    "triage", "todo", "scheduled", "ready", "running", "blocked", "review",
+)
+
+
+def list_ordinary(
+    conn: sqlite3.Connection,
+    *,
+    now: Optional[int] = None,
+    done_within_days: int = 3,
+    assignee: Optional[str] = None,
+    tenant: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> list[Task]:
+    """The default board view: everything actionable + recently-finished work.
+
+    Returns all :data:`ACTIONABLE_STATUSES` tasks (``blocked`` always included,
+    regardless of age) plus ``done`` tasks whose ``completed_at`` is within the
+    last ``done_within_days``. ``archived`` and stale ``done`` are excluded —
+    they live in the history/all view. Display-only: no rows are mutated.
+    """
+    now = int(time.time()) if now is None else int(now)
+    done_cutoff = now - int(done_within_days) * 86400
+    placeholders = ",".join("?" * len(ACTIONABLE_STATUSES))
+    query = (
+        f"SELECT * FROM tasks WHERE ("
+        f"status IN ({placeholders}) "
+        f"OR (status = 'done' AND completed_at IS NOT NULL AND completed_at >= ?)"
+        f")"
+    )
+    params: list[Any] = [*ACTIONABLE_STATUSES, done_cutoff]
+    if assignee is not None:
+        query += " AND assignee = ?"
+        params.append(_canonical_assignee(assignee))
+    if tenant is not None:
+        query += " AND tenant = ?"
+        params.append(tenant)
+    if session_id is not None:
+        query += " AND session_id = ?"
+        params.append(session_id)
+    query += " ORDER BY priority DESC, created_at ASC"
+    rows = conn.execute(query, params).fetchall()
+    return [Task.from_row(r) for r in rows]
+
+
+def list_stale_blocked(
+    conn: sqlite3.Connection,
+    *,
+    now: Optional[int] = None,
+    stale_days: int = 7,
+    assignee: Optional[str] = None,
+    tenant: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> list[Task]:
+    """Blocked tasks that have needed a decision for ``stale_days`` or longer.
+
+    Staleness is measured from when the task *entered* ``blocked`` (the latest
+    ``blocked`` event), falling back to ``created_at`` when no such event
+    exists. These are the "needs-decision" cards a human should unstick.
+
+    The optional ``assignee`` / ``tenant`` / ``session_id`` filters mirror
+    :func:`list_ordinary` so a scoped view (``list --mine`` etc.) never surfaces
+    a needs-decision footer for cards outside that scope.
+    """
+    now = int(time.time()) if now is None else int(now)
+    cutoff = now - int(stale_days) * 86400
+    query = """
+        SELECT t.* FROM tasks t
+         WHERE t.status = 'blocked'
+           AND COALESCE(
+               (SELECT MAX(created_at) FROM task_events
+                 WHERE task_id = t.id AND kind = 'blocked'),
+               t.created_at) <= ?
+        """
+    params: list[Any] = [cutoff]
+    if assignee is not None:
+        query += " AND t.assignee = ?"
+        params.append(_canonical_assignee(assignee))
+    if tenant is not None:
+        query += " AND t.tenant = ?"
+        params.append(tenant)
+    if session_id is not None:
+        query += " AND t.session_id = ?"
+        params.append(session_id)
+    query += " ORDER BY t.priority DESC, t.created_at ASC"
     rows = conn.execute(query, params).fetchall()
     return [Task.from_row(r) for r in rows]
 
@@ -6583,6 +6922,79 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     # for a later dispatcher tick.
     recompute_ready(conn)
     return True
+
+
+def cancel_task(
+    conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None
+) -> bool:
+    """Close a task as cancelled / won't-do: move it to ``archived`` — NOT
+    ``done`` — and record why.
+
+    Cancelling is a lifecycle *close*, not a completion: ``completed_at`` is
+    left untouched so a won't-do card never pollutes done metrics or the
+    recent-done view, and it is auditable via the emitted ``cancelled`` event
+    (which carries the reason). Rows, comments, events and attempt history are
+    all preserved — this is a status transition, never a delete. Idempotent:
+    a second call on an already-archived task is a no-op returning ``False``.
+    """
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'archived', "
+            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND status != 'archived'",
+            (task_id,),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn, task_id,
+            outcome="reclaimed", status="reclaimed",
+            summary="task cancelled with run still active",
+        )
+        _append_event(
+            conn, task_id, "cancelled",
+            {"reason": reason} if reason else None,
+            run_id=run_id,
+        )
+    recompute_ready(conn)
+    return True
+
+
+def sweep_done_tasks(
+    conn: sqlite3.Connection,
+    *,
+    done_within_days: int = 30,
+    now: Optional[int] = None,
+) -> list[str]:
+    """Idempotently archive ``done`` tasks finished more than ``done_within_days``
+    ago. Returns the list of archived task ids.
+
+    Safety contract:
+
+    * Only ``status = 'done'`` rows with a non-NULL ``completed_at`` older than
+      the cutoff are eligible. ``running``/``ready``/``todo``/``triage``/
+      ``scheduled``/``review`` and — critically — ``blocked`` are never touched:
+      blocked work needs a human and must stay visible indefinitely.
+    * Nothing is deleted. Archiving is a status transition; comments, events,
+      runs and attachments are preserved and remain in the history/all view.
+    * Idempotent: re-running archives only newly-eligible rows (already-archived
+      rows no longer match ``status = 'done'``).
+
+    Explicitly cancelled / won't-do cards are archived at close time via
+    :func:`cancel_task`, so they never reach this sweep.
+    """
+    now = int(time.time()) if now is None else int(now)
+    cutoff = now - int(done_within_days) * 86400
+    rows = conn.execute(
+        "SELECT id FROM tasks "
+        "WHERE status = 'done' AND completed_at IS NOT NULL AND completed_at < ?",
+        (cutoff,),
+    ).fetchall()
+    archived: list[str] = []
+    for row in rows:
+        if archive_task(conn, row["id"]):
+            archived.append(row["id"])
+    return archived
 
 
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:

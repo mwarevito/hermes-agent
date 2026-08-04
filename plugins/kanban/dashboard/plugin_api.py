@@ -621,6 +621,23 @@ class CreateTaskBody(BaseModel):
 @router.post("/tasks")
 def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
+    if board is None:
+        # No explicit board from the UI → route deterministically by
+        # parents/profile/content instead of silently landing on the
+        # persisted current board. A create with parents is routed to the
+        # parents' board; a split/missing parent set is a clean 400 rather
+        # than a 500. See kanban_db.resolve_creation_board.
+        try:
+            board = kanban_db.resolve_creation_board(
+                parents=payload.parents,
+                assignee=payload.assignee,
+                created_by="dashboard",
+                tenant=payload.tenant,
+                title=payload.title,
+                body=payload.body,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
     conn = _conn(board=board)
     try:
         task_id = kanban_db.create_task(

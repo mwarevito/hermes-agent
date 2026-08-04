@@ -77,6 +77,43 @@ def _resolve_auto_decompose_settings(
         per_tick = 1
     return enabled, per_tick
 
+# How often a running task's card is refreshed. The worker's auto-heartbeat is
+# rate-limited to 60s, so refreshing much faster buys no new information.
+CARD_REFRESH_SECONDS = 45
+
+
+def _fmt_duration(seconds) -> str:
+    try:
+        seconds = int(seconds)
+    except (TypeError, ValueError):
+        return "?"
+    if seconds < 60:
+        return f"{seconds} сек"
+    if seconds < 3600:
+        return f"{seconds // 60} мин"
+    return f"{seconds // 3600} ч {(seconds % 3600) // 60} мин"
+
+
+def _render_progress_card(task, *, task_id: str, now: int) -> str:
+    """Card text while the task is still running.
+
+    Terminal states deliberately keep their existing upstream wording — this
+    renderer is only for the in-flight refresh, which had no message at all
+    before (the user saw silence until the task ended).
+    """
+    title = (getattr(task, "title", None) or task_id)[:120]
+    who = getattr(task, "assignee", None)
+    tag = f"@{who} " if who else ""
+    lines = [f"⚙️ {tag}Kanban {task_id} — работает", title]
+    started = getattr(task, "started_at", None) or getattr(task, "created_at", None)
+    if started:
+        lines.append(f"идёт {_fmt_duration(now - int(started))}")
+    hb = getattr(task, "last_heartbeat_at", None)
+    if hb:
+        lines.append(f"жив, отметился {_fmt_duration(now - int(hb))} назад")
+    return "\n".join(lines)
+
+
 
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
     """Take an exclusive, non-blocking advisory lock for the sole dispatcher.
@@ -430,9 +467,30 @@ class GatewayKanbanWatchersMixin:
                                         lease_seconds=lease_seconds,
                                         retry_limit=retry_limit,
                                     )
-                                    if not events:
-                                        continue
                                     task = _kb.get_task(conn, sub["task_id"])
+                                    if not events:
+                                        # No terminal event — but if the task is
+                                        # still running, keep its card fresh.
+                                        # This path touches no ledger and never
+                                        # moves the cursor: a dropped refresh is
+                                        # cosmetic, unlike a dropped terminal
+                                        # ping.
+                                        if (
+                                            task is not None
+                                            and getattr(task, "status", "") == "running"
+                                            and sub.get("card_message_id")
+                                        ):
+                                            last = sub.get("card_updated_at") or 0
+                                            if (time.time() - float(last)) >= CARD_REFRESH_SECONDS:
+                                                deliveries.append({
+                                                    "sub": sub,
+                                                    "events": [],
+                                                    "task": task,
+                                                    "board": slug,
+                                                    "owner_profile": owner_profile,
+                                                    "progress_only": True,
+                                                })
+                                        continue
                                     logger.debug(
                                         "kanban notifier: leased %d event(s) for %s on board %s",
                                         len(events), sub["task_id"], slug,
@@ -494,6 +552,28 @@ class GatewayKanbanWatchersMixin:
                     # exists to fix). The helper returns None only when the profile
                     # (or default) genuinely has no adapter for the platform.
                     adapter = self._authorization_adapter(plat, sub_profile or None)
+                    if d.get("progress_only"):
+                        # Cosmetic refresh of an existing card: no lease, no
+                        # cursor, no unsub. Failures here must never affect
+                        # terminal delivery, so they are swallowed and logged.
+                        if adapter is not None:
+                            try:
+                                meta: dict[str, Any] = {}
+                                if sub.get("thread_id"):
+                                    meta["thread_id"] = sub["thread_id"]
+                                await self._kanban_deliver_card(
+                                    adapter, sub, board_slug,
+                                    _render_progress_card(
+                                        task, task_id=sub["task_id"], now=int(time.time()),
+                                    ),
+                                    meta,
+                                )
+                            except Exception as exc:
+                                logger.debug(
+                                    "kanban card refresh failed for %s: %s",
+                                    sub["task_id"], exc,
+                                )
+                        continue
                     if adapter is None:
                         logger.debug(
                             "kanban notifier: adapter %s disconnected before delivery for %s; releasing lease",
@@ -649,21 +729,15 @@ class GatewayKanbanWatchersMixin:
                             wake_deferred_ids.append(ev.id)
                             continue
                         try:
-                            _send_res = await adapter.send(
-                                sub["chat_id"], msg, metadata=metadata,
+                            # Delivery goes through THE card for this
+                            # subscription (edit-in-place, create on first
+                            # use). _kanban_deliver_card raises on a reported
+                            # SendResult(success=False) so a silent transient
+                            # failure is recorded in the durable ledger as a
+                            # failure instead of being confirmed as sent.
+                            await self._kanban_deliver_card(
+                                adapter, sub, board_slug, msg, metadata,
                             )
-                            # A SendResult(success=False) without an exception
-                            # (returned by push-capable adapters on a genuine
-                            # transient failure) must count as a FAILED
-                            # delivery — otherwise the cursor advances and the
-                            # event is permanently lost. Adapters returning
-                            # None (or anything non-SendResult shaped) keep
-                            # the legacy "no exception == delivered" contract.
-                            if getattr(_send_res, "success", True) is False:
-                                raise RuntimeError(
-                                    "adapter send() reported failure: "
-                                    f"{getattr(_send_res, 'error', None) or 'unknown error'}"
-                                )
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
                                 kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
@@ -960,6 +1034,70 @@ class GatewayKanbanWatchersMixin:
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",
                 new_cursor=cursor,
+            )
+        finally:
+            conn.close()
+
+    async def _kanban_deliver_card(
+        self, adapter, sub: dict, board: Optional[str], text: str, metadata: dict,
+    ) -> None:
+        """Deliver into THE card for this subscription, creating it if needed.
+
+        Editing one message keeps a task to a single card instead of a stream
+        of pings. The message id is persisted on the subscription row, so a
+        gateway restart keeps editing the same card. Any edit failure (card
+        deleted, adapter without edit support) falls back to a plain send —
+        so delivery semantics are never weaker than before this existed.
+        """
+        card_id = sub.get("card_message_id")
+        if card_id and text == (sub.get("card_text") or ""):
+            return  # unchanged; don't spend an edit
+        new_id = None
+        if card_id and hasattr(adapter, "edit_message"):
+            try:
+                res = await adapter.edit_message(sub["chat_id"], int(card_id), text)
+                if getattr(res, "success", False):
+                    new_id = card_id
+            except Exception as exc:
+                logger.debug("kanban card: edit failed for %s: %s", sub["task_id"], exc)
+        if new_id is None:
+            res = await adapter.send(sub["chat_id"], text, metadata=metadata)
+            # A SendResult(success=False) without an exception (returned by
+            # push-capable adapters on a genuine transient failure) must count
+            # as a FAILED delivery — otherwise the caller confirms the event in
+            # the durable ledger, the cursor advances, and the event is
+            # permanently lost. Raise so the caller's failure path records it.
+            # Adapters returning None (or anything non-SendResult shaped) keep
+            # the legacy "no exception == delivered" contract.
+            if getattr(res, "success", True) is False:
+                raise RuntimeError(
+                    "adapter send() reported failure: "
+                    f"{getattr(res, 'error', None) or 'unknown error'}"
+                )
+            new_id = getattr(res, "message_id", None) or card_id
+        sub["card_message_id"] = str(new_id) if new_id is not None else None
+        sub["card_text"] = text
+        try:
+            await asyncio.to_thread(
+                self._kanban_save_card, sub, board, sub["card_message_id"], text,
+            )
+        except Exception as exc:
+            logger.debug("kanban card: persist failed for %s: %s", sub["task_id"], exc)
+
+    def _kanban_save_card(
+        self, sub: dict, board: Optional[str], message_id, text: str,
+    ) -> None:
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            _kb.save_notify_card(
+                conn,
+                task_id=sub["task_id"],
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+                message_id=message_id,
+                text=text,
             )
         finally:
             conn.close()

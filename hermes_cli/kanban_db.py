@@ -1362,6 +1362,12 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     delivery_metadata TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
+    -- Live status card: ONE chat message per subscription, edited in place
+    -- instead of a stream of pings. Persisted (not in-memory) so a gateway
+    -- restart keeps editing the SAME card rather than posting a duplicate.
+    card_message_id TEXT,
+    card_updated_at INTEGER,
+    card_text       TEXT,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
@@ -2551,6 +2557,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "delivery_metadata", "delivery_metadata TEXT"
             )
+        for _col, _decl in (
+            ("card_message_id", "card_message_id TEXT"),
+            ("card_updated_at", "card_updated_at INTEGER"),
+            ("card_text", "card_text TEXT"),
+        ):
+            if _col not in notify_cols:
+                _add_column_if_missing(conn, "kanban_notify_subs", _col, _decl)
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -2691,6 +2704,7 @@ _REBUILD_SPECS = {
         " chat_type TEXT, thread_id TEXT NOT NULL DEFAULT '', user_id TEXT,"
         " notifier_profile TEXT, delivery_metadata TEXT, created_at INTEGER NOT NULL,"
         " last_event_id INTEGER NOT NULL DEFAULT 0,"
+        " card_message_id TEXT, card_updated_at INTEGER, card_text TEXT,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
     ),
@@ -8934,12 +8948,26 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        # Force-load the sdlc-review skill for review agents — it carries
-        # the review logic (AC verification, merge, etc.). The mandatory
-        # kanban lifecycle is already injected into every worker's system
-        # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
-        # review agent needs.
-        claimed.skills = ["sdlc-review"]
+        # Force-load sdlc-review skill for review agents.  The
+        # _default_spawn function already auto-loads kanban-worker, and
+        # appends task.skills via --skills.  Setting task.skills here
+        # means the review agent gets both kanban-worker (lifecycle)
+        # and sdlc-review (review logic: AC verification, merge, etc.).
+        # Gate on resolvability: an unresolvable preload kills the review
+        # agent at CLI startup, which turns the whole review lane into a
+        # silent no-op (2026-08-04). Without the skill the agent still runs
+        # with the injected kanban lifecycle guidance — degraded, not dead.
+        _review_home = os.environ.get("HERMES_HOME")
+        if _skill_available(_review_home, "sdlc-review"):
+            claimed.skills = ["sdlc-review"]
+        else:
+            claimed.skills = []
+            logger.warning(
+                "kanban dispatcher: sdlc-review skill does not resolve for home %s; "
+                "spawning review agent for %s WITHOUT it (install "
+                "<home>/skills/devops/sdlc-review/SKILL.md to restore the review lane)",
+                _review_home or "~/.hermes", claimed.id,
+            )
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
@@ -9161,6 +9189,65 @@ def _resolve_hermes_argv() -> list[str]:
     if hermes_bin:
         return _hermes_path_argv(hermes_bin)
     return _module_hermes_argv()
+
+
+def _skill_available(hermes_home: Optional[str], skill: str) -> bool:
+    """True if ``skill`` resolves for the home the spawned worker runs under.
+
+    Preloading a missing skill is fatal at CLI startup, so every ``--skills``
+    injection must be gated on this. See ``_kanban_worker_skill_available``
+    for the full rationale.
+    """
+    from pathlib import Path as _Path
+
+    base = _Path(hermes_home) if hermes_home else (_Path.home() / ".hermes")
+    skills_root = base / "skills"
+    if not skills_root.is_dir():
+        return False
+    if (skills_root / "devops" / skill / "SKILL.md").is_file():
+        return True
+    try:
+        for skill_md in skills_root.rglob(f"{skill}/SKILL.md"):
+            if skill_md.is_file():
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
+    """True if the bundled ``kanban-worker`` skill resolves for the home the
+    spawned worker will run under.
+
+    The dispatcher injects ``--skills kanban-worker`` into every worker. When
+    the worker activates a profile (``hermes -p <name>``), its ``SKILLS_DIR``
+    becomes ``<profile_home>/skills`` — which on many profiles does NOT contain
+    the bundled skill (it ships in the *default* root home, not every
+    profile-scoped skills dir). Preloading a missing skill is fatal at CLI
+    startup (``ValueError: Unknown skill(s): kanban-worker``), aborting the
+    worker before the agent loop runs. Gate the flag on actual resolvability;
+    the kanban lifecycle contract is still injected via ``KANBAN_GUIDANCE``, so
+    omitting the flag only drops the supplementary pattern library.
+    """
+    from pathlib import Path as _Path
+
+    # An unset HERMES_HOME means the worker falls back to the default root
+    # home (``~/.hermes``), which ships the bundled skill.
+    base = _Path(hermes_home) if hermes_home else (_Path.home() / ".hermes")
+    skills_root = base / "skills"
+    if not skills_root.is_dir():
+        return False
+    # Canonical bundled location first (cheap), then a bounded scan for
+    # profiles that have it nested elsewhere.
+    if (skills_root / "devops" / "kanban-worker" / "SKILL.md").is_file():
+        return True
+    try:
+        for skill_md in skills_root.rglob("kanban-worker/SKILL.md"):
+            if skill_md.is_file():
+                return True
+    except OSError:
+        pass
+    return False
 
 
 def _worker_terminal_timeout_env(
@@ -10169,6 +10256,39 @@ def count_notify_subs(
         return int(row[0]) if row else 0
     finally:
         conn.close()
+
+
+def save_notify_card(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id=None,
+    message_id=None,
+    text: str = "",
+) -> None:
+    """Remember the live status card for a subscription.
+
+    The card is ONE chat message that the notifier edits in place. Persisting
+    its id (rather than caching it in the adapter) is what keeps a gateway
+    restart from posting a second card for the same task.
+    """
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE kanban_notify_subs SET card_message_id = ?, card_updated_at = ?,"
+            " card_text = ? WHERE task_id = ? AND platform = ? AND chat_id = ?"
+            " AND thread_id = ?",
+            (
+                str(message_id) if message_id is not None else None,
+                int(time.time()),
+                text,
+                task_id,
+                platform,
+                chat_id,
+                thread_id or "",
+            ),
+        )
 
 
 def remove_notify_sub(

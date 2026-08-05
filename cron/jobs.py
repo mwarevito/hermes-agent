@@ -115,6 +115,14 @@ _JOBS_LOCK_TIMEOUT_SECONDS = 30.0
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
 
+# A terminal job run (one-shot completion, or the last iteration of a
+# repeat-limited job) whose agent succeeded but whose delivery failed must
+# not be silently retired — the user never saw the output. Retry a bounded
+# number of times before giving up, so a persistently broken target (e.g.
+# platform misconfigured) doesn't retry forever.
+_MAX_DELIVERY_RETRIES = 3
+_DELIVERY_RETRY_DELAY_MINUTES = 5
+
 
 @dataclass(frozen=True)
 class _CronStorePaths:
@@ -1686,16 +1694,102 @@ def remove_job(job_id: str) -> bool:
     return False
 
 
+def _complete_terminal_job(jobs: List[Dict[str, Any]], i: int, job: Dict[str, Any], now: str) -> None:
+    """Retire/advance a job whose result has been delivered (or needed no
+    delivery). Shared tail for both a normal run that delivered cleanly
+    (``mark_job_run``) and a delivery-only retry that finally succeeded
+    (``finalize_pending_delivery``) — either way the job is done and must be
+    completed/rescheduled exactly once. Mutates ``jobs``/``job`` in place;
+    caller holds ``_jobs_lock()`` and is responsible for ``save_jobs``.
+    """
+    # last_delivery_error is already set by the caller (mark_job_run /
+    # finalize_pending_delivery) to the outcome of THIS attempt — do not
+    # touch it here, a non-terminal run reaching this tail still needs its
+    # (possibly non-None) delivery_error preserved.
+    job.pop("pending_delivery", None)
+
+    # Increment completed count.  Finite one-shot jobs are pre-claimed by
+    # claim_dispatch() BEFORE the side effect runs (issue #38758), which
+    # already incremented completed — do not double-count them here.
+    if job.get("repeat"):
+        repeat = job["repeat"]
+        times = repeat.get("times")
+        completed = repeat.get("completed", 0)
+        kind = job.get("schedule", {}).get("kind")
+        preclaimed_oneshot = (
+            kind == "once"
+            and times is not None
+            and times > 0
+            and completed > 0
+        )
+        if not preclaimed_oneshot:
+            completed += 1
+            repeat["completed"] = completed
+
+        # Check if we've hit the repeat limit
+        if times is not None and times > 0 and completed >= times:
+            # Limit reached: retain the record as a terminal completion
+            # instead of popping it. Deleting the job here discarded the
+            # last_status / last_error / last_delivery_error the caller
+            # wrote — a finished one-shot vanished from `cronjob list` with
+            # no inspectable outcome, and a failed delivery was invisible.
+            # The retention sweep prunes these after
+            # COMPLETED_ONESHOT_RETENTION_DAYS.
+            job["enabled"] = False
+            job["state"] = "completed"
+            job["next_run_at"] = None
+            return
+
+    # Compute next run
+    job["next_run_at"] = compute_next_run(job["schedule"], now)
+
+    # If no next run, decide whether this is terminal completion
+    # (one-shot) or a transient failure (recurring schedule couldn't
+    # compute — e.g. 'croniter' missing from the runtime env).
+    # Recurring jobs must NEVER be silently disabled: that turns a
+    # missing runtime dep into "job completed" and the user's
+    # schedule quietly goes off. See issue #16265.
+    if job["next_run_at"] is None:
+        kind = job.get("schedule", {}).get("kind")
+        if kind in {"cron", "interval"}:
+            job["state"] = "error"
+            if not job.get("last_error"):
+                job["last_error"] = (
+                    "Failed to compute next run for recurring "
+                    "schedule (is the 'croniter' package "
+                    "installed in the gateway's Python env?)"
+                )
+            logger.error(
+                "Job '%s' (%s) could not compute next_run_at; "
+                "leaving enabled and marking state=error so the "
+                "job is not silently disabled.",
+                job.get("name", job["id"]),
+                kind,
+            )
+        else:
+            job["enabled"] = False
+            job["state"] = "completed"
+    elif job.get("state") != "paused":
+        job["state"] = "scheduled"
+
+
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+                 delivery_error: Optional[str] = None, delivery_payload: Optional[str] = None):
     """
     Mark a job as having been run.
-    
+
     Updates last_run_at, last_status, increments completed count,
     computes next_run_at, and auto-deletes if repeat limit reached.
 
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
+
+    ``delivery_payload`` is the exact content that failed to deliver. It is
+    only persisted (as ``pending_delivery``) when the failure happens on a
+    terminal run (one-shot, or the last iteration of a repeat-limited job) —
+    the job cannot be silently retired because the user never saw the
+    output. The next due tick then retries ONLY the delivery (see
+    ``finalize_pending_delivery``); the agent/script is never re-run.
     """
     with _jobs_lock():
         jobs = load_jobs()
@@ -1716,76 +1810,64 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 if job.get("run_claim") is not None:
                     job["run_claim"] = None
                 
-                # Increment completed count.  Finite one-shot jobs are
-                # pre-claimed by claim_dispatch() BEFORE the side effect runs
-                # (issue #38758), which already incremented completed — do not
-                # double-count them here.  Recurring jobs and direct callers
-                # with no pre-run claim still get the legacy increment.
-                if job.get("repeat"):
-                    repeat = job["repeat"]
+
+                # A terminal run (one-shot, or the last iteration of a
+                # repeat-limited job) that is about to be retired this call —
+                # but whose delivery just failed — must not be silently
+                # removed/completed: the output exists but the user never saw
+                # it. Persist the payload and a bounded retry schedule
+                # instead of retiring; the next due tick retries delivery
+                # ONLY (see finalize_pending_delivery/run_one_job) — it never
+                # re-runs the agent. Non-terminal runs (more occurrences
+                # left) are untouched — they already get another natural
+                # chance on their next scheduled fire.
+                repeat = job.get("repeat")
+                repeat_limit_reached = False
+                if repeat:
                     times = repeat.get("times")
                     completed = repeat.get("completed", 0)
                     kind = job.get("schedule", {}).get("kind")
+                    # claim_dispatch() pre-increments a finite one-shot before
+                    # the run (#38758), so its completed is already final —
+                    # do not project another increment onto it.
                     preclaimed_oneshot = (
                         kind == "once"
                         and times is not None
                         and times > 0
                         and completed > 0
                     )
-                    if not preclaimed_oneshot:
-                        completed += 1
-                        repeat["completed"] = completed
+                    prospective_completed = (
+                        completed if preclaimed_oneshot else completed + 1
+                    )
+                    repeat_limit_reached = (
+                        times is not None
+                        and times > 0
+                        and prospective_completed >= times
+                    )
+                schedule_kind = job.get("schedule", {}).get("kind")
+                is_terminal_run = schedule_kind == "once" or repeat_limit_reached
 
-                    # Check if we've hit the repeat limit
-                    if times is not None and times > 0 and completed >= times:
-                        # Limit reached: retain the record as a terminal
-                        # completion instead of popping it. Deleting the job
-                        # here discarded the last_status / last_error /
-                        # last_delivery_error written above — a finished
-                        # one-shot vanished from `cronjob list` with no
-                        # inspectable outcome, and a failed delivery was
-                        # invisible. Mirror the terminal shape of the
-                        # next_run_at-is-None branch below; the retention
-                        # sweep prunes these after
-                        # COMPLETED_ONESHOT_RETENTION_DAYS.
-                        job["enabled"] = False
-                        job["state"] = "completed"
-                        job["next_run_at"] = None
-                        save_jobs(jobs)
-                        return
-                
-                # Compute next run
-                job["next_run_at"] = compute_next_run(job["schedule"], now)
-
-                # If no next run, decide whether this is terminal completion
-                # (one-shot) or a transient failure (recurring schedule couldn't
-                # compute — e.g. 'croniter' missing from the runtime env).
-                # Recurring jobs must NEVER be silently disabled: that turns a
-                # missing runtime dep into "job completed" and the user's
-                # schedule quietly goes off. See issue #16265.
-                if job["next_run_at"] is None:
-                    kind = job.get("schedule", {}).get("kind")
-                    if kind in {"cron", "interval"}:
-                        job["state"] = "error"
-                        if not job.get("last_error"):
-                            job["last_error"] = (
-                                "Failed to compute next run for recurring "
-                                "schedule (is the 'croniter' package "
-                                "installed in the gateway's Python env?)"
-                            )
-                        logger.error(
-                            "Job '%s' (%s) could not compute next_run_at; "
-                            "leaving enabled and marking state=error so the "
-                            "job is not silently disabled.",
-                            job.get("name", job.get("id", "?")),
-                            kind,
-                        )
-                    else:
-                        job["enabled"] = False
-                        job["state"] = "completed"
-                elif job.get("state") != "paused":
+                if delivery_error is not None and is_terminal_run:
+                    job["pending_delivery"] = {
+                        "payload": delivery_payload or "",
+                        "success": success,
+                        "error": error,
+                        "retry_count": 0,
+                    }
+                    job["next_run_at"] = (
+                        _hermes_now() + timedelta(minutes=_DELIVERY_RETRY_DELAY_MINUTES)
+                    ).isoformat()
                     job["state"] = "scheduled"
+                    logger.warning(
+                        "Job '%s': delivery failed on terminal run: %s — "
+                        "scheduling an output-only delivery retry (up to %d "
+                        "attempts); the agent will NOT be re-run",
+                        job.get("name", job_id), delivery_error, _MAX_DELIVERY_RETRIES,
+                    )
+                    save_jobs(jobs)
+                    return
 
+                _complete_terminal_job(jobs, i, job, now)
                 save_jobs(jobs)
                 return
 
@@ -1975,6 +2057,12 @@ def advance_next_runs(job_ids) -> int:
         for job in jobs:
             if job["id"] not in ids:
                 continue
+            # A job with a pending output-only delivery retry keeps its
+            # short bounded retry timer: recomputing next_run_at here would
+            # push a 5-minute delivery retry out to the job's next natural
+            # occurrence (e.g. tomorrow) and the user never sees the output.
+            if job.get("pending_delivery"):
+                continue
             kind = job.get("schedule", {}).get("kind")
             if kind not in {"cron", "interval"}:
                 continue
@@ -1987,6 +2075,92 @@ def advance_next_runs(job_ids) -> int:
         return advanced
 
 
+
+def finalize_pending_delivery(job_id: str, delivery_error: Optional[str]) -> None:
+    """Finalize an output-only delivery retry for a terminal job.
+
+    Called by the scheduler after re-attempting ``_deliver_result`` with the
+    payload saved in a job's ``pending_delivery`` state — no agent/script
+    execution happens on this path (see ``run_one_job``). Mirrors the three
+    outcomes ``mark_job_run`` handles for a fresh terminal run:
+
+    - success: clears ``pending_delivery`` and retires/completes the job
+      exactly once (via ``_complete_terminal_job``, the same tail a normal
+      successful delivery uses).
+    - failure, retries remain: bumps the bounded attempt count and
+      reschedules another short retry. No agent execution.
+    - failure, retries exhausted: leaves an auditable terminal error state
+      (``state="error"``, ``enabled=False``) WITHOUT deleting the saved
+      payload — it is evidence for manual review, not something to silently
+      discard, and the job must never be reported as delivered when it
+      wasn't.
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for i, job in enumerate(jobs):
+            if job["id"] != job_id:
+                continue
+
+            pending = job.get("pending_delivery")
+            if not pending:
+                logger.warning(
+                    "finalize_pending_delivery: job '%s' has no pending_delivery "
+                    "state (cleared or removed concurrently?), skipping",
+                    job_id,
+                )
+                return
+
+            now = _hermes_now().isoformat()
+            job["last_delivery_error"] = delivery_error
+            job["fire_claim"] = None
+
+            if delivery_error is None:
+                _complete_terminal_job(jobs, i, job, now)
+                save_jobs(jobs)
+                return
+
+            retry_count = pending.get("retry_count", 0) + 1
+            pending["retry_count"] = retry_count
+            job["pending_delivery"] = pending
+
+            if retry_count < _MAX_DELIVERY_RETRIES:
+                job["next_run_at"] = (
+                    _hermes_now() + timedelta(minutes=_DELIVERY_RETRY_DELAY_MINUTES)
+                ).isoformat()
+                job["state"] = "scheduled"
+                logger.warning(
+                    "Job '%s': delivery retry %d/%d failed: %s — retrying "
+                    "again (output-only, no agent re-execution)",
+                    job.get("name", job_id), retry_count, _MAX_DELIVERY_RETRIES,
+                    delivery_error,
+                )
+            else:
+                # Retry budget exhausted. Do NOT retire the job as if it
+                # were delivered, and do NOT delete the saved payload — it
+                # is the only auditable record that this output was never
+                # seen by the user.
+                pending["exhausted"] = True
+                job["pending_delivery"] = pending
+                job["enabled"] = False
+                job["state"] = "error"
+                if not job.get("last_error"):
+                    job["last_error"] = (
+                        f"Delivery failed after {retry_count} retries: {delivery_error}"
+                    )
+                logger.error(
+                    "Job '%s': delivery retries exhausted (%d/%d): %s — leaving "
+                    "the job in an error state with the undelivered payload "
+                    "preserved for manual review; NOT marking it as delivered",
+                    job.get("name", job_id), retry_count, _MAX_DELIVERY_RETRIES,
+                    delivery_error,
+                )
+
+            save_jobs(jobs)
+            return
+
+        logger.warning("finalize_pending_delivery: job_id %s not found, skipping save", job_id)
+
+
 def advance_next_run(job_id: str) -> bool:
     """Preemptively advance next_run_at for a recurring job before execution.
 
@@ -1996,6 +2170,12 @@ def advance_next_run(job_id: str) -> bool:
     one run is far better than firing dozens of times in a crash loop.
 
     One-shot jobs are left unchanged so they can still retry on restart.
+
+    A job with a pending output-only delivery retry (``pending_delivery``)
+    is also left unchanged — its ``next_run_at`` is the short bounded retry
+    timer set by ``mark_job_run``/``finalize_pending_delivery``, not the
+    schedule's normal cadence; recomputing it here would push a 5-minute
+    delivery retry out to the job's next natural occurrence (e.g. tomorrow).
 
     Returns True if next_run_at was advanced, False otherwise.
     """
@@ -2401,8 +2581,17 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                 # For recurring jobs, check if the scheduled time is stale
                 # (gateway was down and missed the window). Fast-forward to
                 # the next future occurrence instead of firing a stale run.
+                # Skipped for a job with a pending output-only delivery retry
+                # — its due time is the short bounded retry timer, not the
+                # schedule's cadence, so "stale" here would wrongly push the
+                # retry out to the job's next natural occurrence instead of
+                # letting this tick process it.
                 grace = _compute_grace_seconds(schedule)
-                if kind in {"cron", "interval"} and (now - next_run_dt).total_seconds() > grace:
+                if (
+                    kind in {"cron", "interval"}
+                    and not job.get("pending_delivery")
+                    and (now - next_run_dt).total_seconds() > grace
+                ):
                     # Job is past its catch-up grace window — skip accumulated
                     # missed runs but still execute once now to avoid deferring
                     # indefinitely (e.g. a long-running job just finished).

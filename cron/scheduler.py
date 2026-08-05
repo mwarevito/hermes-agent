@@ -282,7 +282,16 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_runs, claim_dispatch, heartbeat_run_claim
+from cron.jobs import (
+    get_due_jobs,
+    mark_job_run,
+    save_job_output,
+    advance_next_run,
+    advance_next_runs,
+    claim_dispatch,
+    heartbeat_run_claim,
+    finalize_pending_delivery,
+)
 from cron.executions import create_execution, finish_execution, mark_execution_running
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -1621,6 +1630,33 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         delivered = False
         target_errors = []
 
+        # Telegram private-chat "topics" only exist as a client-side illusion
+        # built on a reply anchor or the real direct_messages_topic_id Bot API
+        # param — message_thread_id alone is silently ignored for private
+        # chats. The standalone sender (tools.send_message_tool) only knows
+        # message_thread_id, so it can never route these correctly: it would
+        # report success while actually delivering to the ROOT DM. Detect this
+        # case so the delivery is (a) routed through the DM-topic-aware live
+        # adapter (the DeliveryRouter block below resolves the real topic id),
+        # and (b) never silently handed to the standalone path as a fallback.
+        from gateway.delivery import looks_like_telegram_private_chat_id as _looks_priv
+        is_telegram_dm_topic_target = (
+            platform_name.lower() == "telegram"
+            and bool(thread_id)
+            and _looks_priv(str(chat_id))
+        )
+        skip_standalone_fallback = False
+
+        if is_telegram_dm_topic_target and not live_adapter_ready:
+            msg = (
+                f"Telegram DM-topic delivery to {chat_id}:{thread_id} requires the "
+                "live gateway adapter to route correctly; no live adapter is "
+                "available for this delivery"
+            )
+            logger.warning("Job '%s': %s", job["id"], msg)
+            delivery_errors.append(msg)
+            continue
+
         # Continuable cron surface (D1/D2/D6): resolve the delivery surface for
         # this platform generically from its config ``extra``. Default "thread"
         # (today's behaviour, byte-identical). "in_channel" delivers the brief
@@ -1789,11 +1825,40 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # adapter route via a plain message_thread_id.
                 route_thread_id = str(thread_id) if thread_id is not None else None
                 route_metadata = {"job_id": job["id"], "cron_delivery": True}
-                if route_thread_id:
-                    route_metadata["thread_id"] = route_thread_id
                 media_metadata = {"cron_delivery": True}
-                if thread_id:
-                    media_metadata["thread_id"] = thread_id
+                # A Telegram *private-chat* topic that the adapter has actually
+                # REGISTERED as a DM topic is a third case the channel probe
+                # above cannot see: get_chat_info reports "private", not
+                # "channel", so route_via_dm_topic is False — yet a bare
+                # message_thread_id is silently ignored by the Bot API for
+                # private chats and the message lands in the ROOT DM while the
+                # send reports success (incident 2026-08-05, topics
+                # 701226/701649). Resolve the canonical anchor through the SAME
+                # helper live gateway replies use, so cron picks up
+                # telegram_dm_topic_reply_fallback + the real
+                # direct_messages_topic_id whenever the adapter recognises this
+                # thread_id. Unregistered/legacy thread ids resolve to nothing
+                # and keep the plain message_thread_id routing below.
+                dm_topic_metadata = None
+                if is_telegram_dm_topic_target and route_thread_id:
+                    from gateway.run import GatewayRunner
+
+                    resolved_dm_meta = GatewayRunner._thread_metadata_for_target(
+                        platform, str(chat_id), route_thread_id,
+                        adapter=runtime_adapter,
+                    ) or {}
+                    if resolved_dm_meta.get("telegram_dm_topic_reply_fallback"):
+                        dm_topic_metadata = resolved_dm_meta
+                if dm_topic_metadata:
+                    route_metadata.update(dm_topic_metadata)
+                    # Attachments mirror the text routing so media lands in the
+                    # same DM topic instead of the root DM.
+                    media_metadata.update(dm_topic_metadata)
+                else:
+                    if route_thread_id:
+                        route_metadata["thread_id"] = route_thread_id
+                    if thread_id:
+                        media_metadata["thread_id"] = thread_id
 
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content.
@@ -1884,7 +1949,6 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             # still delivered.
                             target_errors.append(f"live adapter send failed: {ex}")
                             raise
-
                         if timeout_handled:
                             # The timeout branch above already decided the
                             # outcome (assume-delivered if in flight, or
@@ -1921,7 +1985,22 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                     f"live adapter send to {platform_name}:{chat_id} "
                                     f"returned unconfirmed result ({shape}, error={err})"
                                 )
-                                if transport is not None and transport.is_relay:
+                                if is_telegram_dm_topic_target:
+                                    # The live adapter is the only DM-topic-aware
+                                    # path; standalone knows message_thread_id
+                                    # only and would silently deliver to the ROOT
+                                    # DM. Fail loudly instead of misrouting.
+                                    logger.warning(
+                                        "Job '%s': %s; refusing standalone fallback "
+                                        "for Telegram DM-topic delivery",
+                                        job["id"], msg,
+                                    )
+                                    skip_standalone_fallback = True
+                                    delivery_errors.append(
+                                        f"delivery to {platform_name}:{chat_id} "
+                                        f"thread_id={thread_id} failed: {err}"
+                                    )
+                                elif transport is not None and transport.is_relay:
                                     logger.warning("Job '%s': %s", job["id"], msg)
                                 else:
                                     logger.warning(
@@ -1940,8 +2019,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                     f"configured thread_id {requested_thread_id} for "
                                     f"{platform_name}:{chat_id} was not found; delivered without thread_id"
                                 )
+                                # LOG-ONLY, deliberately not a delivery_error: the
+                                # message DID reach the user, it just degraded to
+                                # the base chat. Recording it as an error makes
+                                # mark_job_run persist a pending_delivery for an
+                                # already-delivered payload, which is then resent
+                                # on every subsequent tick until the retry budget
+                                # is exhausted (false retries of a successful
+                                # thread_fallback send).
                                 logger.warning("Job '%s': %s", job["id"], msg)
-                                delivery_errors.append(msg)
 
                 # Send extracted media files as native attachments via the live
                 # adapter, using the same DM-topic-aware routing as the text send
@@ -2011,13 +2097,29 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 err_msg = f"live adapter delivery to {platform_name}:{chat_id} failed: {e}"
                 if not any(err_msg in err for err in target_errors):
                     target_errors.append(err_msg)
-                if transport is not None and transport.is_relay:
+                if is_telegram_dm_topic_target:
+                    # The live adapter is the DM-topic-aware path — standalone
+                    # only knows message_thread_id and would silently deliver
+                    # to the ROOT DM. Fail loudly instead of misrouting.
+                    logger.warning(
+                        "Job '%s': %s; refusing standalone fallback for "
+                        "Telegram DM-topic delivery",
+                        job["id"], err_msg,
+                    )
+                    skip_standalone_fallback = True
+                    delivery_errors.append(
+                        f"delivery to {platform_name}:{chat_id} thread_id={thread_id} failed: {e}"
+                    )
+                elif transport is not None and transport.is_relay:
                     logger.warning("Job '%s': %s", job["id"], err_msg)
                 else:
                     logger.warning(
                         "Job '%s': %s, falling back to standalone",
                         job["id"], err_msg,
                     )
+
+        if not delivered and skip_standalone_fallback:
+            continue
 
         if not delivered:
             if transport is not None and transport.is_relay:
@@ -3923,6 +4025,24 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
+    # Output-only delivery retry: a prior tick already ran this job's agent
+    # to completion — only delivery failed. Re-running run_job here would
+    # repeat every external side effect the agent/script performed, which is
+    # exactly what a bounded retry must NOT do. Retry ONLY the delivery, with
+    # the exact payload saved from that run, and never touch the agent.
+    pending = job.get("pending_delivery")
+    if pending:
+        delivery_error = None
+        try:
+            delivery_error = _deliver_result(
+                job, pending.get("payload", ""), adapters=adapters, loop=loop,
+            )
+        except Exception as de:
+            delivery_error = str(de)
+            logger.error("Delivery retry failed for job %s: %s", job["id"], de)
+        finalize_pending_delivery(job["id"], delivery_error)
+        return True
+
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
@@ -4060,7 +4180,13 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
         if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+            mark_job_run(
+                job["id"], success, error,
+                delivery_error=delivery_error,
+                # Terminal-run delivery failures persist the exact payload so
+                # the next tick can retry DELIVERY ONLY (never re-run the agent).
+                delivery_payload=deliver_content if delivery_error else None,
+            )
         normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
         if delivery_error:
             delivery_outcome = "failed"

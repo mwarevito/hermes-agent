@@ -964,6 +964,7 @@ class TestSilentDelivery:
             False,
             "Agent completed but produced empty response (model error, timeout, or misconfiguration)",
             delivery_error=None,
+            delivery_payload=None,
         )
 
 
@@ -1519,6 +1520,194 @@ class TestDeliverOriginUnresolvableIsLocal:
         assert self._deliver(job, monkeypatch) is None
 
 
+class TestDeliverResultTelegramDmTopicSynthetic:
+    """Cron delivery to a Telegram synthetic private-DM topic must route
+    through the same DM-topic-aware metadata live gateway replies use, and
+    must never silently hand off to the anchor-agnostic standalone sender
+    when that routing can't be resolved (see #cron-dm-topic-delivery).
+    """
+
+    class _FakeDmTopicAdapter:
+        """Adapter stub whose class defines ``_get_dm_topic_info`` so
+        ``GatewayRunner._is_telegram_dm_topic_target``'s class-level lookup
+        (not instance-level, to avoid false positives on bare MagicMocks)
+        recognizes the thread_id as a registered DM topic."""
+
+        def __init__(self, send_result):
+            self.send = AsyncMock(return_value=send_result)
+
+        def _get_dm_topic_info(self, chat_id, thread_id):
+            return {"name": "Personal"}
+
+    class _FakeNonDmTopicAdapter:
+        """Adapter stub that does NOT recognize the thread_id as a
+        registered DM topic (simulates a legacy/never-created topic id)."""
+
+        def __init__(self, send_result):
+            self.send = AsyncMock(return_value=send_result)
+
+        def _get_dm_topic_info(self, chat_id, thread_id):
+            return None
+
+    def test_synthetic_dm_topic_resolves_canonical_anchor(self):
+        """A thread_id the adapter recognizes as a registered DM topic must
+        be delivered via the real direct_messages_topic_id routing (the
+        canonical resolver used by ordinary gateway replies), not a bare
+        message_thread_id."""
+        from gateway.config import Platform
+        from concurrent.futures import Future
+
+        send_result = MagicMock(success=True, raw_response=None)
+        adapter = self._FakeDmTopicAdapter(send_result)
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            # Run the routed coroutine (DeliveryRouter._deliver_to_platform)
+            # for real instead of returning a canned future: cron delivery now
+            # goes scheduler -> DeliveryRouter -> adapter, so only executing
+            # the whole chain proves what metadata the ADAPTER actually
+            # receives.  Closing the coroutine here would assert nothing.
+            import asyncio as _asyncio
+            future = Future()
+            try:
+                future.set_result(_asyncio.run(coro))
+            except BaseException as exc:  # noqa: BLE001
+                future.set_exception(exc)
+            return future
+
+        job = {
+            "id": "dm-topic-job",
+            "deliver": "telegram:405154434:701226",
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock()) as standalone_send:
+            result = _deliver_result(
+                job,
+                "Hello from cron",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        assert result is None
+        adapter.send.assert_called_once()
+        sent_metadata = adapter.send.call_args.kwargs.get("metadata") or adapter.send.call_args[0][-1]
+        assert sent_metadata["telegram_dm_topic_reply_fallback"] is True
+        assert sent_metadata["direct_messages_topic_id"] == "701226"
+        # Standalone sender must never be used when the live adapter succeeds.
+        standalone_send.assert_not_called()
+
+    def test_missing_anchor_persists_error_without_standalone_fallback(self):
+        """When the live adapter refuses a Telegram DM-topic send (no
+        resolvable anchor/topic), _deliver_result must persist a non-success
+        delivery error and must NOT fall back to the standalone sender —
+        the standalone path can't route DM topics and would silently
+        misdeliver into the root DM while reporting success."""
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult
+        from concurrent.futures import Future
+
+        send_result = SendResult(
+            success=False,
+            error="Telegram DM topic delivery requires a reply anchor; refusing to send outside the requested topic",
+            retryable=False,
+        )
+        adapter = self._FakeNonDmTopicAdapter(send_result)
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        completed_future = Future()
+        completed_future.set_result(send_result)
+
+        def fake_run_coro(coro, _loop):
+            coro.close()
+            return completed_future
+
+        job = {
+            "id": "missing-anchor-job",
+            "deliver": "telegram:405154434:701226",
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock()) as standalone_send:
+            result = _deliver_result(
+                job,
+                "Hello from cron",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        assert result is not None
+        assert "reply anchor" in result or "failed" in result
+        standalone_send.assert_not_called()
+
+    def test_no_live_adapter_refuses_standalone_for_dm_topic_target(self):
+        """Without a live adapter at all (gateway not running / adapter not
+        connected), a Telegram private-DM thread_id target must still
+        refuse the standalone sender rather than silently misrouting."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        job = {
+            "id": "no-adapter-job",
+            "deliver": "telegram:405154434:701226",
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock()) as standalone_send:
+            result = _deliver_result(job, "Hello from cron", adapters=None, loop=None)
+
+        assert result is not None
+        standalone_send.assert_not_called()
+
+    def test_real_forum_topic_unaffected(self):
+        """Supergroup forum topics (negative chat_id) are a different
+        Telegram feature (message_thread_id works natively) and must keep
+        using the standalone sender exactly as before."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        job = {
+            "id": "forum-topic-job",
+            "deliver": "telegram:-1001234567890:17585",
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as standalone_send:
+            result = _deliver_result(job, "Hello from cron", adapters=None, loop=None)
+
+        assert result is None
+        standalone_send.assert_called_once()
+        assert standalone_send.call_args.kwargs.get("thread_id") == "17585"
+
+
 class TestSendMediaTimeoutCancelsFuture:
     """Same orphan-coroutine guarantee for _send_media_via_adapter's
     future.result(timeout=30) call. If this times out mid-batch, the
@@ -1971,3 +2160,201 @@ class TestSetCronSessionTitle:
         db.get_next_title_in_lineage.assert_called_once_with("Nightly Synthesis")
 
 
+class TestHomeTargetEnvVarRegistry:
+    """Regression: ``_HOME_TARGET_ENV_VARS`` must include every gateway
+    platform that supports cron-driven outbound delivery. Missing an
+    entry means ``hermes cron create --deliver=<platform>`` silently
+    fails to route through the platform's home channel."""
+
+    def test_whatsapp_cloud_registered(self):
+        """``deliver=whatsapp_cloud`` routes through
+        WHATSAPP_CLOUD_HOME_CHANNEL — added alongside the existing
+        ``whatsapp`` Baileys entry."""
+        from cron.scheduler import _HOME_TARGET_ENV_VARS
+
+        assert "whatsapp_cloud" in _HOME_TARGET_ENV_VARS
+        assert _HOME_TARGET_ENV_VARS["whatsapp_cloud"] == "WHATSAPP_CLOUD_HOME_CHANNEL"
+
+    def test_baileys_whatsapp_still_registered(self):
+        """Sanity guard: the Cloud addition didn't disturb Baileys
+        whatsapp routing."""
+        from cron.scheduler import _HOME_TARGET_ENV_VARS
+
+        assert _HOME_TARGET_ENV_VARS.get("whatsapp") == "WHATSAPP_HOME_CHANNEL"
+
+
+class TestRunOneJobPendingDelivery:
+    """A terminal run (one-shot, or the final iteration of a repeat-limited
+    job) whose agent succeeded but whose delivery failed must retry ONLY the
+    delivery on the next due tick — never re-run the agent/script. Rerunning
+    the agent on a delivery failure would repeat every external side effect
+    it performed (see the cron-dm-topic-delivery fix)."""
+
+    @pytest.fixture()
+    def tmp_cron_dir(self, tmp_path, monkeypatch):
+        """Redirect cron storage to a temp directory (mirrors tests/cron/test_jobs.py)."""
+        monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+        monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+        return tmp_path
+
+    def test_terminal_delivery_failure_runs_agent_once_across_three_retries(self, tmp_cron_dir):
+        """The agent executes exactly once. Each of the 3 bounded retries
+        calls ONLY _deliver_result, with the exact payload the agent
+        produced on that single run — never run_job again."""
+        from cron.jobs import create_job, get_job, _MAX_DELIVERY_RETRIES
+        from cron.scheduler import run_one_job
+
+        job = create_job(prompt="Notify me when done", schedule="30m", repeat=1)
+        job_id = job["id"]
+
+        run_job_mock = MagicMock(return_value=(True, "full output doc", "final answer for the user", None))
+        deliver_mock = MagicMock(return_value="platform down")
+
+        with patch("cron.scheduler.run_job", run_job_mock), \
+             patch("cron.scheduler.save_job_output", return_value="ignored-path"), \
+             patch("cron.scheduler._deliver_result", deliver_mock):
+            # Initial fire: agent runs once, delivery fails -> pending_delivery persisted.
+            run_one_job(get_job(job_id))
+            assert run_job_mock.call_count == 1
+            first = get_job(job_id)
+            assert first["pending_delivery"]["payload"] == "final answer for the user"
+            last_run_at = first["last_run_at"]
+
+            # Three more due ticks — each must be an output-only delivery retry.
+            for _ in range(_MAX_DELIVERY_RETRIES):
+                run_one_job(get_job(job_id))
+                assert run_job_mock.call_count == 1, "agent must not be re-run on a delivery retry"
+
+        # 1 initial delivery attempt (part of the agent run) + 3 retries.
+        assert deliver_mock.call_count == 1 + _MAX_DELIVERY_RETRIES
+        for call in deliver_mock.call_args_list:
+            assert call.args[0]["id"] == job_id
+            assert call.args[1] == "final answer for the user"
+
+        final = get_job(job_id)
+        assert final is not None, "exhausted job must remain visible, not silently deleted"
+        assert final["last_run_at"] == last_run_at, "no agent re-execution means last_run_at never moves"
+        assert final["enabled"] is False
+        assert final["state"] == "error"
+        assert final["last_delivery_error"] == "platform down"
+        assert final["pending_delivery"]["exhausted"] is True
+        assert final["pending_delivery"]["payload"] == "final answer for the user", (
+            "the undelivered payload is evidence — it must not be discarded on exhaustion"
+        )
+
+    def test_success_after_retry_retires_exactly_once(self, tmp_cron_dir):
+        """Once a retry's delivery succeeds, the job retires exactly once
+        (repeat=1 limit reached -> removed) — no duplicate completion, and
+        the job can never fire again."""
+        from cron.jobs import create_job, get_job, get_due_jobs
+        from cron.scheduler import run_one_job
+
+        job = create_job(prompt="Notify me when done", schedule="30m", repeat=1)
+        job_id = job["id"]
+
+        run_job_mock = MagicMock(return_value=(True, "full output doc", "final answer", None))
+
+        with patch("cron.scheduler.run_job", run_job_mock), \
+             patch("cron.scheduler.save_job_output", return_value="ignored-path"), \
+             patch("cron.scheduler._deliver_result", side_effect=["platform down", None]) as deliver_mock:
+            run_one_job(get_job(job_id))  # agent runs, delivery fails
+            assert get_job(job_id)["pending_delivery"]["payload"] == "final answer"
+
+            run_one_job(get_job(job_id))  # output-only retry, delivery succeeds
+
+        assert run_job_mock.call_count == 1, "agent must not be re-run for the retry"
+        assert deliver_mock.call_count == 2
+        assert deliver_mock.call_args_list[1].args[1] == "final answer", (
+            "the retry must deliver the original payload, not re-derive it"
+        )
+        retired = get_job(job_id)
+        assert retired is not None, (
+            "the completed one-shot record is RETAINED for inspection "
+            "(upstream retention + retention sweep), not deleted"
+        )
+        assert retired["state"] == "completed"
+        assert retired["enabled"] is False
+        assert "pending_delivery" not in retired, "retry state must be cleared exactly once"
+        assert job_id not in {j["id"] for j in get_due_jobs()}, "a retired job must never fire again"
+
+    def test_thread_fallback_success_does_not_create_pending_delivery(self, tmp_cron_dir):
+        """A real send_result-shaped success with raw_response={"thread_fallback":
+        True} (Telegram delivered without the configured topic) must be
+        treated as a successful delivery end-to-end: _deliver_result returns
+        None, mark_job_run must not create a pending_delivery, and the
+        payload must not be retried/duplicated on a later tick."""
+        from cron.jobs import create_job, get_job, get_due_jobs
+        from cron.scheduler import run_one_job
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult
+        from concurrent.futures import Future
+
+        job = create_job(
+            prompt="Notify me when done", schedule="30m", repeat=1,
+            deliver="telegram:226252250:7072",
+        )
+        job_id = job["id"]
+
+        run_job_mock = MagicMock(return_value=(True, "full output doc", "final answer for the user", None))
+
+        send_result = SendResult(
+            success=True,
+            message_id="42",
+            raw_response={"requested_thread_id": 7072, "thread_fallback": True},
+        )
+        adapter = MagicMock()
+        adapter.send = AsyncMock(return_value=send_result)
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            # Execute the routed coroutine (DeliveryRouter._deliver_to_platform)
+            # for real: the thread_fallback signal this test is about is carried
+            # on the SendResult the adapter returns, so the whole scheduler ->
+            # router -> adapter chain has to run for the assertion to mean
+            # anything.
+            import asyncio as _asyncio
+            future = Future()
+            try:
+                future.set_result(_asyncio.run(coro))
+            except BaseException as exc:  # noqa: BLE001
+                future.set_exception(exc)
+            return future
+
+        with patch("cron.scheduler.run_job", run_job_mock), \
+             patch("cron.scheduler.save_job_output", return_value="ignored-path"), \
+             patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+            run_one_job(get_job(job_id), adapters={Platform.TELEGRAM: adapter}, loop=loop)
+
+        assert run_job_mock.call_count == 1
+        adapter.send.assert_called_once()
+
+        final = get_job(job_id)
+        # Upstream now RETAINS the finished one-shot record (retention +
+        # retention sweep) instead of deleting it — see
+        # test_success_after_retry_retires_exactly_once. What this test is
+        # about is unchanged and asserted directly: the degraded-but-successful
+        # send must retire the job with NO pending_delivery, so the payload is
+        # never resent.
+        assert final is not None, (
+            "the completed one-shot record is RETAINED for inspection, not deleted"
+        )
+        assert final["state"] == "completed"
+        assert final["enabled"] is False
+        assert "pending_delivery" not in final, (
+            "a thread_fallback send DID reach the user — recording it as an "
+            "undelivered payload would resend it on every later tick"
+        )
+        assert not final.get("last_delivery_error")
+        assert job_id not in {j["id"] for j in get_due_jobs()}, (
+            "a job that delivered successfully must never fire again to resend the same payload"
+        )

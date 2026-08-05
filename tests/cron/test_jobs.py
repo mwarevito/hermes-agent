@@ -335,7 +335,15 @@ class TestMarkJobRun:
         assert updated["last_status"] == "ok"
 
     def test_repeat_limit_retains_delivery_error(self, tmp_cron_dir):
-        """A one-shot whose delivery failed must keep the error on its record."""
+        """A one-shot whose delivery failed must keep the error on its record.
+
+        It is NOT retired on the spot: a terminal run whose delivery failed
+        enters the bounded output-only retry (``pending_delivery``) first, so
+        the user still gets the output. The record stays inspectable
+        throughout, and only retires (state="completed") once delivery
+        actually succeeds — see
+        ``test_pending_delivery_success_after_retry_completes_once``.
+        """
         job = create_job(prompt="Once", schedule="30m", repeat=1)
         mark_job_run(
             job["id"], success=True,
@@ -343,17 +351,22 @@ class TestMarkJobRun:
         )
         updated = get_job(job["id"])
         assert updated is not None
-        assert updated["state"] == "completed"
+        assert updated["state"] == "scheduled"
+        assert updated["pending_delivery"]["retry_count"] == 0
         assert updated["last_delivery_error"] == "platform 'telegram' not configured"
 
     def test_completed_oneshot_visible_in_list(self, tmp_cron_dir):
         """list_jobs(include_disabled=True) surfaces the completed record."""
+        from cron.jobs import finalize_pending_delivery
+
         job = create_job(prompt="Once", schedule="30m", repeat=1)
         mark_job_run(job["id"], success=True, delivery_error="send failed: 502")
+        # A failed terminal delivery first enters the bounded retry; the
+        # record is retired only once the retry finally delivers.
+        finalize_pending_delivery(job["id"], None)
         listed = {j["id"]: j for j in list_jobs(include_disabled=True)}
         assert job["id"] in listed
         assert listed[job["id"]]["state"] == "completed"
-        assert listed[job["id"]]["last_delivery_error"] == "send failed: 502"
         # Default (enabled-only) listing hides it, matching paused/disabled jobs.
         assert job["id"] not in {j["id"] for j in list_jobs()}
 
@@ -411,6 +424,176 @@ class TestMarkJobRun:
         assert updated["next_run_at"] is None
         assert updated["last_error"]
         assert "croniter" in updated["last_error"].lower()
+
+    def test_recurring_interval_not_disabled_when_next_run_is_none(self, tmp_cron_dir, monkeypatch):
+        """Defensive sibling of the cron test — any recurring schedule that
+        somehow yields next_run_at=None must stay enabled with state=error.
+        """
+        job = create_job(prompt="Recurring", schedule="every 1h")
+        assert job["schedule"]["kind"] == "interval"
+
+        # Force compute_next_run to return None for this call — simulates
+        # any future regression where a recurring schedule loses its
+        # next-run computation (missing dep, corrupt schedule, etc.).
+        monkeypatch.setattr("cron.jobs.compute_next_run", lambda *a, **kw: None)
+
+        mark_job_run(job["id"], success=True)
+
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["enabled"] is True
+        assert updated["state"] == "error"
+        assert updated["state"] != "completed"
+
+    def test_oneshot_still_completes_when_next_run_is_none(self, tmp_cron_dir):
+        """One-shot jobs must still flip to enabled=false, state=completed
+        when next_run_at cannot be computed — the #16265 fix must not
+        regress this path. We bypass create_job and craft a minimal
+        one-shot record directly so that the repeat-limit branch doesn't
+        pop the job before we observe the terminal-completion branch.
+        """
+        jobs = [{
+            "id": "oneshot-test",
+            "prompt": "Once",
+            "schedule": {"kind": "once", "run_at": "2020-01-01T00:00:00+00:00", "display": "once"},
+            "repeat": {"times": None, "completed": 0},
+            "enabled": True,
+            "state": "scheduled",
+            "next_run_at": "2020-01-01T00:00:00+00:00",
+            "last_run_at": None,
+            "last_status": None,
+            "last_error": None,
+            "last_delivery_error": None,
+            "created_at": "2020-01-01T00:00:00+00:00",
+        }]
+        save_jobs(jobs)
+
+        mark_job_run("oneshot-test", success=True)
+
+        updated = get_job("oneshot-test")
+        assert updated is not None
+        assert updated["next_run_at"] is None
+        assert updated["enabled"] is False
+        assert updated["state"] == "completed"
+
+    def test_oneshot_delivery_failure_is_retried_not_removed(self, tmp_cron_dir):
+        """A one-shot completion job whose delivery failed must not be
+        silently removed/marked complete — it should stay enabled with a
+        bounded, OUTPUT-ONLY retry scheduled shortly in the future. The
+        agent must never be re-run to produce the retry — the exact
+        payload from the original (successful) run is persisted instead.
+        """
+        job = create_job(prompt="Notify me when done", schedule="30m", repeat=1)
+        mark_job_run(
+            job["id"], success=True,
+            delivery_error="Telegram DM topic delivery requires a reply anchor",
+            delivery_payload="the agent's final answer",
+        )
+
+        updated = get_job(job["id"])
+        assert updated is not None, "one-shot job was removed despite failed delivery"
+        assert updated["enabled"] is True
+        assert updated["state"] == "scheduled"
+        assert updated["last_delivery_error"] == "Telegram DM topic delivery requires a reply anchor"
+        assert updated["repeat"]["completed"] == 0, "completed count must not advance on a failed delivery"
+
+        pending = updated["pending_delivery"]
+        assert pending["payload"] == "the agent's final answer"
+        assert pending["success"] is True
+        assert pending["retry_count"] == 0
+
+        retry_at = datetime.fromisoformat(updated["next_run_at"])
+        now = datetime.fromisoformat(updated["last_run_at"])
+        assert retry_at > now, "retry must be scheduled in the future, not fired every tick"
+
+    def test_pending_delivery_exhausted_stays_visible_not_marked_delivered(self, tmp_cron_dir):
+        """A persistently failing delivery must not retry forever, but it
+        must also NEVER be silently retired as if it had been delivered.
+        After the bounded retry budget, finalize_pending_delivery must
+        leave the job in an auditable error state with the undelivered
+        payload still attached — not delete it, not mark it complete."""
+        from cron.jobs import _MAX_DELIVERY_RETRIES, finalize_pending_delivery
+
+        job = create_job(prompt="Notify me when done", schedule="30m", repeat=1)
+        job_id = job["id"]
+
+        mark_job_run(
+            job_id, success=True, delivery_error="platform down",
+            delivery_payload="the undelivered answer",
+        )
+
+        # Retries consumed via finalize_pending_delivery — the output-only
+        # path — never via mark_job_run (which would imply a fresh agent run).
+        for _ in range(_MAX_DELIVERY_RETRIES):
+            assert get_job(job_id) is not None, "job disappeared before retry budget was exhausted"
+            finalize_pending_delivery(job_id, "platform down")
+
+        updated = get_job(job_id)
+        assert updated is not None, "job must NOT be deleted when delivery retries are exhausted"
+        assert updated["enabled"] is False
+        assert updated["state"] == "error"
+        assert updated["last_delivery_error"] == "platform down"
+        pending = updated["pending_delivery"]
+        assert pending is not None, "undelivered payload must be preserved as evidence, not deleted"
+        assert pending["exhausted"] is True
+        assert pending["payload"] == "the undelivered answer"
+        assert pending["retry_count"] == _MAX_DELIVERY_RETRIES
+
+    def test_pending_delivery_success_after_retry_completes_once(self, tmp_cron_dir):
+        """Once a retry succeeds, the job completes/removes exactly like a
+        normal successful run — no duplicate completion and no leftover
+        retry state. The retry goes through finalize_pending_delivery
+        (output-only), never mark_job_run (which implies a fresh run)."""
+        from cron.jobs import finalize_pending_delivery
+
+        job = create_job(prompt="Notify me when done", schedule="30m", repeat=1)
+        job_id = job["id"]
+
+        mark_job_run(
+            job_id, success=True, delivery_error="temporary network error",
+            delivery_payload="the answer",
+        )
+        assert get_job(job_id) is not None
+        assert get_job(job_id)["pending_delivery"]["retry_count"] == 0
+
+        finalize_pending_delivery(job_id, None)
+        completed = get_job(job_id)
+        assert completed is not None, (
+            "the completed one-shot record is RETAINED (upstream retention +"
+            " retention sweep), not deleted"
+        )
+        assert completed["state"] == "completed"
+        assert completed["enabled"] is False
+        assert completed["next_run_at"] is None
+        assert "pending_delivery" not in completed, "retry state must be cleared"
+
+    def test_finalize_pending_delivery_noop_without_pending_state(self, tmp_cron_dir):
+        """finalize_pending_delivery must be a safe no-op (not raise, not
+        mutate) when a job has no pending_delivery — e.g. it was already
+        finalized by a concurrent tick."""
+        from cron.jobs import finalize_pending_delivery
+
+        job = create_job(prompt="Report", schedule="every 1h")
+        finalize_pending_delivery(job["id"], "some error")
+
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert "pending_delivery" not in updated
+        assert updated["repeat"]["completed"] == 0
+
+    def test_recurring_job_delivery_failure_not_treated_as_terminal(self, tmp_cron_dir):
+        """A recurring job (more occurrences left) with a failed delivery
+        is not a 'completion' job — it already gets another natural chance
+        on its next scheduled fire, so the bounded-retry path must not
+        engage (no pending_delivery bookkeeping, no agent-skipping retry)."""
+        job = create_job(prompt="Recurring report", schedule="every 1h")
+        mark_job_run(job["id"], success=True, delivery_error="platform down", delivery_payload="the report")
+
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["last_delivery_error"] == "platform down"
+        assert "pending_delivery" not in updated
+        assert updated["repeat"]["completed"] == 1
 
 
 class TestAdvanceNextRun:
@@ -1193,9 +1376,18 @@ class TestCompletedOneshotRetentionSweep:
     """Completed one-shots are retained for inspection, then pruned by age."""
 
     def _completed_oneshot(self, age_days: float):
-        """Create a one-shot, complete it, and backdate its last_run_at."""
+        """Create a one-shot, complete it, and backdate its last_run_at.
+
+        A terminal run whose delivery failed enters the bounded output-only
+        retry first, so the record only reaches ``state="completed"`` once
+        the retry finally delivers — drive that here, since this class is
+        about the RETENTION of a completed record, not about the retry.
+        """
+        from cron.jobs import finalize_pending_delivery
+
         job = create_job(prompt="Once", schedule="30m", repeat=1)
         mark_job_run(job["id"], success=True, delivery_error="boom")
+        finalize_pending_delivery(job["id"], None)
         stamp = (
             datetime.now(timezone.utc) - timedelta(days=age_days)
         ).isoformat()
@@ -1217,7 +1409,9 @@ class TestCompletedOneshotRetentionSweep:
         kept = get_job(recent_id)
         assert kept is not None
         assert kept["state"] == "completed"
-        assert kept["last_delivery_error"] == "boom"
+        # last_delivery_error reflects the FINAL attempt — the retry that
+        # delivered — not the first failure that triggered the retry.
+        assert kept["last_delivery_error"] is None
 
     def test_sweep_ignores_recurring_jobs(self, tmp_cron_dir):
         """Old recurring jobs are never candidates, whatever their history."""

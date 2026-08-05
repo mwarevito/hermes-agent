@@ -388,6 +388,240 @@ async def test_created_private_topic_thread_not_found_fails_without_root_fallbac
 
 
 @pytest.mark.asyncio
+async def test_send_uses_metadata_reply_fallback_for_streaming_dm_topics():
+    """Metadata-only sends still stay in Hermes-created Telegram DM topics."""
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(kwargs)
+        return SimpleNamespace(message_id=778)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(
+        chat_id="123",
+        content="streamed text",
+        metadata={
+            "thread_id": "20197",
+            "telegram_dm_topic_reply_fallback": True,
+            "telegram_reply_to_message_id": "462",
+        },
+    )
+
+    assert result.success is True
+    assert call_log[0]["reply_to_message_id"] == 462
+    assert call_log[0]["message_thread_id"] == 20197
+    assert "direct_messages_topic_id" not in call_log[0]
+
+
+@pytest.mark.asyncio
+async def test_send_reply_fallback_applies_to_every_chunk_for_dm_topics():
+    """Long Telegram DM-topic fallback sends must anchor every chunk."""
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=len(call_log))
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(
+        chat_id="123",
+        content="A" * 5000,
+        metadata={
+            "thread_id": "20197",
+            "telegram_dm_topic_reply_fallback": True,
+            "telegram_reply_to_message_id": "462",
+        },
+    )
+
+    assert result.success is True
+    assert len(call_log) > 1
+    assert all(call["reply_to_message_id"] == 462 for call in call_log)
+    assert all(call["message_thread_id"] == 20197 for call in call_log)
+    assert all("direct_messages_topic_id" not in call for call in call_log)
+
+
+@pytest.mark.asyncio
+async def test_send_model_picker_uses_metadata_reply_fallback_for_dm_topics():
+    """Inline keyboard sends also consume the metadata reply fallback."""
+    adapter = _make_adapter()
+    adapter._model_picker_state = {}
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(kwargs)
+        return SimpleNamespace(message_id=779)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send_model_picker(
+        chat_id="123",
+        providers=[{"name": "OpenAI", "slug": "openai", "models": [], "total_models": 0}],
+        current_model="gpt-test",
+        current_provider="openai",
+        session_key="telegram:123:20197",
+        on_model_selected=lambda *_: None,
+        metadata={
+            "thread_id": "20197",
+            "telegram_dm_topic_reply_fallback": True,
+            "telegram_reply_to_message_id": "462",
+        },
+    )
+
+    assert result.success is True
+    assert call_log[0]["reply_to_message_id"] == 462
+    assert call_log[0]["message_thread_id"] == 20197
+    assert "direct_messages_topic_id" not in call_log[0]
+
+
+@pytest.mark.asyncio
+async def test_send_dm_topic_fallback_without_anchor_does_not_crash():
+    """DM-topic fallback without an anchor uses direct topic routing."""
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=780)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(
+        chat_id="123",
+        content="source-only send",
+        metadata={
+            "thread_id": "20197",
+            "telegram_dm_topic_reply_fallback": True,
+            "direct_messages_topic_id": "20197",
+        },
+    )
+
+    assert result.success is True
+    assert call_log[0]["reply_to_message_id"] is None
+    assert call_log[0]["message_thread_id"] is None
+    assert call_log[0]["direct_messages_topic_id"] == 20197
+
+
+@pytest.mark.asyncio
+async def test_send_dm_topic_fallback_without_direct_topic_id_fails_closed():
+    """No reply anchor AND no direct_messages_topic_id must refuse to send.
+
+    Mirrors test_send_dm_topic_fallback_without_anchor_does_not_crash but
+    without the direct_messages_topic_id metadata key, so there is truly no
+    way to route the message into the correct topic. This must stay
+    fail-loud rather than fall back to a plain send outside the lane.
+    """
+    adapter = _make_adapter()
+    assert adapter._reply_to_mode == "first"
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=780)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(
+        chat_id="123",
+        content="source-only send",
+        metadata={
+            "thread_id": "20197",
+            "telegram_dm_topic_reply_fallback": True,
+        },
+    )
+
+    assert result.success is False
+    assert result.error == adapter._dm_topic_missing_anchor_error()
+    assert result.retryable is False
+    assert call_log == []
+
+
+@pytest.mark.asyncio
+async def test_cron_synthetic_dm_topic_metadata_sends_via_direct_topic_id(monkeypatch, tmp_path):
+    """GatewayRunner._thread_metadata_for_target output must route through send().
+
+    Cron delivery (cron/scheduler.py) has no live MessageEvent to derive
+    metadata from — it builds synthetic routing metadata via the same static
+    helper live gateway replies use. This exercises that exact helper's
+    output through the real TelegramAdapter.send() path, rather than a
+    hand-authored metadata dict, so a refactor of either side is caught.
+    """
+    from gateway import run as gateway_run
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    GatewayRunner = gateway_run.GatewayRunner
+
+    adapter = _make_adapter()
+    assert adapter._reply_to_mode == "first"
+    # Simulate an operator-declared DM topic so
+    # GatewayRunner._is_telegram_dm_topic_target recognizes this thread_id
+    # (mirrors how a real deployment registers DM topics).
+    adapter._dm_topics = {"405154434:cron": 701226}
+    adapter._dm_topics_config = []
+
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=780)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    metadata = GatewayRunner._thread_metadata_for_target(
+        Platform.TELEGRAM, "405154434", "701226", adapter=adapter,
+    )
+
+    assert metadata == {
+        "thread_id": "701226",
+        "telegram_dm_topic_reply_fallback": True,
+        "direct_messages_topic_id": "701226",
+    }
+
+    result = await adapter.send(
+        chat_id="405154434",
+        content="cron synthetic delivery",
+        metadata={"cron_delivery": True, **metadata},
+    )
+
+    assert result.success is True
+    assert call_log[0]["reply_to_message_id"] is None
+    assert call_log[0]["message_thread_id"] is None
+    assert call_log[0]["direct_messages_topic_id"] == 701226
+
+
+@pytest.mark.asyncio
+async def test_send_dm_topic_reply_not_found_fails_closed():
+    """If Telegram deletes the reply anchor, private-topic sends must not fall back elsewhere."""
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        raise FakeBadRequest("Message to be replied not found")
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(
+        chat_id="123",
+        content="anchor disappeared",
+        metadata={
+            "thread_id": "20197",
+            "telegram_dm_topic_reply_fallback": True,
+            "telegram_reply_to_message_id": "462",
+        },
+    )
+
+    assert result.success is False
+    assert result.retryable is False
+    assert call_log[0]["reply_to_message_id"] == 462
+    assert call_log[0]["message_thread_id"] == 20197
+    assert len(call_log) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("method_name", "bot_method_name", "path_kw", "filename", "payload"),
     [

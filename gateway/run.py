@@ -20511,8 +20511,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 metadata["slack_team_id"] = str(team_id)
         return metadata
 
+    @staticmethod
     def _thread_metadata_for_target(
-        self,
         platform: Optional[Platform],
         chat_id: Optional[str],
         thread_id: Optional[str],
@@ -20521,11 +20521,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         reply_to_message_id: Optional[str] = None,
         adapter: Optional[Any] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Build thread metadata for synthetic sends that only have routing state."""
+        """Build thread metadata for synthetic sends that only have routing state.
+
+        Static so non-instance callers (e.g. cron delivery, which only has a
+        raw platform->adapter dict, not a running ``GatewayRunner``) can reuse
+        the exact same DM-topic-aware routing logic that live gateway replies
+        use instead of re-deriving it.
+        """
         if thread_id is None:
             return None
         metadata: Dict[str, Any] = {"thread_id": thread_id}
-        if self._is_telegram_dm_topic_target(
+        if GatewayRunner._is_telegram_dm_topic_target(
             platform,
             chat_id,
             thread_id,

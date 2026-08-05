@@ -36,21 +36,29 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
-# ── Sandbox HERMES_HOME before ANY test module is imported ──────────────────
+# ── Session-level HERMES_HOME isolation guard ──────────────────────────────
+#
 # `hermes_cli/main.py` calls `setup_logging()` at MODULE level, which resolves
 # `get_hermes_home()` and attaches rotating file handlers to the ROOT logger.
 # So merely importing it - which many test modules do, directly or
 # transitively - points the whole pytest session's logging at the operator's
-# real `~/.hermes/logs/agent.log` and `errors.log`.
+# real `~/.hermes/logs/agent.log` and `errors.log`. `hermes_state.py` freezes
+# `DEFAULT_DB_PATH = get_hermes_home() / "state.db"` the same way, and
+# `hermes_cli/main.py` also runs `load_hermes_dotenv()` at import.
 #
-# The `_isolate_env` fixture below also sandboxes HERMES_HOME, but fixtures run
-# AFTER collection imports test modules, by which point the handler already
-# holds an absolute path to the real log. Measured on a live install: 126
-# warnings in the operator's agent.log came from test runs, not the gateway -
-# enough noise to make genuine warnings hard to find.
-#
+# The `_hermetic_environment` fixture below also sandboxes HERMES_HOME, but
+# fixtures run AFTER collection imports test modules, by which point those
+# module-level constants/handlers already hold absolute paths to the real home.
 # conftest is imported before any test module, so setting it here closes that
 # window. The per-test fixture still applies for everything after import.
+#
+# WHY the guard is stricter than "set it when unset" (incident 2026-08-05):
+# a bare ``pytest`` run wrote 189 junk sessions into the live ``state.db`` and
+# rolled the live ``errors.log`` twice in 10 minutes. An explicitly-set
+# HERMES_HOME that RESOLVES TO THE LIVE HOME is just as dangerous as an unset
+# one, so both are redirected; a deliberately non-default value (runner
+# tmpdir, custom/profile home) is respected, and
+# ``HERMES_TESTS_ALLOW_LIVE_HOME=1`` opts out explicitly.
 #
 # ORDER MATTERS: the kanban write guard's deny-list (further down) must know
 # the REAL Hermes root — capture it BEFORE the sandbox rewires HERMES_HOME,
@@ -58,10 +66,73 @@ if str(PROJECT_ROOT) not in sys.path:
 # would silently stop protecting the operator's actual ~/.hermes (#69385).
 _PRE_SANDBOX_KANBAN_OVERRIDE = os.environ.get("HERMES_KANBAN_HOME", "").strip()
 _PRE_SANDBOX_HERMES_HOME = os.environ.get("HERMES_HOME", "")
-if not os.environ.get("HERMES_HOME"):
-    _SESSION_HERMES_HOME = tempfile.mkdtemp(prefix="hermes-test-home-")
-    os.environ["HERMES_HOME"] = _SESSION_HERMES_HOME
-    atexit.register(shutil.rmtree, _SESSION_HERMES_HOME, True)
+
+
+# Set when the guard redirects HERMES_HOME; re-emitted as a config-time
+# warning in pytest_configure so it survives pytest's fd-level capture
+# (which is already active while initial conftests are imported — a plain
+# sys.stderr.write here would be swallowed except under ``-s``).
+_HERMES_HOME_ISOLATION_MSG: "str | None" = None
+
+
+def _isolate_live_hermes_home_for_session() -> None:
+    """Redirect a live-pointing/unset HERMES_HOME to a session tempdir."""
+    global _HERMES_HOME_ISOLATION_MSG
+    import atexit as _atexit
+    import shutil as _shutil
+    import tempfile as _tempfile
+
+    if os.environ.get("HERMES_TESTS_ALLOW_LIVE_HOME", "").strip() == "1":
+        return
+
+    raw = os.environ.get("HERMES_HOME", "").strip()
+
+    # Mirror hermes_constants._get_platform_default_hermes_home() without
+    # importing it (importing hermes modules this early is what we avoid).
+    if sys.platform == "win32":
+        _lad = os.environ.get("LOCALAPPDATA", "").strip()
+        _base = Path(_lad) if _lad else Path.home() / "AppData" / "Local"
+        default_home = _base / "hermes"
+    else:
+        default_home = Path.home() / ".hermes"
+
+    if raw:
+        try:
+            explicit = Path(raw).expanduser().resolve()
+            default_resolved = default_home.resolve()
+        except OSError:
+            return  # unresolvable path — can't be the live home, leave it
+        if explicit != default_resolved:
+            # Deliberately non-standard value (runner tmpdir, custom home,
+            # profile path) — respect it, the caller knows what they want.
+            return
+
+    session_home = Path(_tempfile.mkdtemp(prefix="hermes-tests-home-"))
+    for sub in ("sessions", "cron", "memories", "skills", "logs"):
+        (session_home / sub).mkdir(exist_ok=True)
+    os.environ["HERMES_HOME"] = str(session_home)
+    _atexit.register(_shutil.rmtree, str(session_home), True)  # ignore_errors
+
+    reason = (
+        "HERMES_HOME was unset"
+        if not raw
+        else f"HERMES_HOME pointed at the live home ({raw})"
+    )
+    _HERMES_HOME_ISOLATION_MSG = (
+        f"[tests/conftest.py] HERMES_HOME isolation guard: {reason} — "
+        f"redirected to {session_home} for this pytest session so that "
+        "import-time consumers (hermes_state.DEFAULT_DB_PATH, hermes_cli.main "
+        "setup_logging/load_hermes_dotenv) cannot touch the real live home. "
+        "Set HERMES_TESTS_ALLOW_LIVE_HOME=1 to bypass."
+    )
+    # Visible under ``-s`` / plain imports; captured otherwise (see the
+    # config-time warning in pytest_configure for the always-visible copy).
+    sys.stderr.write("\n" + _HERMES_HOME_ISOLATION_MSG + "\n")
+    sys.stderr.flush()
+
+
+_isolate_live_hermes_home_for_session()
+
 
 #: HERMES_HOME as it stood when conftest was imported - i.e. before any test
 #: module could import code that configures logging. Recorded so the guard in
@@ -954,6 +1025,21 @@ _ALLOW_MACOS_KEYCHAIN_MARK = "allow_macos_keychain"
 
 def pytest_configure(config):  # noqa: D401 — pytest hook
     """Register markers used by hermetic conftest."""
+    # Surface the HERMES_HOME isolation-guard redirect in the warnings
+    # summary. The guard itself runs at conftest import, when pytest's
+    # fd-level capture is already active — its stderr line is swallowed
+    # unless ``-s`` is passed. A config-time warning survives capture and
+    # shows up in the terminal summary even under ``-q``.
+    if _HERMES_HOME_ISOLATION_MSG:
+        import warnings as _warnings
+
+        try:
+            config.issue_config_time_warning(
+                UserWarning(_HERMES_HOME_ISOLATION_MSG), stacklevel=2
+            )
+        except Exception:
+            _warnings.warn(_HERMES_HOME_ISOLATION_MSG, UserWarning, stacklevel=1)
+
     config.addinivalue_line(
         "markers",
         f"{_LIVE_SYSTEM_GUARD_BYPASS_MARK}: bypass the live-system guard "

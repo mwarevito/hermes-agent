@@ -1688,6 +1688,40 @@ def _clear_planned_restart_notification() -> None:
     _planned_restart_notification_path().unlink(missing_ok=True)
 
 
+# --- Idle-restart request file (hermes-deploy deferred restart) -------------
+#
+# hermes-deploy's deferred mode used to `sleep 75; launchctl kickstart` — which
+# killed any agent turn still running past the grace period, including the very
+# turn that ran the deploy (2026-08-03 and twice on 2026-08-05: the deploying
+# turn lost all its messages).  Instead the deploy script now drops a small
+# JSON request file per profile and the gateway restarts itself at the first
+# moment it is actually idle (no active agent turns).  If the gateway is never
+# idle, the request escalates after RESTART_REQUEST_ESCALATION_AGE into the
+# normal graceful drain-restart (current turns get the full drain window to
+# finish; new work queues) — so a deploy can never silently not apply.
+
+RESTART_REQUEST_CHECK_INTERVAL = 15.0
+RESTART_REQUEST_ESCALATION_AGE = 15 * 60.0
+
+
+def _restart_request_path() -> Path:
+    """Path of this gateway's idle-restart request file.
+
+    One file per profile inside the profile's own HERMES_HOME, named after the
+    profile so external writers (hermes-deploy) can address a specific gateway:
+    ``restart-request-default.json`` for the personal bot,
+    ``restart-request-<profile>.json`` for profile gateways.  The profile name
+    comes from the same source the gateway itself uses
+    (``hermes_cli.profiles.get_active_profile_name``, derived from HERMES_HOME).
+    """
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        profile = get_active_profile_name() or "default"
+    except Exception:
+        profile = "default"
+    return _hermes_home / f"restart-request-{profile}.json"
+
+
 # Mark this process as a gateway so cli.py's module-level load_cli_config()
 # knows not to clobber TERMINAL_CWD if lazily imported.
 os.environ["_HERMES_GATEWAY"] = "1"
@@ -10139,6 +10173,137 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._restart_task = asyncio.create_task(_run_restart())
         return True
 
+    def _check_restart_request(self, *, now: Optional[float] = None) -> str:
+        """One tick of the idle-restart watcher (see _restart_request_path).
+
+        Returns the action taken so tests (and the watcher loop) can branch:
+
+        - ``"none"``      — no request file present (or gateway already
+                            stopping); nothing to do.
+        - ``"restart"``   — gateway is idle: file consumed, clean restart
+                            initiated (same path as the /restart command:
+                            ``request_restart(via_service=True)`` — launchd /
+                            the keepalive cron relaunches the process).
+        - ``"deferred"``  — active agent turn(s) running and the request is
+                            still young: leave the file, retry next tick.
+        - ``"escalated"`` — the request file has been waiting longer than
+                            RESTART_REQUEST_ESCALATION_AGE on a never-idle
+                            gateway: file consumed, graceful drain-restart
+                            initiated anyway.  Current turns still get the
+                            full ``restart_drain_timeout`` window to finish
+                            (drain — not a mid-turn kill) and new work queues.
+        - ``"invalid"``   — file exists but is not valid JSON (partial write,
+                            corruption): removed WITHOUT restarting, logged.
+        """
+        if not self._running or self._draining or self._restart_task_started:
+            return "none"
+        path = _restart_request_path()
+        try:
+            mtime = path.stat().st_mtime
+        except FileNotFoundError:
+            return "none"
+        except OSError as e:
+            logger.debug("restart-request stat failed for %s: %s", path, e)
+            return "none"
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if not isinstance(payload, dict):
+                raise ValueError("restart-request payload must be a JSON object")
+        except FileNotFoundError:
+            return "none"
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError, OSError) as e:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            logger.warning(
+                "restart-request file %s is unreadable/invalid (%s) — "
+                "removed WITHOUT restarting; re-request if the restart is "
+                "still wanted",
+                path, e,
+            )
+            return "invalid"
+
+        source = payload.get("source") or "unknown"
+        active = self._running_agent_count()
+        if active == 0:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as e:
+                # Never restart while the request file is still on disk —
+                # the relaunched gateway would consume it AGAIN and
+                # restart-loop.  Skip this tick; deletion is retried next.
+                logger.warning(
+                    "restart-request %s could not be removed (%s) — "
+                    "deferring restart to avoid a restart loop",
+                    path, e,
+                )
+                return "deferred"
+            logger.info(
+                "restart-request from %s honored while idle — restarting "
+                "gateway now (launchd/keepalive relaunches)",
+                source,
+            )
+            self.request_restart(detached=False, via_service=True)
+            return "restart"
+
+        age = (time.time() if now is None else now) - mtime
+        if age > RESTART_REQUEST_ESCALATION_AGE:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as e:
+                logger.warning(
+                    "restart-request %s could not be removed (%s) — "
+                    "deferring escalation to avoid a restart loop",
+                    path, e,
+                )
+                return "deferred"
+            logger.warning(
+                "restart-request from %s pending %.0f min but the gateway "
+                "was never idle (%d active turn(s)) — ESCALATING to a "
+                "graceful drain-restart: current turn(s) get the drain "
+                "window to finish, then the gateway restarts",
+                source, age / 60.0, active,
+            )
+            self.request_restart(detached=False, via_service=True)
+            return "escalated"
+
+        if not getattr(self, "_restart_request_seen_logged", False):
+            self._restart_request_seen_logged = True
+            logger.info(
+                "restart-request from %s noted: %d active turn(s) — will "
+                "apply when idle (escalation after %.0f min)",
+                source, active, RESTART_REQUEST_ESCALATION_AGE / 60.0,
+            )
+        else:
+            logger.debug(
+                "restart-request still pending: %d active turn(s), age %.0fs",
+                active, age,
+            )
+        return "deferred"
+
+    async def _restart_request_watcher(
+        self, interval: float = RESTART_REQUEST_CHECK_INTERVAL
+    ) -> None:
+        """Poll for an idle-restart request file every ``interval`` seconds.
+
+        Started as a background task in ``start()`` alongside the other
+        watchers.  Exits once a restart has been initiated (or the gateway
+        is shutting down for any other reason).
+        """
+        await asyncio.sleep(interval)
+        while self._running:
+            try:
+                action = self._check_restart_request()
+                if action in ("restart", "escalated"):
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("restart-request watcher tick failed: %s", e)
+            await asyncio.sleep(interval)
+
     # Drain-timeout reasons set by _stop_impl() when a still-running turn is
     # force-interrupted; "restart_interrupted" is set by
     # SessionStore.suspend_recently_active() on crash recovery (no
@@ -11510,6 +11675,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # is ignored via its instantiation epoch; only a current-epoch marker
         # engages drain on the first tick.
         self._spawn_supervised(self._drain_control_watcher, "drain_control_watcher")
+
+        # Start the idle-restart request watcher — consumes
+        # $HERMES_HOME/restart-request-<profile>.json (written by
+        # hermes-deploy's deferred mode) and restarts the gateway at the
+        # first tick with no active agent turns, so a deploy can never
+        # kill the very turn that ran it.
+        asyncio.create_task(self._restart_request_watcher())
 
         logger.info("Press Ctrl+C to stop")
         

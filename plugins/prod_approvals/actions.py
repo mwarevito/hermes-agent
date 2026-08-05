@@ -18,6 +18,22 @@ Supported action classes (minimum required set):
 * ``railway_variable_set``  — ``railway variables --set KEY=VALUE ...``
 * ``railway_restart``       — ``railway redeploy|restart --service <id> ...``
 * ``railway_readonly_verify`` — ``railway variables`` / ``railway status`` (reads)
+* ``vercel_prod_deploy``    — ``vercel deploy --prod --yes --scope <team id>``
+  where ``--scope`` must equal the immutable team id of the linked project
+  metadata (``.vercel/project.json``) under the *canonical, existing* cwd
+  (no symlinked cwd or metadata components); the cwd and both immutable ids
+  (project + team) are bound as targets.
+* ``vercel_readonly_verify`` — narrowly-specified reads: ``vercel whoami``,
+  ``vercel project ls``, ``vercel ls``, ``vercel inspect <deployment>``
+  (each with at most an optional immutable ``--scope <team id>``).
+* ``npm_install_hosting_cli`` — ``npm install --global
+  --registry=https://registry.npmjs.org/ vercel@X.Y.Z``: the one canonical
+  argv — exact tokens in exact order, ``--global`` spelled out, official
+  registry with trailing slash pinned on the command line, exact numeric
+  semver (no ``-g``, reordered forms, dist-tags, ranges, extra flags, or
+  custom registries); a write action so the one-time
+  CLI install is approvable without weakening the prod-token smuggling scan
+  for every other ``npm`` form.
 
 Everything else that *looks like* a production-write CLI (``railway``,
 ``vercel``, ``supabase``, ``flyctl`` …) but does not match a structured spec is
@@ -26,8 +42,11 @@ rejected as an unstructured production write — never silently passed through.
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import shlex
+import stat
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
@@ -132,6 +151,11 @@ def tokenize(command: str) -> Tuple[str, ...]:
         raise ShellIndirection(f"tokenization failed: {exc}") from exc
     if not argv:
         raise ShellIndirection("no tokens")
+    # Control characters (incl. quoted newlines/tabs, which the metacharacter
+    # scan cannot see inside single quotes) never belong in a provable argv.
+    for tok in argv:
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in tok):
+            raise ShellIndirection("control character in token")
     # Reject a leading VAR=value environment-assignment prefix (a shell feature,
     # not an argument to the executable).
     if "=" in argv[0]:
@@ -168,13 +192,26 @@ def _is_immutable_id(value: str) -> bool:
     return bool(_UUID_RE.match(value))
 
 
+def _token_references_prod_cli(tok: str) -> bool:
+    if tok.rsplit("/", 1)[-1] in _PROD_CLIS:
+        return True
+    for cli in _PROD_CLIS:
+        if re.search(rf"(?<![\w/-]){re.escape(cli)}(?![\w-])", tok):
+            return True
+    return False
+
+
 def is_prod_write_class(command: str) -> bool:
     """Cheap pre-check: does this command reference a production-write CLI?
 
-    Deliberately conservative and quote-insensitive so smuggling attempts that
-    embed ``railway`` behind metacharacters still get routed into full
-    classification (which then rejects them). Used by the gate to decide
-    whether to engage at all.
+    Two complementary conservative passes. The raw quote-insensitive scan
+    catches prod tokens smuggled behind metacharacters (strings shlex cannot
+    or should not be trusted to tokenize). The tokenization-aware pass catches
+    what the raw scan cannot see: POSIX quote concatenation (``ver'cel'``)
+    and quoted executable paths (``'/usr/bin/vercel'``) reassemble into a prod
+    token only after unquoting. Either pass matching admits the command into
+    full classification (which then rejects every unsafe form) — the passes
+    only ever add detections, never subtract.
     """
     try:
         head = command.strip().split()[0]
@@ -183,12 +220,17 @@ def is_prod_write_class(command: str) -> bool:
     base = head.rsplit("/", 1)[-1]
     if base in _PROD_CLIS:
         return True
-    # Token-level scan for a prod CLI appearing anywhere (smuggled via a wrapper
-    # or metacharacters). Word-boundary matched to avoid substring false hits.
+    # Raw scan: a prod CLI token anywhere in the un-tokenized string
+    # (word-boundary matched to avoid substring false hits).
     for cli in _PROD_CLIS:
         if re.search(rf"(?<![\w/-]){re.escape(cli)}(?![\w-])", command):
             return True
-    return False
+    # Tokenization-aware scan on the unquoted argv.
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return False  # unbalanced quotes; raw scan above already had its say
+    return any(_token_references_prod_cli(tok) for tok in tokens)
 
 
 # --- railway argv parsers --------------------------------------------------
@@ -341,6 +383,254 @@ def _classify_railway(argv: Tuple[str, ...], cwd: str) -> object:
     return UnsafeCommand("unstructured-prod-write", f"railway {sub} is not a structured action")
 
 
+# --- vercel (hosting CLI) argv parsers --------------------------------------
+
+# Immutable Vercel ids. Human-facing project/team *names* are mutable aliases
+# and are never accepted as targets or scopes.
+_VERCEL_PROJECT_ID_RE = re.compile(r"^prj_[A-Za-z0-9]{8,64}$")
+_VERCEL_TEAM_ID_RE = re.compile(r"^team_[A-Za-z0-9]{8,64}$")
+# A deployment reference for `inspect`: immutable dpl_ id or a concrete
+# *.vercel.app deployment URL (optionally https://-prefixed).
+_VERCEL_DEPLOYMENT_RE = re.compile(
+    r"^(?:https://)?(?:dpl_[A-Za-z0-9]{8,64}|[a-z0-9][a-z0-9.-]{0,250}\.vercel\.app)$"
+)
+
+
+def _read_linked_project(cwd: str) -> Tuple[str, str]:
+    """Read the linked-project metadata under ``cwd`` (generic — any project).
+
+    Requires a canonical (symlink-free, ``realpath``-identical), existing,
+    absolute cwd whose ``.vercel/project.json`` is a regular file reached
+    through no symlinked component (opened ``O_NOFOLLOW`` where supported),
+    holding immutable ``projectId`` (prj_…) and ``orgId`` (team_…). Anything
+    missing, unreadable, symlinked, or mutable-looking raises
+    :class:`ShellIndirection` so the caller rejects the write.
+
+    Re-read on every classification: metadata drift between approval and the
+    gate's execution-time re-classification changes the targets — and thus the
+    grant fingerprint — so the stale approval no longer matches. That binding
+    holds at the local-host trust boundary only: a concurrent local process
+    with write access could still swap the file between this read and the
+    hosting CLI's own read, which no userspace check here can prevent.
+    """
+    if not cwd or not os.path.isabs(cwd):
+        raise ShellIndirection(f"cwd must be an absolute path, got {cwd!r}")
+    if os.path.realpath(cwd) != cwd:
+        raise ShellIndirection(
+            f"cwd must be a canonical real path (no symlinked components): {cwd!r}"
+        )
+    if not os.path.isdir(cwd):
+        raise ShellIndirection(f"cwd does not exist: {cwd!r}")
+    meta_path = os.path.join(cwd, ".vercel", "project.json")
+    # cwd is canonical, so any symlink in the .vercel/project.json chain makes
+    # realpath diverge; O_NOFOLLOW additionally refuses a symlinked final
+    # component at open time on platforms that support it.
+    if os.path.realpath(meta_path) != meta_path:
+        raise ShellIndirection(
+            "linked-project metadata path contains a symlinked component"
+        )
+    try:
+        fd = os.open(meta_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        raise ShellIndirection(
+            "cwd is not a linked project (.vercel/project.json missing)"
+        ) from None
+    except OSError as exc:
+        raise ShellIndirection(f"linked-project metadata unreadable: {exc}") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ShellIndirection("linked-project metadata is not a regular file")
+        fh = os.fdopen(fd, "r", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        raise
+    try:
+        with fh:
+            meta = json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise ShellIndirection(f"linked-project metadata unreadable: {exc}") from exc
+    if not isinstance(meta, dict):
+        raise ShellIndirection("linked-project metadata is not an object")
+    project_id = meta.get("projectId")
+    org_id = meta.get("orgId")
+    if not isinstance(project_id, str) or not _VERCEL_PROJECT_ID_RE.fullmatch(project_id):
+        raise ShellIndirection("linked projectId is not an immutable prj_ id")
+    if not isinstance(org_id, str) or not _VERCEL_TEAM_ID_RE.fullmatch(org_id):
+        raise ShellIndirection("linked orgId is not an immutable team_ id")
+    return project_id, org_id
+
+
+def _parse_optional_scope(rest: Tuple[str, ...]) -> Tuple[Tuple[str, str], ...]:
+    """``rest`` must be empty or exactly ``--scope <team id>``. Anything else
+    (extra flags, positionals, mutable scope names) raises."""
+    if not rest:
+        return ()
+    if len(rest) == 2 and rest[0] == "--scope" and _VERCEL_TEAM_ID_RE.fullmatch(rest[1]):
+        return (("team", rest[1]),)
+    raise ShellIndirection(
+        "only an optional `--scope <team id>` is allowed on this read-only form"
+    )
+
+
+def _vercel_readonly(argv: Tuple[str, ...], cwd: str,
+                     targets: Tuple[Tuple[str, str], ...]) -> ProdAction:
+    return ProdAction(
+        action_class="vercel_readonly_verify",
+        executable="vercel",
+        argv=argv,
+        cwd=cwd,
+        targets=targets,
+        read_only=True,
+    )
+
+
+def _classify_vercel(argv: Tuple[str, ...], cwd: str) -> object:
+    if len(argv) < 2:
+        return UnsafeCommand("unstructured-prod-write", "vercel needs a subcommand")
+    sub = argv[1]
+
+    if sub == "deploy":
+        # Exact production deploy grammar (order-insensitive, nothing extra):
+        #   vercel deploy --prod --yes --scope <team id>
+        body = argv[2:]
+        seen: dict = {}
+        scope = None
+        i = 0
+        while i < len(body):
+            tok = body[i]
+            if tok in ("--prod", "--yes"):
+                if tok in seen:
+                    return UnsafeCommand("unstructured-prod-write", f"duplicate {tok}")
+                seen[tok] = True
+                i += 1
+                continue
+            if tok == "--scope":
+                if scope is not None:
+                    return UnsafeCommand("unstructured-prod-write", "duplicate --scope")
+                if i + 1 >= len(body):
+                    return UnsafeCommand("unstructured-prod-write", "--scope without value")
+                scope = body[i + 1]
+                i += 2
+                continue
+            # Any other flag (--token, --env, --prebuilt, --force, …) or any
+            # positional is outside the production grammar.
+            return UnsafeCommand(
+                "unstructured-prod-write",
+                f"{tok!r} is not part of the production deploy grammar "
+                "(vercel deploy --prod --yes --scope <team id>)",
+            )
+        if "--prod" not in seen:
+            return UnsafeCommand("unstructured-prod-write",
+                                 "preview deploys are not allowed; --prod is required")
+        if "--yes" not in seen:
+            return UnsafeCommand("unstructured-prod-write",
+                                 "production deploy grammar requires --yes")
+        if scope is None:
+            return UnsafeCommand("ambiguous-target",
+                                 "production deploy requires --scope <team id>")
+        if not _VERCEL_TEAM_ID_RE.fullmatch(scope):
+            return UnsafeCommand(
+                "unstructured-prod-write",
+                f"--scope {scope!r} is not an immutable team id (team_… required)",
+            )
+        try:
+            project_id, org_id = _read_linked_project(cwd)
+        except ShellIndirection as exc:
+            return UnsafeCommand("unstructured-prod-write", str(exc))
+        if scope != org_id:
+            return UnsafeCommand(
+                "ambiguous-target",
+                "--scope does not match the linked project's immutable team id",
+            )
+        return ProdAction(
+            action_class="vercel_prod_deploy",
+            executable="vercel",
+            argv=argv,
+            cwd=cwd,
+            targets=tuple(sorted((("cwd", cwd),
+                                  ("project", project_id),
+                                  ("team", org_id)))),
+            read_only=False,
+        )
+
+    # Narrowly-specified read-only forms. Each accepts at most an optional
+    # immutable `--scope <team id>`; anything else is rejected.
+    try:
+        if sub == "whoami":
+            if len(argv) != 2:
+                raise ShellIndirection("`vercel whoami` takes no arguments")
+            return _vercel_readonly(argv, cwd, ())
+        if sub == "project":
+            if len(argv) < 3 or argv[2] != "ls":
+                raise ShellIndirection("only `vercel project ls` is a read-only form")
+            return _vercel_readonly(argv, cwd, _parse_optional_scope(argv[3:]))
+        if sub == "ls":
+            return _vercel_readonly(argv, cwd, _parse_optional_scope(argv[2:]))
+        if sub == "inspect":
+            if len(argv) < 3:
+                raise ShellIndirection("`vercel inspect` needs a deployment id/URL")
+            dep = argv[2]
+            if not _VERCEL_DEPLOYMENT_RE.fullmatch(dep):
+                raise ShellIndirection(
+                    f"{dep!r} is not a dpl_ id or *.vercel.app deployment URL"
+                )
+            return _vercel_readonly(argv, cwd, _parse_optional_scope(argv[3:]))
+    except ShellIndirection as exc:
+        return UnsafeCommand("unstructured-prod-write", str(exc))
+
+    # `vercel env`, `alias`, `rollback`, `promote`, `link`, `pull`, `rm`, bare
+    # `vercel --prod`, etc. — unstructured mutations or alias/rollback surfaces.
+    # Never passed through, never approvable as a typed action.
+    return UnsafeCommand("unstructured-prod-write",
+                         f"vercel {sub} is not a structured action")
+
+
+# --- npm one-time hosting-CLI install ----------------------------------------
+
+_SEMVER_EXACT_RE = re.compile(r"^\d+\.\d+\.\d+$")
+_HOSTING_CLI_PACKAGE = "vercel"
+# The registry is pinned on the command line (highest-precedence npm config),
+# so a user/project .npmrc pointing at a custom registry cannot redirect the
+# package. Exactly this single-token official-registry form (trailing slash
+# included) — no no-slash or space-separated variants.
+_NPM_OFFICIAL_REGISTRY_FLAG = "--registry=https://registry.npmjs.org/"
+# The one canonical argv prefix: exact tokens in exact order, followed only by
+# the exact-semver package spec.
+_NPM_CANONICAL_PREFIX = ("npm", "install", "--global", _NPM_OFFICIAL_REGISTRY_FLAG)
+
+
+def _classify_npm(argv: Tuple[str, ...], cwd: str) -> object:
+    """Only the one canonical global-install argv of the official hosting CLI —
+    ``npm install --global --registry=https://registry.npmjs.org/
+    vercel@X.Y.Z`` — exact tokens, exact order — is a typed (approvable) write
+    action; every other npm invocation that carries a prod CLI token stays a
+    smuggling rejection, so the token scan is not weakened."""
+    if len(argv) == 5 and argv[:4] == _NPM_CANONICAL_PREFIX:
+        spec = argv[4]
+        name, sep, version = spec.partition("@")
+        if name == _HOSTING_CLI_PACKAGE and sep:
+            if _SEMVER_EXACT_RE.fullmatch(version):
+                return ProdAction(
+                    action_class="npm_install_hosting_cli",
+                    executable="npm",
+                    argv=argv,
+                    cwd=cwd,
+                    targets=(("package", spec),),
+                    read_only=False,
+                )
+            return UnsafeCommand(
+                "unstructured-prod-write",
+                "hosting CLI install requires an exact numeric semver "
+                f"({_HOSTING_CLI_PACKAGE}@X.Y.Z) — no dist-tags or ranges",
+            )
+    return UnsafeCommand(
+        "smuggling",
+        "npm with a production CLI token is only approvable as the canonical "
+        f"`npm install --global {_NPM_OFFICIAL_REGISTRY_FLAG} "
+        f"{_HOSTING_CLI_PACKAGE}@X.Y.Z` (exact tokens, exact order)",
+    )
+
+
 def classify(command: str, cwd: str = "") -> Classification:
     """Classify a terminal command.
 
@@ -361,6 +651,24 @@ def classify(command: str, cwd: str = "") -> Classification:
     exe = argv[0].rsplit("/", 1)[-1]
     if exe == "railway":
         return _classify_railway(argv, cwd)
+    if exe == "vercel":
+        # Exact bare executable identity: an arbitrary path whose basename
+        # happens to be "vercel" (/tmp/evil/vercel) is not the hosting CLI.
+        if argv[0] != "vercel":
+            return UnsafeCommand(
+                "unstructured-prod-write",
+                f"hosting CLI must be invoked as bare 'vercel', not {argv[0]!r}",
+            )
+        return _classify_vercel(argv, cwd)
+    if exe == "npm":
+        # Reached only when a prod CLI token appears in the command (the
+        # is_prod_write_class pre-check); plain npm commands pass through above.
+        if argv[0] != "npm":
+            return UnsafeCommand(
+                "unstructured-prod-write",
+                f"npm must be invoked as bare 'npm', not {argv[0]!r}",
+            )
+        return _classify_npm(argv, cwd)
     if exe in _PROD_CLIS:
         # Recognised prod CLI without a structured spec yet: block, don't pass.
         return UnsafeCommand("unstructured-prod-write",

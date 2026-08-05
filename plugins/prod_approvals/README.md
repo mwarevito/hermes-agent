@@ -1,7 +1,8 @@
 # prod-approvals
 
 Task-scoped **one-tap / bundle approval** for custom production-write gates
-(Railway variable-set, restart, read-only verify). Replaces the old
+(Railway variable-set, restart, read-only verify; Vercel production deploy,
+read-only verify, and the one-time exact-semver CLI install). Replaces the old
 "model hard-blocks → user says *yes* in chat → model re-runs the command"
 loop — which has no exactly-once, no durable state, no nonce, and no task
 binding — with a structured, durable, fenced approval system whose approval
@@ -70,7 +71,35 @@ never advances on an unproven outcome.
 `railway status` and `railway variables` (listing, no `--set`) are read-only:
 they are **never blocked and never consume a grant** — unless they are an
 explicit ordered step of an already-approved bundle, in which case they are
-consumed in order like any other step.
+consumed in order like any other step. The narrow Vercel read forms
+(`vercel whoami` / `project ls` / `ls` / `inspect <deployment>`, each with at
+most an optional immutable `--scope <team id>`) pass through the same way.
+
+### Vercel production deploy (generic linked-project binding)
+
+The only structured Vercel write grammar is
+`vercel deploy --prod --yes --scope <team id>` (bare `vercel` executable — no
+paths) from a **canonical, existing** cwd (no symlinked cwd or metadata
+components; the metadata file must be a regular file, opened no-follow where
+supported) containing linked-project metadata (`.vercel/project.json`) with
+immutable `prj_…` / `team_…` ids; `--scope` must equal the linked team id.
+The cwd and both ids are bound as targets, and the metadata is re-read on
+every classification, so repointing the link (or moving directories) between
+approval and the gate's execution-time re-classification changes the
+fingerprint and voids the grant. That binding holds at the local-host trust
+boundary: it does not defend against a concurrent local process swapping the
+metadata between the gate's read and the CLI's own read. Likewise, requiring
+the bare `vercel` / `npm` executable identity (no paths) still trusts the
+executor's `PATH` resolution — a malicious binary earlier in `PATH` is inside
+the same local-host trust boundary, not something the gate can rule out.
+Preview deploys, extra flags (`--token`, `--env`, `--prebuilt`, …),
+positionals, and `env`/`alias`/`rollback`/`promote`/`link` are all rejected.
+The one-time CLI install is its own typed write action — the single canonical
+argv `npm install --global --registry=https://registry.npmjs.org/ vercel@X.Y.Z`
+(exact tokens in exact order: `--global` spelled out, official registry with
+trailing slash pinned on the command line so `.npmrc` custom-registry config
+cannot redirect the package, exact numeric semver) — approvable once without
+weakening the prod-token smuggling scan on every other `npm` form.
 
 ### Ordered bounded bundles (user-facing)
 
@@ -150,6 +179,10 @@ prod_bundle_request(commands=[...]) agent tool: build + deliver an ordered bundl
   read-only pass-through, conservative outcome, card delivery, bundle-through-gate,
   heartbeat staleness/refresh, and the backstop hook, against a real temp SQLite
   store (no mocks on the security path).
+* `tests/plugins/test_prod_approvals_vercel.py` — the Vercel structured spec:
+  deploy grammar + linked-project binding, TOCTOU on metadata/cwd change,
+  read-only pass-through, extra-flag/wrapper rejection, and the one-time
+  exact-semver npm CLI install.
 * `tests/plugins/test_prod_approvals_integration.py` — end-to-end through the
   **real** `PluginManager` discovery/load, the real `gateway.approval_cards`
   bus, real `dispatch_gateway_action`, and the real

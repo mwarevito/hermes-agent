@@ -1826,9 +1826,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 route_thread_id = str(thread_id) if thread_id is not None else None
                 route_metadata = {"job_id": job["id"], "cron_delivery": True}
                 media_metadata = {"cron_delivery": True}
-                # A Telegram *private-chat* topic that the adapter has actually
-                # REGISTERED as a DM topic is a third case the channel probe
-                # above cannot see: get_chat_info reports "private", not
+                # A Telegram *private-chat* topic is a third case the channel
+                # probe above cannot see: get_chat_info reports "private", not
                 # "channel", so route_via_dm_topic is False — yet a bare
                 # message_thread_id is silently ignored by the Bot API for
                 # private chats and the message lands in the ROOT DM while the
@@ -1836,15 +1835,20 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # 701226/701649). Resolve the canonical anchor through the SAME
                 # helper live gateway replies use, so cron picks up
                 # telegram_dm_topic_reply_fallback + the real
-                # direct_messages_topic_id whenever the adapter recognises this
-                # thread_id. Unregistered/legacy thread ids resolve to nothing
-                # and keep the plain message_thread_id routing below.
+                # direct_messages_topic_id.
                 dm_topic_metadata = None
                 if is_telegram_dm_topic_target and route_thread_id:
                     from gateway.run import GatewayRunner
 
                     resolved_dm_meta = GatewayRunner._thread_metadata_for_target(
                         platform, str(chat_id), route_thread_id,
+                        # The scheduler has already classified this target as a
+                        # private DM topic (positive chat_id + thread_id); assert
+                        # that instead of depending on the adapter topic registry,
+                        # which does not know legacy/auto-created topics
+                        # (live incident 2026-08-05: topic 701226 refused with
+                        # "requires a reply anchor").
+                        chat_type="dm",
                         adapter=runtime_adapter,
                     ) or {}
                     if resolved_dm_meta.get("telegram_dm_topic_reply_fallback"):

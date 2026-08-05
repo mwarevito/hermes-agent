@@ -1520,6 +1520,83 @@ class TestDeliverOriginUnresolvableIsLocal:
         assert self._deliver(job, monkeypatch) is None
 
 
+class TestDeliverResultThreadFallbackIsLogOnly:
+    """A successful send that degrades to no-thread delivery (Telegram falls
+    back to the base chat after "thread not found") is a SUCCESSFUL delivery,
+    not a failure. Recording it in delivery_errors would make mark_job_run
+    persist a pending_delivery for an already-delivered message, causing the
+    exact payload to be resent on every subsequent tick until exhausted
+    (false retries of a successful thread_fallback send). It must be log-only.
+    """
+
+    def test_live_adapter_thread_fallback_is_log_only_not_delivery_error(self):
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult
+        from concurrent.futures import Future
+
+        send_result = SendResult(
+            success=True,
+            message_id="42",
+            raw_response={
+                "requested_thread_id": 7072,
+                "thread_fallback": True,
+            },
+        )
+        adapter = MagicMock()
+        adapter.send = AsyncMock(return_value=send_result)
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        # A forum supergroup target: thread_fallback is a forum-topic
+        # phenomenon. A positive (private) chat_id with a thread_id is a
+        # DM-topic target and takes the DM-topic-aware metadata path instead
+        # (see TestDeliverResultTelegramDmTopicSynthetic).
+        job = {
+            "id": "thread-fallback-job",
+            "deliver": "telegram:-1002262522500:7072",
+        }
+
+        def fake_run_coro(coro, _loop):
+            # Cron delivery routes through DeliveryRouter._deliver_to_platform;
+            # run the coroutine for real so the metadata asserted below is what
+            # the ADAPTER received, not merely what the scheduler intended.
+            import asyncio as _asyncio
+            future = Future()
+            try:
+                future.set_result(_asyncio.run(coro))
+            except BaseException as exc:  # noqa: BLE001
+                future.set_exception(exc)
+            return future
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+            result = _deliver_result(
+                job,
+                "Hello world",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        # Log-only: a degraded-but-delivered send is NOT a delivery error.
+        assert result is None
+        adapter.send.assert_called_once_with(
+            "-1002262522500",
+            "Hello world",
+            metadata={
+                "job_id": "thread-fallback-job",
+                "cron_delivery": True,
+                "thread_id": "7072",
+            },
+        )
+
+
 class TestDeliverResultTelegramDmTopicSynthetic:
     """Cron delivery to a Telegram synthetic private-DM topic must route
     through the same DM-topic-aware metadata live gateway replies use, and

@@ -138,8 +138,8 @@ VALID_HOOKS: Set[str] = {
     "transform_terminal_output",
     "transform_tool_result",
     # Transform LLM output before it's returned to the user.
-    # Plugins return a string to replace the response text, or None/empty to leave unchanged.
-    # First non-None string wins. Useful for vocabulary/personality transformation.
+    # String returns compose in discovery order; None/empty leaves text unchanged.
+    # Each callback receives the output of the previous callback.
     "transform_llm_output",
     "pre_llm_call",
     "post_llm_call",
@@ -2024,6 +2024,36 @@ class PluginManager:
                 )
         return results
 
+    def transform_llm_output(self, response_text: str, **kwargs: Any) -> tuple[str, bool]:
+        """Run ``transform_llm_output`` callbacks as an ordered pipeline.
+
+        Every callback receives the text returned by the previous callback.
+        ``None``/empty/non-string values are pass-through.  Exceptions remain
+        fail-open per callback.  This is intentionally separate from
+        :meth:`invoke_hook`: observer hooks and first-wins transforms keep their
+        existing contracts, while independent response appenders (for example
+        runtime truth, verification notes, and skill proposals) compose instead
+        of silently suppressing one another.
+        """
+        kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
+        current = response_text
+        transformed = False
+        for cb in self._hooks.get("transform_llm_output", []):
+            call_kwargs = dict(kwargs)
+            call_kwargs["response_text"] = current
+            try:
+                ret = cb(**call_kwargs)
+                if isinstance(ret, str) and ret:
+                    current = ret
+                    transformed = True
+            except Exception as exc:
+                logger.warning(
+                    "Hook 'transform_llm_output' callback %s raised: %s",
+                    getattr(cb, "__name__", repr(cb)),
+                    exc,
+                )
+        return current, transformed
+
     def has_hook(self, hook_name: str) -> bool:
         """Return True when at least one callback is registered for a hook."""
         return bool(self._hooks.get(hook_name))
@@ -2150,6 +2180,11 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     Returns a list of non-``None`` return values from plugin callbacks.
     """
     return get_plugin_manager().invoke_hook(hook_name, **kwargs)
+
+
+def transform_llm_output(response_text: str, **kwargs: Any) -> tuple[str, bool]:
+    """Compose all registered LLM-output transforms in discovery order."""
+    return get_plugin_manager().transform_llm_output(response_text, **kwargs)
 
 
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:

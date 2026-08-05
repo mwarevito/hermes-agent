@@ -1023,3 +1023,77 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+# goal_mode: budget mode is the default, goal loop is explicit opt-in only
+#
+# W2.2 (2026-08-05): 25 of 26 live cards were created with goal_mode=True
+# because the orchestrator model treated every big delegated card as
+# "open-ended". The mechanical default is and must stay OFF; the tool
+# schema must frame goal_mode as an explicit per-card opt-in.
+# ---------------------------------------------------------------------------
+
+def _get_task(tid):
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        return kb.get_task(conn, tid)
+    finally:
+        conn.close()
+
+
+def test_tool_create_defaults_to_budget_mode(worker_env):
+    """kanban_create WITHOUT goal_mode must produce a single-shot
+    (budget-mode) card: goal_mode False, goal_max_turns unset."""
+    from tools import kanban_tools as kt
+    d = json.loads(kt._handle_create({
+        "title": "budget-mode default card",
+        "assignee": "peer",
+    }))
+    assert d["ok"] is True, d
+    task = _get_task(d["task_id"])
+    assert task.goal_mode is False
+    assert task.goal_max_turns is None
+
+
+def test_tool_create_explicit_goal_mode_still_works(worker_env):
+    """Explicit goal_mode=True (the opt-in path) must keep working,
+    including the goal_max_turns budget."""
+    from tools import kanban_tools as kt
+    d = json.loads(kt._handle_create({
+        "title": "explicit goal-loop card",
+        "assignee": "peer",
+        "goal_mode": True,
+        "goal_max_turns": 7,
+    }))
+    assert d["ok"] is True, d
+    task = _get_task(d["task_id"])
+    assert task.goal_mode is True
+    assert task.goal_max_turns == 7
+
+
+def test_tool_create_goal_mode_string_true_still_works(worker_env):
+    """String 'true' (models often send strings) still opts in."""
+    from tools import kanban_tools as kt
+    d = json.loads(kt._handle_create({
+        "title": "explicit goal-loop card (string)",
+        "assignee": "peer",
+        "goal_mode": "true",
+    }))
+    assert d["ok"] is True, d
+    task = _get_task(d["task_id"])
+    assert task.goal_mode is True
+
+
+def test_goal_mode_schema_declares_explicit_opt_in():
+    """The tool schema is the prompt surface the orchestrator model reads.
+    It must present budget mode as the default and goal_mode as an
+    explicit opt-in — this is the deployment canary for the W2.2 change."""
+    from tools.kanban_tools import KANBAN_CREATE_SCHEMA
+    desc = KANBAN_CREATE_SCHEMA["parameters"]["properties"]["goal_mode"][
+        "description"
+    ]
+    assert "EXPLICIT OPT-IN ONLY" in desc
+    assert "Defaults to false" in desc
+    # The old wording that caused 25/26 cards to opt in must be gone.
+    assert "Use this for open-ended cards" not in desc

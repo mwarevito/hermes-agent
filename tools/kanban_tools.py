@@ -2055,15 +2055,23 @@ KANBAN_CREATE_SCHEMA = {
             "goal_mode": {
                 "type": "boolean",
                 "description": (
-                    "Run the dispatched worker in a goal loop. When true, "
-                    "after each turn an auxiliary judge checks the worker's "
-                    "response against this card's title/body; if the work "
-                    "isn't done and budget remains, the worker keeps going "
-                    "in the same session until the judge agrees it's "
-                    "complete (or the goal-turn budget is exhausted, which "
-                    "blocks the task for human review). Use this for "
-                    "open-ended cards where one shot rarely finishes the "
-                    "work. Defaults to false (classic single-shot worker)."
+                    "EXPLICIT OPT-IN ONLY — leave this UNSET for normal "
+                    "delegated work. Defaults to false: budget mode (a "
+                    "classic single-shot worker under the standard runtime "
+                    "cap) is the default for ALL cards, including big, "
+                    "multi-step, or open-ended-looking ones — decompose "
+                    "those into verifiable child cards instead of looping "
+                    "one worker. (Measured live 07/2026: goal-loop cards "
+                    "ground for a median of 82 minutes before giving up, "
+                    "vs 6 minutes for normal single-shot completions.) "
+                    "Set true ONLY when the requesting human explicitly "
+                    "asked for an iterate-until-done goal loop on this "
+                    "specific card. When true, an auxiliary judge "
+                    "re-checks the card against its title/body after each "
+                    "turn and the worker keeps going in the same session "
+                    "until the judge agrees it is complete or the "
+                    "goal-turn budget is exhausted, which blocks the task "
+                    "for human review."
                 ),
             },
             "goal_max_turns": {

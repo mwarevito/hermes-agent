@@ -1287,9 +1287,10 @@ class GatewayKanbanWatchersMixin:
         mentioned to the card's Telegram subscribers (incl. the
         clinic/patient bots).
 
-        Files are deduplicated, missing files are silently skipped (the
-        path may have been mentioned for reference only), and delivery
-        errors are logged but do not break the notifier loop.
+        Files are deduplicated. A listed path that is missing on disk is
+        a lost deliverable (the artifacts list is explicit since Batch-4
+        D2), so it is logged at WARNING — never silently dropped — and
+        delivery errors are logged but do not break the notifier loop.
         """
         from pathlib import Path as _Path
 
@@ -1303,6 +1304,11 @@ class GatewayKanbanWatchersMixin:
             if expanded in seen:
                 return
             if not os.path.isfile(expanded):
+                logger.warning(
+                    "kanban notifier: artifact %s for task %s is missing on "
+                    "disk — deliverable NOT sent",
+                    expanded, getattr(task, "id", "?"),
+                )
                 return
             seen.add(expanded)
             candidates.append(expanded)

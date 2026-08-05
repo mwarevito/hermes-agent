@@ -1612,3 +1612,79 @@ def test_complete_explicit_result_not_overwritten(kanban_home):
         assert kb.complete_task(conn, t, result="explicit log line", summary="the summary")
         task = kb.get_task(conn, t)
     assert task.result == "explicit log line"
+
+
+# ---------------------------------------------------------------------------
+# Artifact persistence across scratch cleanup (2026-08-05 delivery incident)
+# ---------------------------------------------------------------------------
+
+def _completed_event_artifacts(conn, task_id):
+    import json
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='completed'",
+        (task_id,),
+    ).fetchone()
+    assert row is not None
+    return (json.loads(row["payload"]) or {}).get("artifacts")
+
+
+def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
+    """``kanban_complete(artifacts=[...])`` must survive scratch cleanup.
+
+    Completion rmtree's a childless task's scratch dir synchronously while
+    the notifier uploads artifacts asynchronously on its next poll tick, so
+    files living only in the scratch workspace were deleted before delivery
+    (2026-08-05: the Llucky synthesis package was silently lost this way).
+    The listed files must be copied to the board's durable artifacts dir and
+    the completion event rewritten to the durable paths.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="deliver")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        art = ws / "package.md"
+        art.write_text("deliverable", encoding="utf-8")
+        nested = ws / "sub" / "extra.md"
+        nested.parent.mkdir()
+        nested.write_text("extra", encoding="utf-8")
+        assert kb.complete_task(
+            conn, t, result="ok",
+            metadata={"artifacts": [str(art), str(nested)]},
+        )
+        rewritten = _completed_event_artifacts(conn, t)
+    assert not ws.exists(), "scratch cleanup must still run"
+    assert rewritten is not None and len(rewritten) == 2
+    for p in rewritten:
+        assert Path(p).is_file(), f"durable artifact must exist: {p}"
+        assert "artifacts" in Path(p).parts and t in Path(p).parts
+    assert Path(rewritten[0]).read_text(encoding="utf-8") == "deliverable"
+    assert Path(rewritten[1]).read_text(encoding="utf-8") == "extra"
+
+
+def test_complete_task_leaves_outside_artifacts_untouched(kanban_home, tmp_path):
+    """Artifact paths outside the scratch workspace pass through unchanged."""
+    outside = tmp_path / "report.md"
+    outside.write_text("kept", encoding="utf-8")
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="deliver")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        assert kb.complete_task(
+            conn, t, result="ok", metadata={"artifacts": [str(outside)]},
+        )
+        arts = _completed_event_artifacts(conn, t)
+    assert arts == [str(outside)]
+    assert outside.read_text(encoding="utf-8") == "kept"
+
+
+def test_complete_task_artifacts_without_workspace_pass_through(kanban_home):
+    """A task that never resolved a workspace keeps its artifact list verbatim."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="no-ws")
+        assert kb.complete_task(
+            conn, t, result="ok", metadata={"artifacts": ["/nonexistent/x.md"]},
+        )
+        arts = _completed_event_artifacts(conn, t)
+    assert arts == ["/nonexistent/x.md"]

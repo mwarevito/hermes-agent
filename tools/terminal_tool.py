@@ -3348,7 +3348,7 @@ TERMINAL_SCHEMA = {
             },
             "background": {
                 "type": "boolean",
-                "description": "Run in the background, returning a session_id. Pair with notify_on_complete=true for anything with a defined end (tests, builds, deploys) — without it the process runs silently. Only servers/watchers/daemons that never exit should stay silent. Short commands: prefer foreground with a generous timeout.",
+                "description": "Run the command in the background. Almost always pair with notify_on_complete=true — without it, the process runs silently and you'll have no way to learn it finished short of calling process(action='poll') yourself (easy to forget, leading to silent blindness on long jobs). notify_on_complete now DEFAULTS to true whenever background=true, so a bounded background job announces itself — do NOT sit in a process(action='wait'/'poll') loop waiting for it; that burns a model round-trip and up to 60s per check. Long-lived processes (servers, watchers, daemons) simply never emit, because they never exit. Pass notify_on_complete=false explicitly only when you truly want silence. For short commands, prefer foreground with a generous timeout instead.",
                 "default": False
             },
             "timeout": {
@@ -3390,7 +3390,15 @@ def _handle_terminal(args, **kw):
         session_id=kw.get("session_id"),
         workdir=args.get("workdir"),
         pty=args.get("pty", False),
-        notify_on_complete=args.get("notify_on_complete", False),
+        # Default follows background: a bounded background job with no
+        # completion signal is the most expensive habit measured on
+        # 2026-08-04 — 101 process poll/wait calls in a day and ZERO
+        # notify_on_complete, i.e. a model round-trip and up to 60s of
+        # wall-clock burned per "is it done yet?". Long-lived servers are
+        # unaffected: they never exit, so nothing is emitted for them.
+        notify_on_complete=args.get(
+            "notify_on_complete", bool(args.get("background", False))
+        ),
         watch_patterns=args.get("watch_patterns"),
     )
 

@@ -5468,19 +5468,12 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
 
-    # Persist deliverables BEFORE the completion transaction. On commit,
-    # ``_cleanup_workspace`` rmtree's a childless task's scratch dir
-    # synchronously, while artifact egress (the gateway notifier) reads the
-    # files asynchronously a few seconds later — so any artifact living only
-    # in the scratch workspace was deleted before it could be delivered
-    # (2026-08-05: the Llucky synthesis package was silently lost this way).
-    # Copies go to the board's durable ``artifacts/<task_id>/`` dir and the
-    # rewritten paths flow into both the run metadata and the completed event.
-    if isinstance(metadata, dict) and isinstance(metadata.get("artifacts"), (list, tuple)):
-        _persisted = _persist_scratch_artifacts(conn, task_id, metadata["artifacts"])
-        if _persisted is not None:
-            metadata = dict(metadata)
-            metadata["artifacts"] = _persisted
+    # (The 2026-08-05 "deliverable deleted before egress" fix is upstream as of
+    # v2026.8.3: ``_persist_scratch_completion_artifacts`` below copies declared
+    # scratch artifacts into the board's durable attachments dir INSIDE the
+    # completion txn and registers the attachment rows. A second pre-txn copier
+    # of our own would rewrite the paths out of the scratch tree first and make
+    # upstream's function skip — losing the attachment registration.)
 
     with write_txn(conn):
         # FIX F (auditable done, 2026-07-28): the canonical worker handoff is
@@ -5920,65 +5913,6 @@ def _is_managed_scratch_path(p: Path) -> bool:
     """
     is_managed, _board = _managed_scratch_path_info(p)
     return is_managed
-
-
-def _persist_scratch_artifacts(
-    conn: sqlite3.Connection, task_id: str, artifacts,
-) -> Optional[list]:
-    """Copy scratch-workspace artifacts to the board's durable artifacts dir.
-
-    Deliverables named in ``kanban_complete(artifacts=[...])`` must survive
-    ``_cleanup_workspace``: cleanup deletes the scratch dir the moment a
-    childless task completes, but the notifier uploads the files on its next
-    poll tick — after the delete. Every listed path that resolves to a file
-    inside the task's managed scratch workspace is copied (with its relative
-    layout) to ``<workspaces-root>/../artifacts/<task_id>/`` and replaced by
-    the durable path in the returned list. Paths outside the scratch
-    workspace pass through unchanged.
-
-    Returns the rewritten list, or ``None`` when nothing needed rewriting
-    (non-scratch workspace, no in-workspace files, or any lookup failure).
-    Best-effort: a copy failure keeps the original path rather than blocking
-    completion.
-    """
-    try:
-        row = conn.execute(
-            "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if not row or row["workspace_kind"] != "scratch" or not row["workspace_path"]:
-            return None
-        ws = Path(row["workspace_path"]).expanduser()
-        if not ws.is_dir() or not _is_managed_scratch_path(ws):
-            return None
-        ws_real = ws.resolve()
-        import shutil
-        durable_root = ws_real.parent.parent / "artifacts" / task_id
-        out: list = []
-        changed = False
-        for raw in artifacts:
-            if not isinstance(raw, str) or not raw.strip():
-                continue
-            p = raw.strip()
-            try:
-                src_real = Path(os.path.expanduser(p)).resolve()
-                inside = src_real.is_file() and src_real.is_relative_to(ws_real)
-            except (OSError, ValueError):
-                inside = False
-            if not inside:
-                out.append(p)
-                continue
-            try:
-                dest = durable_root / src_real.relative_to(ws_real)
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src_real, dest)
-                out.append(str(dest))
-                changed = True
-            except OSError:
-                out.append(p)
-        return out if changed else None
-    except Exception:
-        return None
 
 
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:

@@ -115,6 +115,23 @@ def _inject_fake_telegram(monkeypatch):
     monkeypatch.setitem(sys.modules, "telegram.constants", _fake_telegram_constants)
     monkeypatch.setitem(sys.modules, "telegram.ext", _fake_telegram_ext)
     monkeypatch.setitem(sys.modules, "telegram.request", _fake_telegram_request)
+    # The adapter binds the SDK names as MODULE-LEVEL globals at import time,
+    # with typing fallbacks when python-telegram-bot is absent
+    # (``InlineKeyboardMarkup = Any``, ``ChatType = None``), and only rebinds
+    # them inside ``check_telegram_requirements()``. Patching sys.modules alone
+    # therefore leaves the adapter looking at those fallbacks — a keyboard send
+    # dies with "Any cannot be instantiated" and ``ChatType.SUPERGROUP`` raises
+    # on None. Bind the fakes onto the adapter module itself as well.
+    import plugins.platforms.telegram.adapter as _adapter_mod
+
+    for _name, _value in (
+        ("InlineKeyboardButton", _FakeInlineKeyboardButton),
+        ("InlineKeyboardMarkup", _FakeInlineKeyboardMarkup),
+        ("InputMediaPhoto", _FakeInputMediaPhoto),
+        ("ParseMode", _fake_telegram_constants.ParseMode),
+        ("ChatType", _fake_telegram_constants.ChatType),
+    ):
+        monkeypatch.setattr(_adapter_mod, _name, _value, raising=False)
 
 
 def _make_adapter():

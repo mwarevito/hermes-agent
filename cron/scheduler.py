@@ -32,7 +32,7 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, List, NamedTuple, Optional
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -291,6 +291,7 @@ from cron.jobs import (
     claim_dispatch,
     heartbeat_run_claim,
     finalize_pending_delivery,
+    record_delivered_message_id,
 )
 from cron.executions import create_execution, finish_execution, mark_execution_running
 
@@ -1334,6 +1335,14 @@ _VIDEO_EXTS = frozenset({'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'})
 _IMAGE_EXTS = frozenset({'.jpg', '.jpeg', '.png', '.webp', '.gif'})
 
 
+class _MediaSendOutcome(NamedTuple):
+    """Aggregate result of a cron media batch send via the live adapter."""
+    all_ok: bool
+    any_ok: bool
+    first_message_id: Optional[str]
+    failed_paths: List[str]
+
+
 def _send_media_via_adapter(
     adapter,
     chat_id: str,
@@ -1342,12 +1351,20 @@ def _send_media_via_adapter(
     loop,
     job: dict,
     platform=None,
-) -> None:
+) -> _MediaSendOutcome:
     """Send extracted MEDIA files as native platform attachments via a live adapter.
 
     Routes each file to the appropriate adapter method (send_voice, send_image_file,
     send_video, send_document) based on file extension — mirroring the routing logic
     in ``BasePlatformAdapter._process_message_background``.
+
+    Returns a :class:`_MediaSendOutcome` so the caller can confirm delivery
+    instead of assuming success: ``all_ok`` (every file confirmed sent),
+    ``any_ok`` (at least one confirmed), ``first_message_id`` (platform message
+    id of the first confirmed send that reported one — usable as a delivery
+    ack), and ``failed_paths`` (files whose send was not confirmed).
+    A send is confirmed only when the adapter returned a result with
+    ``success is True``; a None result or an exception counts as a failure.
     """
     from pathlib import Path
 
@@ -1355,7 +1372,11 @@ def _send_media_via_adapter(
 
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
-    for media_path, _is_voice in media_files:
+    any_ok = False
+    first_message_id: Optional[str] = None
+    failed_paths: List[str] = []
+
+    for idx, (media_path, _is_voice) in enumerate(media_files):
         try:
             ext = Path(media_path).suffix.lower()
             route_platform = platform if platform is not None else getattr(adapter, "platform", None)
@@ -1375,19 +1396,101 @@ def _send_media_via_adapter(
                     "Job '%s': cannot send media %s, gateway loop unavailable",
                     job.get("id", "?"), media_path,
                 )
-                return
+                # No loop means the remaining files cannot be sent either.
+                failed_paths.extend(p for p, _v in media_files[idx:])
+                break
             try:
                 result = future.result(timeout=30)
             except TimeoutError:
                 future.cancel()
                 raise
-            if result and not getattr(result, "success", True):
+            if result is not None and getattr(result, "success", None) is True:
+                any_ok = True
+                mid = getattr(result, "message_id", None)
+                if mid and first_message_id is None:
+                    first_message_id = str(mid)
+            else:
+                failed_paths.append(media_path)
                 logger.warning(
                     "Job '%s': media send failed for %s: %s",
-                    job.get("id", "?"), media_path, getattr(result, "error", "unknown"),
+                    job.get("id", "?"), media_path,
+                    getattr(result, "error", "unknown") if result is not None
+                    else "adapter returned no send result",
                 )
         except Exception as e:
+            failed_paths.append(media_path)
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
+
+    return _MediaSendOutcome(
+        all_ok=not failed_paths,
+        any_ok=any_ok,
+        first_message_id=first_message_id,
+        failed_paths=failed_paths,
+    )
+
+
+def _record_delivery_ack(job: dict, message_id) -> None:
+    """Persist the ack trail for a CONFIRMED cron delivery.
+
+    Two durable records, both best-effort (ack bookkeeping must never turn a
+    message the user already received into a delivery failure):
+
+    1. ``delivered_message_id`` on the job record, so the completed-job
+       archive (``cron/completed.json``) keeps proof of what was sent even
+       after the retired one-shot is removed from jobs.json.
+    2. ``messages.platform_message_id`` on the final assistant row of the
+       job's most recent cron session in state.db, so monitoring can tell
+       "agent finished" apart from "user actually got the result" (live
+       incident 2026-08-05 evening: a lost send was counted as delivered
+       and left zero trace).
+    """
+    mid = str(message_id)
+    try:
+        record_delivered_message_id(job["id"], mid)
+    except Exception as e:
+        logger.warning("Job '%s': failed to stamp delivered_message_id: %s", job.get("id", "?"), e)
+
+    try:
+        from hermes_state import SessionDB
+        db = SessionDB()
+    except Exception as e:
+        logger.warning("Job '%s': SQLite session store not available for delivery ack: %s",
+                       job.get("id", "?"), e)
+        return
+    try:
+        # Cron sessions are named cron_<job_id>_<run timestamp> (see run_job);
+        # ack the newest one — a pending_delivery retry delivers the payload of
+        # the latest agent run. Select the same row the delivery watchdog
+        # reads: the last assistant row with non-empty content.
+        like_pattern = f"cron_{job['id']}_%"
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT id FROM messages WHERE session_id = ("
+                "  SELECT id FROM sessions WHERE id LIKE ? ORDER BY started_at DESC LIMIT 1"
+                ") AND role = 'assistant' AND content IS NOT NULL AND TRIM(content) != '' "
+                "ORDER BY timestamp DESC, id DESC LIMIT 1",
+                (like_pattern,),
+            ).fetchone()
+            if row is None:
+                return False
+            conn.execute(
+                "UPDATE messages SET platform_message_id = ? WHERE id = ?",
+                (mid, row["id"]),
+            )
+            return True
+
+        if not db._execute_write(_do):
+            logger.warning("Job '%s': no cron session assistant row found for delivery ack",
+                           job.get("id", "?"))
+    except Exception as e:
+        logger.warning("Job '%s': failed to write delivery ack to state.db: %s",
+                       job.get("id", "?"), e)
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
 
 
 def _confirm_adapter_delivery(send_result) -> bool:
@@ -1476,12 +1579,23 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     the standalone HTTP path cannot encrypt.  Falls back to standalone send if
     the adapter path fails or is unavailable.
 
-    Returns None on success, or an error string on failure.
+    Returns None on success, or an error string on failure.  Success means
+    CONFIRMED delivery: a send only counts when the platform reported
+    ``success is True`` (a falsy/None result is a failure, so the caller arms
+    the pending_delivery retry machinery). A confirmed send WITHOUT a platform
+    message id (SignalAdapter returns success=True/message_id=None on every
+    real send) is CONFIRMED-BUT-UNACKED: it counts as delivered, only the
+    ack bookkeeping is skipped — treating it as a failure caused guaranteed
+    double delivery.
     """
     targets = _resolve_delivery_targets(job)
     if not targets:
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
         if deliver_value == "local":
+            logger.info(
+                "Job '%s': deliver=local — output saved to the cron output dir "
+                "only, no chat delivery attempted", job["id"],
+            )
             return None  # local-only jobs don't deliver — not a failure
         # deliver=origin with no resolvable origin and no configured home
         # channels: treat as local rather than reporting an error.  CLI-created
@@ -1837,6 +1951,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # telegram_dm_topic_reply_fallback + the real
                 # direct_messages_topic_id.
                 dm_topic_metadata = None
+                dm_topic_root_fallback = False
                 if is_telegram_dm_topic_target and route_thread_id:
                     from gateway.run import GatewayRunner
 
@@ -1851,14 +1966,30 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         chat_type="dm",
                         adapter=runtime_adapter,
                     ) or {}
-                    if resolved_dm_meta.get("telegram_dm_topic_reply_fallback"):
+                    if resolved_dm_meta.get("telegram_reply_to_message_id"):
                         dm_topic_metadata = resolved_dm_meta
+                    else:
+                        # No usable reply anchor: an anchor-less DM-topic send
+                        # routes via direct_messages_topic_id, which the Bot API
+                        # accepts but the user's client may never render (live
+                        # incident 2026-08-05 evening: one-shot result landed in
+                        # an invisible lane and was counted as delivered). Send
+                        # to the root DM with no thread routing instead —
+                        # visible-but-unthreaded beats invisible.
+                        logger.warning(
+                            "Job '%s': Telegram DM-topic target %s:%s has no "
+                            "usable reply anchor; falling back to a root-DM "
+                            "send without thread routing",
+                            job["id"], chat_id, thread_id,
+                        )
+                        dm_topic_root_fallback = True
+                        route_thread_id = None
                 if dm_topic_metadata:
                     route_metadata.update(dm_topic_metadata)
                     # Attachments mirror the text routing so media lands in the
                     # same DM topic instead of the root DM.
                     media_metadata.update(dm_topic_metadata)
-                else:
+                elif not dm_topic_root_fallback:
                     if route_thread_id:
                         route_metadata["thread_id"] = route_thread_id
                     if thread_id:
@@ -1875,6 +2006,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 text_to_send = cleaned_delivery_content.strip()
                 adapter_ok = True
                 timed_out = False
+                confirmed_message_id = None
                 if text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
 
@@ -1967,23 +2099,30 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             # {"success": True, "delivered": False, ...}.
                             # Normalize both shapes so a getattr default doesn't
                             # misread a dict, and so a None / success-less object
-                            # is NOT counted as delivered (#47056).
+                            # is NOT counted as delivered (#47056). CONFIRMED
+                            # delivery means the platform reported success is
+                            # True — a falsy/None result must arm the
+                            # pending_delivery retry machinery instead of being
+                            # logged as delivered (live incident 2026-08-05
+                            # evening: the one-shot result was silently lost).
                             if isinstance(send_result, dict):
                                 send_success = bool(send_result.get("success", False))
                                 send_raw_response = send_result.get("raw_response")
+                                sent_message_id = send_result.get("message_id")
                             else:
                                 send_success = _confirm_adapter_delivery(send_result)
                                 send_raw_response = getattr(send_result, "raw_response", None)
+                                sent_message_id = getattr(send_result, "message_id", None)
 
                             if not send_success:
                                 if isinstance(send_result, dict):
                                     err = send_result.get("error", "unknown")
                                     shape = "dict"
                                 elif send_result is not None:
-                                    err = getattr(send_result, "error", None)
+                                    err = getattr(send_result, "error", None) or "unknown"
                                     shape = type(send_result).__name__
                                 else:
-                                    err = "no response from adapter"
+                                    err = "adapter returned no send result"
                                     shape = "None"
                                 msg = (
                                     f"live adapter send to {platform_name}:{chat_id} "
@@ -2013,25 +2152,39 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                     )
                                 target_errors.append(msg)
                                 adapter_ok = False  # fall through to standalone path
-                            elif (
-                                send_raw_response
-                                and thread_id
-                                and send_raw_response.get("thread_fallback")
-                            ):
-                                requested_thread_id = send_raw_response.get("requested_thread_id") or thread_id
-                                msg = (
-                                    f"configured thread_id {requested_thread_id} for "
-                                    f"{platform_name}:{chat_id} was not found; delivered without thread_id"
-                                )
-                                # LOG-ONLY, deliberately not a delivery_error: the
-                                # message DID reach the user, it just degraded to
-                                # the base chat. Recording it as an error makes
-                                # mark_job_run persist a pending_delivery for an
-                                # already-delivered payload, which is then resent
-                                # on every subsequent tick until the retry budget
-                                # is exhausted (false retries of a successful
-                                # thread_fallback send).
-                                logger.warning("Job '%s': %s", job["id"], msg)
+                            else:
+                                if sent_message_id:
+                                    confirmed_message_id = str(sent_message_id)
+                                else:
+                                    # CONFIRMED-BUT-UNACKED: some adapters
+                                    # (Signal) report success=True with no
+                                    # message id on every real send. The message
+                                    # reached the user — arming a retry here
+                                    # caused guaranteed double delivery. Only
+                                    # the ack bookkeeping is skipped.
+                                    logger.info(
+                                        "Job '%s': delivered without platform "
+                                        "message id — ack skipped", job["id"],
+                                    )
+                                if (
+                                    send_raw_response
+                                    and thread_id
+                                    and send_raw_response.get("thread_fallback")
+                                ):
+                                    requested_thread_id = send_raw_response.get("requested_thread_id") or thread_id
+                                    msg = (
+                                        f"configured thread_id {requested_thread_id} for "
+                                        f"{platform_name}:{chat_id} was not found; delivered without thread_id"
+                                    )
+                                    # LOG-ONLY, deliberately not a delivery_error: the
+                                    # message DID reach the user, it just degraded to
+                                    # the base chat. Recording it as an error makes
+                                    # mark_job_run persist a pending_delivery for an
+                                    # already-delivered payload, which is then resent
+                                    # on every subsequent tick until the retry budget
+                                    # is exhausted (false retries of a successful
+                                    # thread_fallback send).
+                                    logger.warning("Job '%s': %s", job["id"], msg)
 
                 # Send extracted media files as native attachments via the live
                 # adapter, using the same DM-topic-aware routing as the text send
@@ -2052,7 +2205,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 routed_media_metadata["user_id"] = logical_home.user_id
                             if logical_home.scope_id:
                                 routed_media_metadata["scope_id"] = logical_home.scope_id
-                    _send_media_via_adapter(
+                    media_outcome = _send_media_via_adapter(
                         runtime_adapter,
                         chat_id,
                         media_files,
@@ -2061,6 +2214,37 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         job,
                         platform=platform,
                     )
+                    if not text_to_send and not media_outcome.any_ok:
+                        # MEDIA-ONLY payload and no file was confirmed sent:
+                        # nothing reached the user, so this is a delivery
+                        # failure exactly like a failed text send — fall
+                        # through to standalone / arm the pending_delivery
+                        # retry machinery.
+                        adapter_ok = False
+                        logger.warning(
+                            "Job '%s': media-only delivery to %s:%s failed for "
+                            "all %d file(s): %s",
+                            job["id"], platform_name, chat_id,
+                            len(media_outcome.failed_paths),
+                            ", ".join(media_outcome.failed_paths),
+                        )
+                    elif not media_outcome.all_ok:
+                        # The text (or part of the media) already reached the
+                        # user — arming pending_delivery would resend what was
+                        # delivered. Surface the partial failure loudly
+                        # instead of retrying.
+                        logger.warning(
+                            "Job '%s': delivered to %s:%s but media send "
+                            "failed for: %s — NOT scheduling a delivery retry "
+                            "(a retry would duplicate the delivered content)",
+                            job["id"], platform_name, chat_id,
+                            ", ".join(media_outcome.failed_paths),
+                        )
+                    if confirmed_message_id is None and media_outcome.first_message_id:
+                        # No text ack available (no text, or a confirmed text
+                        # send without a message id) — a confirmed media
+                        # send's message id is just as good an ack.
+                        confirmed_message_id = media_outcome.first_message_id
                 elif timed_out and media_files:
                     msg = (
                         f"{len(media_files)} media attachment(s) not delivered to "
@@ -2072,6 +2256,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 if adapter_ok:
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
                     delivered = True
+                    if confirmed_message_id:
+                        _record_delivery_ack(job, confirmed_message_id)
                     # Seed the thread session only now that delivery into it
                     # succeeded (deferred from thread-open above).
                     if opened_thread_id and not thread_seeded:
@@ -2203,14 +2389,24 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
 
-            if result and result.get("error"):
-                msg = f"delivery error: {result['error']}"
+            if not result or result.get("error"):
+                # A falsy result is NOT a confirmed delivery — same class of
+                # silent loss as the live-adapter path above.
+                msg = f"delivery error: {result['error'] if result else 'sender returned no result'}"
                 logger.error("Job '%s': %s", job["id"], msg)
                 target_errors.extend([msg])
                 delivery_errors.extend(target_errors)
                 continue
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
+            if result.get("message_id"):
+                _record_delivery_ack(job, result["message_id"])
+            else:
+                # CONFIRMED-BUT-UNACKED (see the live-adapter path above).
+                logger.info(
+                    "Job '%s': delivered without platform message id — ack skipped",
+                    job["id"],
+                )
             _maybe_mirror_cron_delivery(
                 job, platform_name, chat_id, mirror_text,
                 thread_id=thread_id, user_id=origin_user_id,

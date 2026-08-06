@@ -1598,10 +1598,11 @@ class TestDeliverResultThreadFallbackIsLogOnly:
 
 
 class TestDeliverResultTelegramDmTopicSynthetic:
-    """Cron delivery to a Telegram synthetic private-DM topic must route
-    through the same DM-topic-aware metadata live gateway replies use, and
-    must never silently hand off to the anchor-agnostic standalone sender
-    when that routing can't be resolved (see #cron-dm-topic-delivery).
+    """Cron delivery to a Telegram synthetic private-DM topic: anchor-less
+    sends fall back to a visible root-DM send (never the invisible
+    direct_messages_topic_id lane — 2026-08-05 evening incident), and must
+    never silently hand off to the anchor-agnostic standalone sender
+    when DM-topic routing can't be resolved (see #cron-dm-topic-delivery).
     """
 
     class _FakeDmTopicAdapter:
@@ -1626,15 +1627,17 @@ class TestDeliverResultTelegramDmTopicSynthetic:
         def _get_dm_topic_info(self, chat_id, thread_id):
             return None
 
-    def test_synthetic_dm_topic_resolves_canonical_anchor(self):
-        """A thread_id the adapter recognizes as a registered DM topic must
-        be delivered via the real direct_messages_topic_id routing (the
-        canonical resolver used by ordinary gateway replies), not a bare
-        message_thread_id."""
+    def test_synthetic_dm_topic_without_anchor_sends_root_dm(self):
+        """A DM-topic thread_id with no usable reply anchor (cron sends never
+        carry one) must be delivered to the ROOT DM with no thread routing —
+        an anchor-less send routed via direct_messages_topic_id is accepted
+        by the Bot API but can land in a lane the user's client never renders
+        (live incident 2026-08-05 evening). Visible-but-unthreaded beats
+        invisible."""
         from gateway.config import Platform
         from concurrent.futures import Future
 
-        send_result = MagicMock(success=True, raw_response=None)
+        send_result = MagicMock(success=True, message_id="31337", raw_response=None)
         adapter = self._FakeDmTopicAdapter(send_result)
 
         pconfig = MagicMock()
@@ -1666,6 +1669,7 @@ class TestDeliverResultTelegramDmTopicSynthetic:
 
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("cron.scheduler._record_delivery_ack"), \
              patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
              patch("tools.send_message_tool._send_to_platform", new=AsyncMock()) as standalone_send:
             result = _deliver_result(
@@ -1678,8 +1682,10 @@ class TestDeliverResultTelegramDmTopicSynthetic:
         assert result is None
         adapter.send.assert_called_once()
         sent_metadata = adapter.send.call_args.kwargs.get("metadata") or adapter.send.call_args[0][-1]
-        assert sent_metadata["telegram_dm_topic_reply_fallback"] is True
-        assert sent_metadata["direct_messages_topic_id"] == "701226"
+        # Root-DM fallback: no thread routing of any kind reaches the adapter.
+        assert "telegram_dm_topic_reply_fallback" not in sent_metadata
+        assert "direct_messages_topic_id" not in sent_metadata
+        assert "thread_id" not in sent_metadata
         # Standalone sender must never be used when the live adapter succeeds.
         standalone_send.assert_not_called()
 

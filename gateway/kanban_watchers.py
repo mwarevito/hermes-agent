@@ -558,9 +558,9 @@ class GatewayKanbanWatchersMixin:
                         # terminal delivery, so they are swallowed and logged.
                         if adapter is not None:
                             try:
-                                meta: dict[str, Any] = {}
-                                if sub.get("thread_id"):
-                                    meta["thread_id"] = sub["thread_id"]
+                                meta: dict[str, Any] = self._kanban_visible_thread_metadata(
+                                    plat, sub, adapter,
+                                )
                                 await self._kanban_deliver_card(
                                     adapter, sub, board_slug,
                                     _render_progress_card(
@@ -708,14 +708,33 @@ class GatewayKanbanWatchersMixin:
                                 self._kanban_confirm_sent, sub, ev.id, board_slug, lease_owner,
                             )
                             continue
+                        # Subscription-level routing (relay/user/scope) is the
+                        # base; thread routing is layered on top and only in a
+                        # shape that is guaranteed USER-VISIBLE.
                         delivery_metadata = sub.get("delivery_metadata")
                         metadata: dict[str, Any] = (
                             dict(delivery_metadata)
                             if isinstance(delivery_metadata, dict)
                             else {}
                         )
-                        if sub.get("thread_id") and not metadata.get("thread_id"):
-                            metadata["thread_id"] = sub["thread_id"]
+                        visible_thread_meta = self._kanban_visible_thread_metadata(
+                            plat, sub, adapter,
+                        )
+                        if visible_thread_meta:
+                            metadata.update(visible_thread_meta)
+                        else:
+                            # Root-DM downgrade (anchorless private-chat topic,
+                            # 2026-08-05 t_0fc6b0dd): strip any thread routing
+                            # inherited from delivery_metadata too, or the
+                            # invisible/wedged lane comes back through the side
+                            # door.
+                            for _routing_key in (
+                                "thread_id", "message_thread_id",
+                                "direct_messages_topic_id",
+                                "telegram_direct_messages_topic_id",
+                                "telegram_dm_topic_reply_fallback",
+                            ):
+                                metadata.pop(_routing_key, None)
                         if not _is_push_adapter:
                             logger.debug(
                                 "kanban notifier: adapter %s has no push "
@@ -1038,6 +1057,57 @@ class GatewayKanbanWatchersMixin:
         finally:
             conn.close()
 
+    def _kanban_visible_thread_metadata(self, plat, sub, adapter) -> dict:
+        """Thread routing that is guaranteed USER-VISIBLE for watcher sends.
+
+        Watcher sends never have a reply anchor, and a Telegram private-chat
+        topic without one has no visible route: a bare thread_id trips the
+        adapter's anchor guard (silent ``success=False`` — the 2026-08-05
+        t_0fc6b0dd loss), while the canonical fallback metadata
+        (``direct_messages_topic_id``, operator-declared topics only) is
+        accepted by the Bot API but may render nowhere the user looks (the
+        same evening's cron loss). Cover BOTH shapes — operator-declared
+        topics (fallback flag set) and ad-hoc user topics (bare thread on a
+        private-looking chat id) — by stripping thread routing and sending to
+        the root DM: visible-but-unthreaded beats invisible or wedged.
+        """
+        # Decision cache per routing target: the answer is stable for a given
+        # (platform, chat, thread), the helper's cache-miss path re-reads
+        # config from disk, and the notifier calls this every ~5s tick per sub
+        # — without the cache the root-DM downgrade would also WARN-spam once
+        # per tick for the whole lifetime of a task.
+        cache = getattr(self, "_kanban_thread_meta_cache", None)
+        if cache is None:
+            cache = {}
+            self._kanban_thread_meta_cache = cache
+        key = (str(plat), str(sub.get("chat_id")), str(sub.get("thread_id") or ""))
+        if key in cache:
+            return dict(cache[key])
+
+        meta = self._thread_metadata_for_target(
+            plat, sub["chat_id"], sub.get("thread_id") or None, adapter=adapter,
+        ) or {}
+        if meta and not meta.get("telegram_reply_to_message_id"):
+            from gateway.config import Platform as _Platform
+            # Upstream renamed the helper (dropped the leading underscore) in
+            # v2026.8.x; keep using the public name.
+            from gateway.delivery import looks_like_telegram_private_chat_id
+            anchorless_private_topic = meta.get("telegram_dm_topic_reply_fallback") or (
+                plat == _Platform.TELEGRAM
+                and looks_like_telegram_private_chat_id(str(sub.get("chat_id") or ""))
+            )
+            if anchorless_private_topic:
+                logger.warning(
+                    "kanban notifier: DM-topic target %s:%s for task %s has no "
+                    "reply anchor; sending to the root DM without thread routing",
+                    sub.get("chat_id"), sub.get("thread_id"), sub.get("task_id"),
+                )
+                meta = {}
+        if len(cache) > 256:
+            cache.clear()
+        cache[key] = dict(meta)
+        return dict(meta)
+
     async def _kanban_deliver_card(
         self, adapter, sub: dict, board: Optional[str], text: str, metadata: dict,
     ) -> None:
@@ -1062,17 +1132,19 @@ class GatewayKanbanWatchersMixin:
                 logger.debug("kanban card: edit failed for %s: %s", sub["task_id"], exc)
         if new_id is None:
             res = await adapter.send(sub["chat_id"], text, metadata=metadata)
-            # A SendResult(success=False) without an exception (returned by
-            # push-capable adapters on a genuine transient failure) must count
-            # as a FAILED delivery — otherwise the caller confirms the event in
-            # the durable ledger, the cursor advances, and the event is
-            # permanently lost. Raise so the caller's failure path records it.
-            # Adapters returning None (or anything non-SendResult shaped) keep
-            # the legacy "no exception == delivered" contract.
+            # A SendResult(success=False) without an exception must count as a
+            # FAILED delivery — adapters signal failure by RETURNING it rather
+            # than raising (telegram's DM-topic guard: "requires a reply
+            # anchor"). Without this check the caller confirms the event in the
+            # durable ledger, the cursor advances, and the event is permanently
+            # lost — an unchecked return durably marked lost sends as 'sent'
+            # (2026-08-05 incident, t_0fc6b0dd). Adapters returning None (or
+            # anything non-SendResult shaped) keep the legacy
+            # "no exception == delivered" contract.
             if getattr(res, "success", True) is False:
                 raise RuntimeError(
-                    "adapter send() reported failure: "
-                    f"{getattr(res, 'error', None) or 'unknown error'}"
+                    f"kanban card send failed for {sub['task_id']}: "
+                    f"{getattr(res, 'error', None) or 'send returned success=False'}"
                 )
             new_id = getattr(res, "message_id", None) or card_id
         sub["card_message_id"] = str(new_id) if new_id is not None else None
@@ -1335,32 +1407,50 @@ class GatewayKanbanWatchersMixin:
         image_paths = [p for p in candidates if _Path(p).suffix.lower() in _IMAGE_EXTS]
         other_paths = [p for p in candidates if _Path(p).suffix.lower() not in _IMAGE_EXTS]
 
+        # Adapters can signal failure by RETURNING success=False instead of
+        # raising — check every result so a lost deliverable is at least
+        # loudly logged, never silently counted as delivered.
+        task_id = getattr(task, "id", "?")
+
         if image_paths:
             try:
                 batch = [(f"file://{_quote(p)}", "") for p in image_paths]
-                await adapter.send_multiple_images(
+                res = await adapter.send_multiple_images(
                     chat_id=chat_id, images=batch, metadata=metadata,
                 )
+                if res is not None and getattr(res, "success", True) is False:
+                    logger.warning(
+                        "kanban notifier: image batch upload for task %s "
+                        "returned failure: %s — deliverable NOT sent",
+                        task_id, getattr(res, "error", None),
+                    )
             except Exception as exc:
                 logger.warning(
-                    "kanban notifier: image batch upload failed: %s", exc,
+                    "kanban notifier: image batch upload for task %s failed: %s",
+                    task_id, exc,
                 )
 
         for path in other_paths:
             ext = _Path(path).suffix.lower()
             try:
                 if ext in _VIDEO_EXTS:
-                    await adapter.send_video(
+                    res = await adapter.send_video(
                         chat_id=chat_id, video_path=path, metadata=metadata,
                     )
                 else:
-                    await adapter.send_document(
+                    res = await adapter.send_document(
                         chat_id=chat_id, file_path=path, metadata=metadata,
+                    )
+                if res is not None and getattr(res, "success", True) is False:
+                    logger.warning(
+                        "kanban notifier: artifact upload (%s) for task %s "
+                        "returned failure: %s — deliverable NOT sent",
+                        path, task_id, getattr(res, "error", None),
                     )
             except Exception as exc:
                 logger.warning(
-                    "kanban notifier: artifact upload (%s) failed: %s",
-                    path, exc,
+                    "kanban notifier: artifact upload (%s) for task %s failed: %s",
+                    path, task_id, exc,
                 )
 
     async def _kanban_dispatcher_watcher(self) -> None:

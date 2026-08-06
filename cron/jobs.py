@@ -123,6 +123,10 @@ ONESHOT_GRACE_SECONDS = 120
 _MAX_DELIVERY_RETRIES = 3
 _DELIVERY_RETRY_DELAY_MINUTES = 5
 
+# Retired jobs are popped from jobs.json entirely; completed.json keeps a
+# bounded audit trail of them (see _archive_completed_job).
+_MAX_COMPLETED_ARCHIVE = 200
+
 
 @dataclass(frozen=True)
 class _CronStorePaths:
@@ -1694,6 +1698,93 @@ def remove_job(job_id: str) -> bool:
     return False
 
 
+def _archive_completed_job(job: Dict[str, Any], completed_at: str) -> None:
+    """Append a retired job's audit record to ``cron/completed.json``.
+
+    A retired one-shot is popped from jobs.json entirely; without this
+    archive there is no trace left to audit whether the user ever saw its
+    output (live incident 2026-08-05 evening: the one-shot was deleted with
+    delivery silently lost and zero audit trail). Bounded to the last
+    ``_MAX_COMPLETED_ARCHIVE`` entries. Best-effort — an archive failure
+    must never block job completion.
+    """
+    completed_file = CRON_DIR / "completed.json"
+    record = {
+        "id": job.get("id"),
+        "name": job.get("name"),
+        "deliver": job.get("deliver"),
+        "origin": job.get("origin"),
+        "last_delivery_error": job.get("last_delivery_error"),
+        "delivered_message_id": job.get("delivered_message_id"),
+        "completed_at": completed_at,
+    }
+    try:
+        entries: List[Dict[str, Any]] = []
+        if completed_file.exists():
+            try:
+                with open(completed_file, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, list):
+                    entries = loaded
+            except (ValueError, UnicodeDecodeError) as parse_err:
+                # Corrupt archive (json.JSONDecodeError is a ValueError):
+                # quarantine it and start a fresh list instead of silently
+                # dropping this — and every future — record forever.
+                corrupt_path = completed_file.with_name(
+                    f"{completed_file.name}.corrupt.{int(time.time())}"
+                )
+                try:
+                    os.replace(completed_file, corrupt_path)
+                    logger.warning(
+                        "completed.json is corrupt (%s); moved it to %s and "
+                        "starting a fresh archive", parse_err, corrupt_path,
+                    )
+                except OSError as rename_err:
+                    logger.warning(
+                        "completed.json is corrupt (%s) and could not be "
+                        "quarantined (%s); overwriting it with a fresh archive",
+                        parse_err, rename_err,
+                    )
+        entries.append(record)
+        entries = entries[-_MAX_COMPLETED_ARCHIVE:]
+        ensure_dirs()
+        fd, tmp_path = tempfile.mkstemp(dir=str(completed_file.parent), suffix='.tmp', prefix='.completed_')
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(entries, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            atomic_replace(tmp_path, completed_file)
+            _secure_file(completed_file)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except Exception as e:
+        logger.warning("Failed to archive completed job '%s' to %s: %s",
+                       job.get("id", "?"), completed_file, e)
+
+
+def record_delivered_message_id(job_id: str, message_id: str) -> None:
+    """Stamp the platform message id of a CONFIRMED delivery on the job record.
+
+    Called by the scheduler right after a send is confirmed (success + real
+    message id). The value rides along into the completed-job archive (see
+    ``_archive_completed_job``) so a retired one-shot keeps auditable proof
+    of what the user was actually sent.
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job["id"] == job_id:
+                job["delivered_message_id"] = str(message_id)
+                save_jobs(jobs)
+                return
+        logger.debug("record_delivered_message_id: job_id %s not found, skipping", job_id)
+
+
 def _complete_terminal_job(jobs: List[Dict[str, Any]], i: int, job: Dict[str, Any], now: str) -> None:
     """Retire/advance a job whose result has been delivered (or needed no
     delivery). Shared tail for both a normal run that delivered cleanly
@@ -1735,6 +1826,14 @@ def _complete_terminal_job(jobs: List[Dict[str, Any]], i: int, job: Dict[str, An
             # no inspectable outcome, and a failed delivery was invisible.
             # The retention sweep prunes these after
             # COMPLETED_ONESHOT_RETENTION_DAYS.
+            #
+            # Archive an audit record too: retention is TIME-BOUNDED, so
+            # cron/completed.json keeps the durable delivery proof
+            # (delivered_message_id / last_delivery_error) after the sweep
+            # prunes the retained row — without it a retired one-shot
+            # eventually leaves no trace of whether the user ever saw its
+            # output (live incident 2026-08-05 evening).
+            _archive_completed_job(job, now)
             job["enabled"] = False
             job["state"] = "completed"
             job["next_run_at"] = None

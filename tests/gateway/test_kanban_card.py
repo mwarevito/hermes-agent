@@ -33,9 +33,10 @@ class CardAdapter:
             type(self)._no_edit_instances.add(id(self))
 
     class _Res:
-        def __init__(self, success, message_id=None):
+        def __init__(self, success, message_id=None, error=None):
             self.success = success
             self.message_id = message_id
+            self.error = error
 
     async def send(self, chat_id, text, metadata=None):
         self._next_id += 1
@@ -52,6 +53,10 @@ def _make_runner(adapter):
     runner._running = True
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._kanban_sub_fail_counts = {}
+    # Model the default gateway AFTER its dispatcher acquired the singleton
+    # lock — without the handle the notifier owns no subscriptions and the
+    # tick delivers nothing (mirrors tests/gateway/test_kanban_notifier.py).
+    runner._kanban_dispatcher_lock_handle = object()
     return runner
 
 
@@ -167,3 +172,209 @@ def test_progress_card_says_what_is_happening(tmp_path, monkeypatch):
     assert "долгая задача" in text
     assert "работает" in text
     assert "мин" in text, "пользователь должен видеть, сколько это уже идёт"
+
+
+# ── SendResult checks (2026-08-05 incident: success=False marked 'sent') ─────
+
+
+async def _run_one_notifier_tick(monkeypatch, runner):
+    """One full notifier tick, same shape as tests/gateway/test_kanban_notifier.py."""
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(delay):
+        if delay == 5:
+            return None
+        runner._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    await runner._kanban_notifier_watcher(interval=1)
+
+
+class RejectingAdapter:
+    """send() RETURNS success=False instead of raising — the telegram
+    DM-topic guard shape ("requires a reply anchor") that silently lost
+    the t_0fc6b0dd delivery."""
+
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, chat_id, text, metadata=None):
+        self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+        return CardAdapter._Res(
+            False, error="Telegram DM topic send requires a reply anchor",
+        )
+
+
+def test_returned_send_failure_is_recorded_failed_not_sent(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "card7.db"))
+    kb.init_db()
+    from gateway.kanban_watchers import TERMINAL_KINDS
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="lost delivery", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.complete_task(conn, tid, summary="готово")
+    finally:
+        conn.close()
+
+    adapter = RejectingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1, "отправка была попробована"
+    conn = kb.connect()
+    try:
+        row = conn.execute(
+            "SELECT status FROM kanban_notify_deliveries WHERE task_id = ?",
+            (tid,),
+        ).fetchone()
+        assert row is not None and row[0] == "failed", (
+            "success=False обязан лечь в леджер как 'failed', не 'sent'"
+        )
+        assert len(kb.list_notify_subs(conn, tid)) == 1, (
+            "подписка не должна удаляться, пока событие не доставлено"
+        )
+        _, events = kb.unseen_events_for_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            kinds=list(TERMINAL_KINDS),
+        )
+        assert [ev.kind for ev in events] == ["completed"], (
+            "курсор не должен уехать за недоставленное событие"
+        )
+    finally:
+        conn.close()
+
+
+class DmTopicCardAdapter(CardAdapter):
+    """Telegram-style adapter that declares the sub's thread a DM topic lane."""
+
+    def _get_dm_topic_info(self, chat_id, thread_id):
+        return {"name": "General"}
+
+
+def test_adhoc_user_topic_also_strips_thread_routing(tmp_path, monkeypatch, caplog):
+    """The 2026-08-05 t_0fc6b0dd shape: ad-hoc USER topic, no operator config.
+
+    _get_dm_topic_info knows only operator-declared topics, so the canonical
+    helper returns a bare thread_id for an ad-hoc topic — which telegram's
+    anchor guard refuses with a silent success=False. A private-looking chat
+    id + thread with no anchor must strip to the root DM just like the
+    operator-declared case.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "card9.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="adhoc topic task", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="405154434",
+            thread_id="701898",
+        )
+        kb.complete_task(conn, tid, summary="готово")
+    finally:
+        conn.close()
+
+    adapter = CardAdapter()  # no _get_dm_topic_info — ad-hoc topic
+    runner = _make_runner(adapter)
+    with caplog.at_level("WARNING"):
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    meta = adapter.sent[0]["metadata"] or {}
+    assert "thread_id" not in meta
+    assert "direct_messages_topic_id" not in meta
+    assert any(
+        "root DM" in rec.getMessage() and str(tid) in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+def test_dm_topic_sub_send_strips_invisible_thread_routing(tmp_path, monkeypatch, caplog):
+    """Anchor-less DM-topic watcher sends must go to the ROOT DM.
+
+    A bare thread_id trips telegram's anchor guard (silent success=False), and
+    the canonical fallback (direct_messages_topic_id, no anchor) is accepted by
+    the Bot API but renders nowhere the user looks (2026-08-05 evening cron
+    incident). The only user-visible option without an anchor is the root DM.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "card8.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="dm topic task", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="405154434",
+            thread_id="701898",
+        )
+        kb.complete_task(conn, tid, summary="готово")
+    finally:
+        conn.close()
+
+    adapter = DmTopicCardAdapter()
+    runner = _make_runner(adapter)
+    with caplog.at_level("WARNING"):
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    meta = adapter.sent[0]["metadata"] or {}
+    assert "direct_messages_topic_id" not in meta, (
+        "анкорлесс DM-топик: direct_messages_topic_id уводит сообщение в "
+        "невидимую полосу — маршрутизация должна быть срезана до корня лички"
+    )
+    assert "telegram_dm_topic_reply_fallback" not in meta
+    assert "thread_id" not in meta
+    assert any(
+        "root DM" in rec.getMessage() and str(tid) in rec.getMessage()
+        for rec in caplog.records
+    ), "провал маршрутизации в топик должен логироваться WARNING'ом с task id"
+
+
+class ArtifactRejectingAdapter(CardAdapter):
+    """send_document() RETURNS success=False instead of raising."""
+
+    def __init__(self):
+        super().__init__()
+        self.documents = []
+
+    async def send_document(self, chat_id, file_path, metadata=None):
+        self.documents.append(file_path)
+        return CardAdapter._Res(False, error="upload rejected")
+
+
+def test_artifact_send_failure_is_logged_with_task_id(tmp_path, monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "card9.db"))
+    kb.init_db()
+    artifact = tmp_path / "report.txt"
+    artifact.write_text("данные")
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="artifact task", assignee="worker")
+        task = kb.get_task(conn, tid)
+    finally:
+        conn.close()
+
+    adapter = ArtifactRejectingAdapter()
+    runner = _make_runner(adapter)
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        asyncio.run(runner._deliver_kanban_artifacts(
+            adapter=adapter,
+            chat_id="chat-1",
+            metadata={},
+            event_payload={"artifacts": [str(artifact)]},
+            task=task,
+        ))
+
+    assert len(adapter.documents) == 1, "загрузка была попробована"
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(tid in m and "NOT sent" in m for m in warnings), (
+        "провал загрузки артефакта обязан попасть в WARNING с id задачи, "
+        f"а не потеряться молча; получили: {warnings}"
+    )

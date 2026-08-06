@@ -22,6 +22,29 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     return plugins.invoke_hook(hook_name, **kwargs)
 
 
+def transform_llm_output(response_text: str, **kwargs: Any) -> tuple[str, bool]:
+    """Notify observers, then compose plugin LLM-output transforms in order.
+
+    Parallel to :func:`invoke_hook` (observers first, plugins second), but the
+    plugin leg is a PIPELINE: every ``transform_llm_output`` callback receives
+    the previous callback's text, so independent response appenders (runtime
+    truth, verification notes, skill proposals) all survive instead of the
+    first one winning and silently suppressing the rest.
+    """
+    try:
+        from hermes_cli.observability import observe_lifecycle
+
+        observe_lifecycle(
+            "transform_llm_output", response_text=response_text, **kwargs
+        )
+    except Exception:
+        logger.warning("Built-in observability hook failed", exc_info=True)
+
+    from hermes_cli import plugins
+
+    return plugins.transform_llm_output(response_text, **kwargs)
+
+
 def has_hook(hook_name: str) -> bool:
     """Return whether a first-party observer or plugin consumes a hook."""
     try:

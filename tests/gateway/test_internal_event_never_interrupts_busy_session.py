@@ -118,9 +118,14 @@ async def test_internal_event_does_not_interrupt_busy_session() -> None:
 
     handled = await runner._handle_active_session_busy_message(event, sk)
 
-    # Returns False so the base adapter silently queues the internal event
-    # as a cascading next turn — it must NOT be handled-with-interrupt here.
-    assert handled is False
+    # internal-notification-queue: the runner itself parks the event and reports
+    # it handled, so upstream's base-adapter queueing never runs and the event has
+    # exactly one owner. (Upstream alone returns False here and lets the adapter
+    # queue it; with our patch that would queue the same event twice.)
+    assert handled is True
+    # Handled must mean PARKED, not swallowed — an event that vanishes here is a
+    # background result the user never receives.
+    assert runner._queued_events[sk] == [event]
     # The active turn must survive.
     parent.interrupt.assert_not_called()
     # No "⚡ Interrupting current task" (or any) ack for a synthetic event.

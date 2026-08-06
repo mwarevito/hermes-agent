@@ -243,7 +243,7 @@ def test_click_from_other_user_rejected(real_manager):
 async def test_telegram_callback_query_routes_to_plugin(real_manager, monkeypatch):
     _ensure_telegram_mock()
     from gateway import approval_cards
-    from gateway.platforms.telegram import TelegramAdapter
+    from plugins.platforms.telegram.adapter import TelegramAdapter
     from gateway.config import PlatformConfig
     from plugins.prod_approvals import gate
 
@@ -294,7 +294,7 @@ async def test_telegram_callback_query_routes_to_plugin(real_manager, monkeypatc
 @pytest.mark.asyncio
 async def test_send_action_card_builds_inline_keyboard():
     _ensure_telegram_mock()
-    from gateway.platforms.telegram import TelegramAdapter
+    from plugins.platforms.telegram.adapter import TelegramAdapter
     from gateway.config import PlatformConfig
     from gateway.approval_cards import ApprovalCard
 

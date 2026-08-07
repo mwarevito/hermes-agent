@@ -38,6 +38,24 @@ logger = logging.getLogger("gateway.run")
 # one of these is not "waiting for the adapter to connect" — it is dead mail.
 _UNDELIVERABLE_PLATFORMS = frozenset({"tui", "cli", ""})
 
+# The notifier ticks every few seconds and a dead subscription stays dead, so an
+# unconditional warning per tick floods the log (measured live: 3 rows -> ~2000
+# lines/hour). Warn once an hour per subscription: persistent breakage keeps
+# resurfacing, but the log stays readable. Keyed per subscription so a second
+# broken card is never silenced by the first.
+_UNDELIVERABLE_WARN_INTERVAL = 3600.0
+_undeliverable_warned: dict = {}
+
+
+def _should_warn_undeliverable(task_id, platform, chat_id) -> bool:
+    key = (str(task_id), str(platform), str(chat_id))
+    now = time.time()
+    last = _undeliverable_warned.get(key, 0.0)
+    if now - last < _UNDELIVERABLE_WARN_INTERVAL:
+        return False
+    _undeliverable_warned[key] = now
+    return True
+
 TERMINAL_KINDS = (
     "completed", "blocked", "gave_up", "crashed", "timed_out",
     "status", "archived", "unblocked", "block_loop_detected",
@@ -456,7 +474,10 @@ class GatewayKanbanWatchersMixin:
                                         # platform='tui' whose chat_id encoded a
                                         # Telegram address; nothing delivered them
                                         # and nothing complained.
-                                        if platform in _UNDELIVERABLE_PLATFORMS:
+                                        if platform in _UNDELIVERABLE_PLATFORMS and \
+                                                _should_warn_undeliverable(
+                                                    sub.get("task_id"), platform,
+                                                    sub.get("chat_id")):
                                             logger.warning(
                                                 "kanban notifier: task %s is subscribed on platform %r "
                                                 "(chat_id=%r) which no gateway adapter can deliver — this "

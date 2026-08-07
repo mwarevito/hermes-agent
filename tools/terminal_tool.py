@@ -3353,7 +3353,7 @@ TERMINAL_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": f"Max seconds to wait (default: 180, foreground max: {FOREGROUND_MAX_TIMEOUT}). Returns INSTANTLY when command finishes — set high for long tasks, you won't wait unnecessarily. Foreground timeout above {FOREGROUND_MAX_TIMEOUT}s is rejected; use background=true for longer commands.",
+                "description": f"Max seconds to wait (default: 180, foreground max: {FOREGROUND_MAX_TIMEOUT}). Returns INSTANTLY when command finishes — set high for long tasks, you won't wait unnecessarily. Foreground timeout above {FOREGROUND_MAX_TIMEOUT}s is rejected; use background=true for longer commands. For process(action='wait') the ceiling is far higher (TERMINAL_WAIT_MAX, 900s by default): if you genuinely must block on a background process — e.g. a one-shot worker session that cannot end its turn to receive a completion notification — ask for ONE long wait rather than a loop of short ones. Each wakeup is a full model round-trip; blocking itself costs nothing.",
                 "minimum": 1
             },
             "workdir": {

@@ -46,7 +46,10 @@ class TestWaitTimeoutClarity:
             registry.kill_process(sid)
 
     def test_clamped_wait_keeps_clamp_note_and_running_semantics(self, registry, monkeypatch):
-        monkeypatch.setenv("TERMINAL_TIMEOUT", "1")
+        # The knob that bounds a WAIT is TERMINAL_WAIT_MAX, not TERMINAL_TIMEOUT
+        # (which bounds how long a foreground COMMAND may run). The assertion
+        # below — clamped waits stay explanatory and non-erroring — is unchanged.
+        monkeypatch.setenv("TERMINAL_WAIT_MAX", "1")
         sid = _spawn_sleeper(registry)
         try:
             r = registry.wait(sid, timeout=600)
@@ -54,6 +57,28 @@ class TestWaitTimeoutClarity:
             assert "clamped" in r["timeout_note"]
             assert "not an error" in r["timeout_note"]
             assert r["process_running"] is True
+        finally:
+            registry.kill_process(sid)
+
+    def test_foreground_command_timeout_does_not_cut_a_wait_short(self, registry, monkeypatch):
+        """A short command timeout must not shorten a block on a running process.
+
+        Bounding "how long may I wait for a background process" by the foreground
+        command limit costs one model round-trip per limit-length. Measured
+        2026-08-06: 48 waits of ~60 s to cover 45 minutes, in kanban worker
+        sessions that then compacted 4x and lost their own context.
+        """
+        monkeypatch.setenv("TERMINAL_TIMEOUT", "1")
+        monkeypatch.setenv("TERMINAL_WAIT_MAX", "900")
+        sid = _spawn_sleeper(registry)
+        try:
+            r = registry.wait(sid, timeout=3)
+            # Still running after 3 s, so this is a timeout — but a 3-second one
+            # that we asked for, not a 1-second one imposed by the command limit.
+            assert r["status"] == "timeout"
+            assert "clamped" not in (r.get("timeout_note") or ""), (
+                "запрошенное ожидание не должно резаться лимитом команды"
+            )
         finally:
             registry.kill_process(sid)
 

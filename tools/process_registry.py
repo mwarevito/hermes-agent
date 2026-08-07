@@ -1537,7 +1537,27 @@ class ProcessRegistry:
             default_timeout = int(os.getenv("TERMINAL_TIMEOUT", "180"))
         except (ValueError, TypeError):
             default_timeout = 180
-        max_timeout = default_timeout
+        # TERMINAL_TIMEOUT bounds how long a FOREGROUND COMMAND may run. Using it
+        # to also bound how long a caller may BLOCK on an already-running
+        # background process is a category error: it turns one long wait into
+        # ceil(duration / TERMINAL_TIMEOUT) model round-trips. Measured
+        # 2026-08-06: 48 waits of ~60 s to cover 45 minutes, in a session that
+        # then compacted 4x and lost its own context. Blocking is free; waking up
+        # is what costs. Never below default_timeout, so an explicitly raised
+        # TERMINAL_TIMEOUT is honoured rather than reduced.
+        _wait_env = os.getenv("TERMINAL_WAIT_MAX")
+        if _wait_env is not None:
+            # Set explicitly: honour it verbatim, including a deliberately low
+            # value. Flooring an explicit setting by TERMINAL_TIMEOUT would make
+            # the ceiling impossible to lower.
+            try:
+                max_timeout = int(_wait_env)
+            except (ValueError, TypeError):
+                max_timeout = 900
+        else:
+            # Unset: default generously, but never below an operator-raised
+            # command timeout — that would be a silent downgrade.
+            max_timeout = max(default_timeout, 900)
         requested_timeout = timeout
         timeout_note = None
 

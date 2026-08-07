@@ -923,7 +923,34 @@ def _handle_heartbeat(args: dict, **kw) -> str:
                 return tool_error(
                     f"could not heartbeat {tid} (unknown id or not running)"
                 )
-            return _ok(task_id=tid)
+            # Чекпоинт — ДОПОЛНЕНИЕ к хартбиту, а не его замена: хартбит
+            # говорит «процесс жив», чекпоинт — «работа сдвинулась». Их
+            # смешение и позволило 30 минутам зелёных хартбитов спрятать
+            # молчаливый таймаут 06.08.
+            step = args.get("step")
+            extra = {}
+            if isinstance(step, str) and step.strip():
+                requested = args.get("artifacts") or []
+                if not isinstance(requested, list):
+                    requested = [requested]
+                saved = kb.record_checkpoint(
+                    conn,
+                    tid,
+                    step_key=step,
+                    artifacts=requested,
+                    note=note,
+                    expected_run_id=_worker_run_id(tid),
+                )
+                if saved:
+                    row = kb.get_task(conn, tid)
+                    kept = getattr(row, "current_step_key", None)
+                    extra["step_key"] = kept or step.strip()[:64]
+                    # Сколько путей отвалилось — видно сразу в ответе тула,
+                    # иначе воркер уверен, что сослался на файл, которого нет.
+                    extra["artifacts_requested"] = len(requested)
+                else:
+                    extra["checkpoint"] = "skipped"
+            return _ok(task_id=tid, **extra)
         finally:
             conn.close()
     except ValueError as e:
@@ -1877,6 +1904,26 @@ KANBAN_HEARTBEAT_SCHEMA = {
                 "description": (
                     "Optional short note describing current progress. "
                     "Shown in the event log."
+                ),
+            },
+            "step": {
+                "type": "string",
+                "description": (
+                    "Short slug naming the phase you JUST FINISHED "
+                    "(e.g. 'repo-cloned', 'tests-green', 'diff-written'). "
+                    "Persisted, so a retry of this task resumes here instead "
+                    "of redoing it. Name the phase you COMPLETED, not the one "
+                    "you are starting — and only when it really changed: "
+                    "repeating the same slug reads as standing still."
+                ),
+            },
+            "artifacts": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Absolute paths this phase produced. Verified to exist "
+                    "when stored and again when shown to a retry; paths that "
+                    "are gone are dropped."
                 ),
             },
             "board": _board_schema_prop(),

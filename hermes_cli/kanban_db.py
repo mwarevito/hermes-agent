@@ -7892,6 +7892,78 @@ def heartbeat_worker(
     return True
 
 
+def record_checkpoint(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    step_key: str,
+    artifacts: Optional[list] = None,
+    note: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Persist "this phase is FINISHED" so a retry resumes instead of redoing it.
+
+    Motivation (2026-08-06 measurements): a retried card reloaded skills 9 and 8
+    times and re-ran the gate 7-8 times, while the one card that succeeded did
+    each exactly once. Nothing survived a restart, so every retry began at zero.
+
+    ⛑ Deliberately NOT a heartbeat: this does NOT touch ``last_heartbeat_at``.
+    A heartbeat says the process is alive; a checkpoint says the work MOVED.
+    Conflating the two is exactly what let 30 minutes of green heartbeats hide a
+    silent timeout on 2026-08-06.
+
+    ⛑ The event kind is ``checkpoint``, and task_liveness_watchdog counts it as
+    progress ONLY when ``step_key`` DIFFERS from the previous checkpoint. That
+    coupling is load-bearing in the other direction too: emitting this event on a
+    timer with an unchanged key would blind DET-E, the only detector built for
+    that incident. Name the phase you finished, not the one you are starting.
+
+    Artifacts are verified against disk here rather than trusted: a path that no
+    longer exists is dropped, so a resumed worker is never pointed at a file that
+    was cleaned up between runs. Returns True only when a checkpoint was written.
+    """
+    key = " ".join(str(step_key or "").split())[:64].strip()
+    if not key:
+        return False
+    kept = []
+    for raw in (artifacts or []):
+        if len(kept) >= 20:
+            break
+        try:
+            sp = str(raw)
+        except Exception:
+            continue
+        if os.path.isabs(sp) and os.path.exists(sp):
+            kept.append(sp)
+    now = int(time.time())
+    with write_txn(conn):
+        if expected_run_id is None:
+            cur = conn.execute(
+                "UPDATE tasks SET current_step_key = ? "
+                "WHERE id = ? AND status = 'running'",
+                (key, task_id),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE tasks SET current_step_key = ? "
+                "WHERE id = ? AND status = 'running' AND current_run_id = ?",
+                (key, task_id, int(expected_run_id)),
+            )
+        if cur.rowcount != 1:
+            return False
+        run_id = (
+            int(expected_run_id)
+            if expected_run_id is not None
+            else _current_run_id(conn, task_id)
+        )
+        payload = {"step_key": key, "artifacts": kept}
+        if note:
+            payload["note"] = str(note)[:500]
+        _append_event(conn, task_id, "checkpoint", payload, run_id=run_id)
+        _ = now
+    return True
+
+
 def _signal_worker_tree(pid, sig, *, kill=None, killpg=None):
     """Deliver ``sig`` to the worker and everything it started.
 
@@ -10137,6 +10209,58 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
     lines.append("")
+
+    # Resume checkpoint — the newest checkpoint from a PREVIOUS, FINISHED run.
+    #
+    # ⛑ Rendered BELOW the task statement on purpose: a 64-char slug the worker
+    # itself wrote must never outrank what the human asked for. It is a pointer
+    # to where the last attempt got to, not an instruction.
+    #
+    # ⛑ Only checkpoints from a run that has ENDED are shown. A live sibling
+    # run's checkpoint must never leak into another worker's prompt, and this
+    # run's own checkpoints are not news to itself.
+    #
+    # Artifacts are re-verified against disk at render time: the workspace of a
+    # completed task is rmtree'd by _cleanup_workspace, so a path recorded last
+    # run may simply be gone. Pointing a retry at a file that no longer exists is
+    # worse than saying nothing.
+    try:
+        ck = conn.execute(
+            "SELECT e.payload AS payload, e.created_at AS created_at "
+            "FROM task_events e "
+            "LEFT JOIN task_runs r ON r.id = e.run_id "
+            "WHERE e.task_id = ? AND e.kind = 'checkpoint' "
+            "  AND (e.run_id IS NULL OR e.run_id != COALESCE(?, -1)) "
+            "  AND (r.id IS NULL OR r.ended_at IS NOT NULL) "
+            "ORDER BY e.id DESC LIMIT 1",
+            (task_id, task.current_run_id),
+        ).fetchone()
+    except Exception:
+        ck = None
+    if ck is not None:
+        try:
+            data = json.loads(ck["payload"] or "{}") or {}
+        except Exception:
+            data = {}
+        step = str(data.get("step_key") or "").strip()
+        if step:
+            alive = [a for a in (data.get("artifacts") or [])
+                     if isinstance(a, str) and os.path.exists(a)]
+            lines.append("## Resume checkpoint")
+            lines.append(
+                f"A previous run of THIS task finished the phase `{step}`. "
+                f"Start after it — do not redo it unless its artifacts are missing."
+            )
+            if alive:
+                lines.append("Artifacts it produced (verified present just now):")
+                for a in alive[:20]:
+                    lines.append(f"- {a}")
+            else:
+                lines.append(
+                    "None of its artifacts still exist on disk, so treat the phase "
+                    "as unverified and re-check before relying on it."
+                )
+            lines.append("")
 
     if task.body and task.body.strip():
         lines.append("## Body")

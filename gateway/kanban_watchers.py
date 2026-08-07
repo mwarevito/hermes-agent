@@ -34,6 +34,10 @@ logger = logging.getLogger("gateway.run")
 # they must still be claimed so they can't wedge a later completed/blocked event
 # behind an unresolved row. "block_loop_detected" is the triage hand-off that
 # exists to force human attention, so it gets its own loud message.
+# Platforms that no messaging gateway adapter will ever serve. A subscription on
+# one of these is not "waiting for the adapter to connect" — it is dead mail.
+_UNDELIVERABLE_PLATFORMS = frozenset({"tui", "cli", ""})
+
 TERMINAL_KINDS = (
     "completed", "blocked", "gave_up", "crashed", "timed_out",
     "status", "archived", "unblocked", "block_loop_detected",
@@ -444,10 +448,27 @@ class GatewayKanbanWatchersMixin:
                                             continue
                                     platform = (sub.get("platform") or "").lower()
                                     if platform not in active_platforms:
-                                        logger.debug(
-                                            "kanban notifier: subscription for %s on %s skipped; adapter not connected",
-                                            sub.get("task_id"), platform or "<missing>",
-                                        )
+                                        # A disconnected adapter is transient and
+                                        # normal (debug). A platform this gateway
+                                        # can never serve is a card whose result
+                                        # has nowhere to go, forever — say so at
+                                        # WARNING. 2026-08-06: three cards sat on
+                                        # platform='tui' whose chat_id encoded a
+                                        # Telegram address; nothing delivered them
+                                        # and nothing complained.
+                                        if platform in _UNDELIVERABLE_PLATFORMS:
+                                            logger.warning(
+                                                "kanban notifier: task %s is subscribed on platform %r "
+                                                "(chat_id=%r) which no gateway adapter can deliver — this "
+                                                "result will never reach anyone. Re-subscribe the task.",
+                                                sub.get("task_id"), platform or "<missing>",
+                                                sub.get("chat_id"),
+                                            )
+                                        else:
+                                            logger.debug(
+                                                "kanban notifier: subscription for %s on %s skipped; adapter not connected",
+                                                sub.get("task_id"), platform or "<missing>",
+                                            )
                                         continue
                                     # Durably lease this sub's unseen terminal
                                     # events. The cursor is NOT advanced here —
@@ -475,10 +496,19 @@ class GatewayKanbanWatchersMixin:
                                         # moves the cursor: a dropped refresh is
                                         # cosmetic, unlike a dropped terminal
                                         # ping.
+                                        # NB: no card_message_id requirement.
+                                        # Requiring one meant only a task that
+                                        # had ALREADY been messaged could get a
+                                        # progress card — and the only thing
+                                        # that messaged first was the terminal
+                                        # event. Nothing was ever sent while
+                                        # work was in flight (2026-08-06).
+                                        # card_updated_at is 0 when no card
+                                        # exists, so the first tick in `running`
+                                        # creates it and later ticks edit it.
                                         if (
                                             task is not None
                                             and getattr(task, "status", "") == "running"
-                                            and sub.get("card_message_id")
                                         ):
                                             last = sub.get("card_updated_at") or 0
                                             if (time.time() - float(last)) >= CARD_REFRESH_SECONDS:

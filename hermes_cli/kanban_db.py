@@ -3625,8 +3625,10 @@ def _inherit_notify_subs(
         f"""
         INSERT OR IGNORE INTO kanban_notify_subs
             (task_id, platform, chat_id, thread_id, user_id,
-             notifier_profile, created_at, last_event_id)
-        SELECT ?, platform, chat_id, thread_id, user_id, notifier_profile, ?, ?
+             notifier_profile, created_at, last_event_id,
+             chat_type, delivery_metadata)
+        SELECT ?, platform, chat_id, thread_id, user_id, notifier_profile, ?, ?,
+               chat_type, delivery_metadata
           FROM kanban_notify_subs
          WHERE task_id IN ({placeholders})
         """,
@@ -7890,6 +7892,47 @@ def heartbeat_worker(
     return True
 
 
+def _signal_worker_tree(pid, sig, *, kill=None, killpg=None):
+    """Deliver ``sig`` to the worker and everything it started.
+
+    Kanban workers are spawned with ``start_new_session=True``, so the worker pid
+    is its own process-group leader and one ``killpg`` reaches every child it
+    launched (a background Claude Code run, a test subprocess, a git command).
+    Signalling the bare pid instead leaves those children running, unowned, and
+    still holding whatever resource they took — which is exactly how a timed-out
+    kanban worker left a Claude process squatting the launcher's lane slot and
+    guaranteed the retry would time out as well (2026-08-06).
+
+    Group delivery is attempted ONLY when ``os.getpgid(pid) == pid``. A pid that
+    is not its group's leader shares somebody else's group — under a dispatcher
+    running in-gateway that group can be the gateway's own — and killpg there
+    would kill the supervisor along with the worker. In that case, and on any
+    platform without process groups (Windows), fall back to the single pid.
+
+    Returns True if a signal was delivered to the whole group, False if only the
+    single pid was signalled (or nothing was).
+    """
+    _kill = kill if kill is not None else getattr(os, "kill", None)
+    _killpg = killpg if killpg is not None else getattr(os, "killpg", None)
+    _getpgid = getattr(os, "getpgid", None)
+
+    if _killpg is not None and _getpgid is not None:
+        try:
+            if _getpgid(pid) == pid:
+                _killpg(pid, sig)  # windows-footgun: ok — guarded by getattr above
+                return True
+        except (ProcessLookupError, OSError):
+            # Process already gone, or we cannot read its group: fall through to
+            # the single-pid attempt, which will no-op harmlessly if it is dead.
+            pass
+    if _kill is not None:
+        try:
+            _kill(pid, sig)
+        except (ProcessLookupError, OSError):
+            pass
+    return False
+
+
 def enforce_max_runtime(
     conn: sqlite3.Connection,
     *,
@@ -7943,23 +7986,18 @@ def enforce_max_runtime(
             os.kill if hasattr(os, "kill") else None
         )
         if kill is not None:
-            try:
-                kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
+            # Whole group, not just the wrapper — see _signal_worker_tree.
+            _signal_worker_tree(pid, signal.SIGTERM, kill=kill)
             # Short polling wait — no time.sleep on the write txn.
             for _ in range(10):
                 if not _pid_alive(pid):
                     break
                 time.sleep(0.5)
             if _pid_alive(pid):
-                try:
-                    # signal.SIGKILL doesn't exist on Windows.
-                    _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-                    kill(pid, _sigkill)
-                    killed = True
-                except (ProcessLookupError, OSError):
-                    pass
+                # signal.SIGKILL doesn't exist on Windows.
+                _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+                _signal_worker_tree(pid, _sigkill, kill=kill)
+                killed = True
 
         with write_txn(conn):
             cur = conn.execute(

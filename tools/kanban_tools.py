@@ -1352,6 +1352,60 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(f"kanban_create: {e}")
 
 
+# Session keys are built as ``agent:main:{platform}:{chat_type}:{chat_id}:
+# {thread_id}[:{user_id}]`` (gateway/run.py). A key therefore CARRIES a real
+# delivery address whenever the session came from a gateway — filing it under
+# platform 'tui' throws that address away and makes the card undeliverable.
+_SESSION_KEY_PLATFORMS = frozenset(
+    {"telegram", "discord", "slack", "whatsapp", "signal", "matrix", "imessage"}
+)
+
+
+def _decode_session_key(key: str):
+    """(platform, chat_type, chat_id, thread_id, user_id) or None.
+
+    None means the key names no known gateway platform — a genuine TUI/local
+    key — and the caller should fall back to the 'tui' subscription.
+    """
+    parts = [p for p in (key or "").split(":")]
+    if len(parts) < 5 or parts[0] != "agent":
+        return None
+    platform = parts[2].strip().lower()
+    if platform not in _SESSION_KEY_PLATFORMS:
+        return None
+    chat_type = parts[3].strip() or None
+    chat_id = parts[4].strip()
+    if not chat_id:
+        return None
+    thread_id = parts[5].strip() if len(parts) > 5 and parts[5].strip() else None
+    user_id = parts[6].strip() if len(parts) > 6 and parts[6].strip() else None
+    return platform, chat_type, chat_id, thread_id, user_id
+
+
+def _worker_task_subscription(conn):
+    """The address of the task THIS worker is running, if we are a worker.
+
+    A kanban worker is a CLI subprocess: it has no gateway ContextVars, so
+    without this it either invents a dead 'tui' row or registers nothing at all
+    (the 2026-08-06 root card). But its own card knows where its output goes,
+    and a card it spawns belongs to the same conversation. Prefers a real
+    gateway platform; a 'tui' parent row is no better than what we would invent.
+    """
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if not task_id:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT platform, chat_id, thread_id, user_id, chat_type, delivery_metadata "
+            "FROM kanban_notify_subs WHERE task_id = ? AND platform != 'tui' "
+            "AND COALESCE(chat_id, '') != '' ORDER BY created_at DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    except Exception:
+        return None
+    return row
+
+
 def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     """Auto-subscribe the calling session to task completion / block events.
 
@@ -1401,6 +1455,9 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
 
     platform = ""
     chat_id = ""
+    # Set when the delivery address had to be recovered from the session key
+    # rather than read from ContextVars; carries (chat_type, thread, user).
+    _from_session_key = None
     try:
         from gateway.session_context import get_session_env
         platform = get_session_env("HERMES_SESSION_PLATFORM", "")
@@ -1423,13 +1480,44 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
                 get_session_env("HERMES_SESSION_KEY", "")
                 or os.environ.get("HERMES_SESSION_KEY", "")
             )
-            if not session_key:
-                return False  # CLI / cron / test — no persistent channel
-            platform = "tui"
-            chat_id = session_key
+            decoded = _decode_session_key(session_key)
+            if decoded:
+                # The key names a real gateway address; use it rather than
+                # filing a deliverable card under the undeliverable 'tui'
+                # platform (2026-08-06: three cards lost exactly this way).
+                platform, _key_chat_type, chat_id, _key_thread, _key_user = decoded
+                _from_session_key = (_key_chat_type, _key_thread, _key_user)
+            elif not session_key:
+                _from_session_key = None
+                platform = ""
+                chat_id = ""
+            else:
+                _from_session_key = None
+                platform = "tui"
+                chat_id = session_key
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
         chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or None
+        # A decoded session key carries thread/user/chat_type too — the
+        # ContextVars are empty in exactly the case where we decoded one.
+        if _from_session_key:
+            chat_type = chat_type or _from_session_key[0]
+            thread_id = thread_id or _from_session_key[1]
+            user_id = user_id or _from_session_key[2]
+        if not platform or not chat_id:
+            # Last resort before giving up: a kanban worker borrows the address
+            # of the card it is running. Its child cards belong to the same
+            # conversation, and without this the card is created addressless
+            # and its result has nowhere to go (2026-08-06 root card).
+            _own = _worker_task_subscription(conn)
+            if _own is not None:
+                platform = _own["platform"]
+                chat_id = _own["chat_id"]
+                thread_id = thread_id or _own["thread_id"]
+                user_id = user_id or _own["user_id"]
+                chat_type = chat_type or _own["chat_type"]
+            else:
+                return False  # CLI / cron / test — no persistent channel
         message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "") or ""
         # Upstream v2026.8.3 prefers the per-session profile env here; keep that
         # preference, but the never-NULL floor stays our single source of truth

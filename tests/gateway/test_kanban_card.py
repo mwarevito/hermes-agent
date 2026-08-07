@@ -378,3 +378,57 @@ def test_artifact_send_failure_is_logged_with_task_id(tmp_path, monkeypatch, cap
         "провал загрузки артефакта обязан попасть в WARNING с id задачи, "
         f"а не потеряться молча; получили: {warnings}"
     )
+
+
+# ── start card (2026-08-06): work must be visible while it runs ─────────────
+
+
+def test_start_card_is_created_while_the_task_is_still_running(tmp_path, monkeypatch):
+    """A running task with no card yet must get one.
+
+    The refresh path used to require an existing ``card_message_id``, and the
+    only thing that ever created one was a terminal delivery — so nothing was
+    ever sent while work was in flight. On 2026-08-06 that turned 2.5 hours of
+    kanban work into total silence from the outside.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "startcard.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="долгая задача", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (tid,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert _sub_row(tid)["card_message_id"] is None, "предусловие: карточки ещё нет"
+
+    adapter = CardAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1, (
+        "пока задача идёт, должна появиться карточка — раньше не появлялось ничего"
+    )
+    assert _sub_row(tid)["card_message_id"] is not None, (
+        "id обязан лечь в подписку, иначе следующий тик пришлёт вторую карточку"
+    )
+
+
+def test_no_card_for_a_task_that_is_not_running(tmp_path, monkeypatch):
+    """Only in-flight work gets a card — a queued task must stay silent."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "startcard2.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="в очереди", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+    finally:
+        conn.close()
+
+    adapter = CardAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == [], "задача в очереди не должна слать карточку"

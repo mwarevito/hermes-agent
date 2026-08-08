@@ -9019,12 +9019,48 @@ class TelegramAdapter(BasePlatformAdapter):
             if text:
                 return reply_to_id, text
         
+        # A forum topic's service root is not something anyone quoted: Telegram
+        # points every message in a topic at it. Announcing it as an
+        # unrecoverable quote invents a conversation that never happened, and
+        # 2026-08-08 showed what the agent then does — told there IS context it
+        # cannot see, it fills the hole with a guess. Keep the id (routing still
+        # needs it) and say nothing about content.
+        if reply_to_id and self._telegram_reply_is_topic_root(
+            raw_payload, reply_payload, reply_to_id
+        ):
+            return reply_to_id, None
+
         # When reply_to_id exists but text could not be recovered,
         # use a placeholder so gateway/run.py still injects the "[Replying to: ...]" prefix.
         # This ensures the agent knows a reply context exists even if content is privacy-hidden.
         if reply_to_id:
             return reply_to_id, f"[Reply #{reply_to_id} — content unavailable]"
         return reply_to_id, None
+
+    @staticmethod
+    def _telegram_reply_is_topic_root(raw_payload, reply_payload, reply_to_id) -> bool:
+        """True if the "reply" points at a forum topic's own service root.
+
+        Telegram threads a topic by making every message in it a reply to the
+        topic-creation message, so ``reply_to_message`` is present for messages
+        nobody replied to. Two independent tells, because either can be absent
+        depending on how the update was serialised:
+
+        * ``message_thread_id`` equals the replied-to id — the defining property
+          of the topic root;
+        * the replied-to payload carries ``forum_topic_created`` /
+          ``forum_topic_edited`` — a service message, not someone's words.
+        """
+        if not reply_to_id:
+            return False
+        thread_id = raw_payload.get("message_thread_id") if isinstance(raw_payload, dict) else None
+        if thread_id is not None and str(thread_id) == str(reply_to_id):
+            return True
+        if isinstance(reply_payload, dict):
+            for key in ("forum_topic_created", "forum_topic_edited", "forum_topic_reopened"):
+                if reply_payload.get(key) is not None:
+                    return True
+        return False
 
     @staticmethod
     def _telegram_reply_context_missing_fallback_allowed(text: str) -> bool:

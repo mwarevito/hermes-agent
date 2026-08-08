@@ -5443,6 +5443,49 @@ def carry_run_owner_session(
         )
 
 
+#: A card declares its acceptance criteria as markdown checkboxes. Anything else
+#: in the body is prose and is not treated as a criterion.
+_CRITERION_RE = re.compile(r"^\s*[-*]\s*\[[ xX]\]\s*(?P<text>\S.*?)\s*$", re.M)
+#: A verdict is the criterion's own words followed by an explicit outcome token.
+_VERDICT_TOKENS = ("PASS", "FAIL", "ПРОШЛО", "НЕ ПРОШЛО", "OK", "БЛОКЕР")
+
+
+def _declared_criteria(body: Optional[str]) -> list:
+    """Acceptance criteria a card declares, in order. Empty when it declares none."""
+    if not body:
+        return []
+    return [m.group("text") for m in _CRITERION_RE.finditer(body)]
+
+
+def _unaddressed_criteria(body: Optional[str], verdict_text: Optional[str]) -> list:
+    """Criteria the completion text says nothing about.
+
+    2026-08-08: a reviewer looped five times and returned "APPROVED 10/10"
+    having checked exactly one thing — contact provenance — while the card
+    listed more. A single global verdict cannot be wrong per-axis, because it
+    has no axes; it can only be wrong all at once, and nothing downstream can
+    tell a thorough approval from a lazy one.
+
+    Deliberately OPT-IN: a card that declares no criteria is unaffected, so this
+    changes nothing for the boards as they are today and only binds the cards
+    that ask to be bound. A guard that blocked every completion would be
+    switched off within a day, and then the axes would be unenforced AND
+    unenforceable.
+
+    Matching is on the criterion's own words plus an explicit outcome token
+    somewhere in the text — enough to make a per-axis statement mandatory,
+    without pretending to judge whether the statement is true.
+    """
+    criteria = _declared_criteria(body)
+    if not criteria:
+        return []
+    text = (verdict_text or "")
+    if not any(tok.lower() in text.lower() for tok in _VERDICT_TOKENS):
+        return list(criteria)
+    lowered = text.lower()
+    return [c for c in criteria if c.lower() not in lowered]
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5493,6 +5536,27 @@ def complete_task(
     # and are never gated. owner IS NULL -> fall through (legacy run, or the
     # boot-stamp has not landed yet; safe, because a subagent can only run
     # AFTER the worker's first turn, by which point the stamp exists).
+    #
+    # A card that declares acceptance criteria may not be closed with a verdict
+    # that ignores some of them. Opt-in by construction: a card declaring none
+    # is untouched. See _unaddressed_criteria for the 2026-08-08 incident.
+    _body_row = conn.execute(
+        "SELECT body FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    _body_text = _body_row["body"] if _body_row else None
+    _missing = _unaddressed_criteria(_body_text, summary or result)
+    if _missing:
+        _declared = _declared_criteria(_body_text)
+        raise ValueError(
+            "task %s declares %d acceptance criteria and the completion says "
+            "nothing about %d of them: %s. State a verdict per criterion "
+            "(quote it, then PASS/FAIL) — a single global 'approved' cannot be "
+            "wrong per-axis, which is how a reviewer approved 10/10 on "
+            "2026-08-08 having checked one thing."
+            % (task_id, len(_declared), len(_missing),
+               "; ".join(c[:60] for c in _missing[:5]))
+        )
+
     if require_owner:
         _rid = expected_run_id
         if _rid is None:

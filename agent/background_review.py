@@ -29,6 +29,38 @@ from agent.thread_scoped_output import thread_scoped_silence
 logger = logging.getLogger(__name__)
 
 
+def _gate_ceremony_tool_names() -> set:
+    """Tools belonging to plugins that gate tool calls — never deniable here.
+
+    A plugin registering ``pre_tool_call`` can refuse a tool and demand its own
+    ceremony first ("classify this turn"). If the review whitelist excludes that
+    plugin's tools, the refusal cannot be answered and the review thread wedges:
+    every tool is refused pending a ceremony whose tool is itself refused. That
+    is a deadlock, not a policy.
+
+    Runtime registration is the source of truth (``hooks_registered`` /
+    ``tools_registered``), not the manifest: a plugin that merely *declares* a
+    hook it never registers is not a gate and gets nothing. Any failure to read
+    the registry returns an empty set — the caller then keeps the previous,
+    stricter whitelist rather than opening up on an error path.
+    """
+    try:
+        from hermes_cli.plugins import get_plugin_manager
+
+        manager = get_plugin_manager()
+        names: set = set()
+        for loaded in getattr(manager, "_plugins", {}).values():
+            if not getattr(loaded, "enabled", False):
+                continue
+            if "pre_tool_call" not in (getattr(loaded, "hooks_registered", None) or []):
+                continue
+            names.update(getattr(loaded, "tools_registered", None) or [])
+        return names
+    except Exception:  # pragma: no cover - defensive; see docstring
+        logger.debug("background review: could not read gate tool names", exc_info=True)
+        return set()
+
+
 # ---------------------------------------------------------------------------
 # Background-review aux-model selector + routed digest.
 #
@@ -900,11 +932,28 @@ def _run_review_in_thread(
                     quiet_mode=True,
                 )
             }
+            # A gate plugin's OWN tools can never be denied here, or the review
+            # deadlocks: a pre_tool_call gate answers the first tool call with
+            # "classify this turn first", and if its classifier is not on the
+            # whitelist the turn can neither proceed nor satisfy the gate. That
+            # exact standoff happened five times on 2026-08-08 (14:17:59,
+            # 14:38:32, 15:14:49, 15:39:10, 15:46:09) — the tool was refused
+            # with "classify this turn first" and novel_task_classify was
+            # refused as non-whitelisted.
+            #
+            # The rule is deliberately about the CLASS, not about one plugin: a
+            # plugin that registers pre_tool_call is a gate, and a gate's own
+            # bookkeeping tools are the only way to answer it. Reading the
+            # RUNTIME registration (hooks_registered / tools_registered) rather
+            # than the manifest keeps this honest — a plugin that declares a
+            # hook it never registers grants nothing.
+            review_whitelist |= _gate_ceremony_tool_names()
             set_thread_tool_whitelist(
                 review_whitelist,
                 deny_msg_fmt=(
                     "Background review denied non-whitelisted tool: "
-                    "{tool_name}. Only memory/skill tools are allowed."
+                    "{tool_name}. Only memory/skill tools and gate ceremony "
+                    "tools are allowed."
                 ),
             )
             try:

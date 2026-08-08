@@ -218,6 +218,14 @@ def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None
 # long single-call MCP workflows.
 DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
 
+# How long an auto-derived idempotency key suppresses an identical, unstarted
+# card. Half an hour: an orchestrator's double-tap happens within seconds, while
+# genuinely re-filing the same work usually happens later and after the previous
+# card ran. Raise with HERMES_KANBAN_AUTO_IDEMPOTENCY_WINDOW; 0 disables it.
+AUTO_IDEMPOTENCY_WINDOW = int(
+    os.environ.get("HERMES_KANBAN_AUTO_IDEMPOTENCY_WINDOW", str(30 * 60))
+)
+
 # If a worker's PID is still alive but its ``last_heartbeat_at`` is
 # older than this when ``release_stale_claims`` runs, treat the worker
 # as wedged and reclaim regardless of PID liveness (#29747 gap 3).
@@ -3437,6 +3445,39 @@ def create_task(
             return row["id"]
 
     now = int(time.time())
+
+    # An orchestrator that forgets the key still must not double-file a card.
+    # 2026-08-08: duplicates were created twice in one day, and by 19:38 five
+    # llucky and eleven hermes-infra cards sat in todo without a single start —
+    # among them exact copies of cards that were already running. Deduplication
+    # existed the whole time; nothing passed a key to it. So derive one.
+    #
+    # Scoped narrowly on purpose: an auto key only matches ANOTHER auto key
+    # (never an explicit one), only against a card that has not started and is
+    # still open, and only inside a short window. Filing the same card twice
+    # tomorrow, or re-filing one whose predecessor already ran, is legitimate
+    # work — this catches the double-tap, not the repeat.
+    if not idempotency_key and AUTO_IDEMPOTENCY_WINDOW > 0:
+        auto_key = "auto:" + hashlib.sha1(
+            "\x1f".join((
+                str(title or ""), str(body or ""), str(assignee or ""),
+            )).encode("utf-8", "replace")
+        ).hexdigest()
+        row = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? "
+            "AND status IN ('todo', 'ready') "
+            "AND started_at IS NULL "
+            "AND created_at >= ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (auto_key, now - AUTO_IDEMPOTENCY_WINDOW),
+        ).fetchone()
+        if row:
+            _log.info(
+                "kanban: card %r already filed as %s within %ds - not duplicating",
+                str(title)[:60], row["id"], AUTO_IDEMPOTENCY_WINDOW,
+            )
+            return row["id"]
+        idempotency_key = auto_key
 
     # Resolve workspace_path from board-level default_workdir when the
     # caller did not specify one explicitly. Board defaults represent

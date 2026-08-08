@@ -226,6 +226,44 @@ AUTO_IDEMPOTENCY_WINDOW = int(
     os.environ.get("HERMES_KANBAN_AUTO_IDEMPOTENCY_WINDOW", str(30 * 60))
 )
 
+
+def _dependency_wait_is_repeating(conn, task_id: str, reason) -> bool:
+    """True if the LAST dependency wait on this task gave the identical reason.
+
+    A dependency wait routes the task back to ``todo`` on purpose — parents may
+    still finish. But an identical verdict twice in a row means the previous run
+    changed nothing the next run reads, so a third attempt cannot differ either;
+    on 2026-08-08 that produced five consecutive runs and 7m35s of pure cycle.
+
+    Only the most recent dependency_wait is compared, not the whole history: a
+    task that waits, progresses, and later waits again for the same reason is
+    making progress between the two, and must not be punished for it.
+
+    Any read failure answers False — an unreadable history must not invent an
+    escalation, and the loop it fails to catch is the status quo, not a
+    regression.
+    """
+    if reason is None:
+        return False
+    try:
+        row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'dependency_wait' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    except Exception:
+        return False
+    if not row:
+        return False
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except Exception:
+        return False
+    prior = payload.get("reason") if isinstance(payload, dict) else None
+    if prior is None:
+        return False
+    return str(prior).strip() == str(reason).strip()
+
 # If a worker's PID is still alive but its ``last_heartbeat_at`` is
 # older than this when ``release_stale_claims`` runs, treat the worker
 # as wedged and reclaim regardless of PID liveness (#29747 gap 3).
@@ -6335,6 +6373,21 @@ def block_task(
         # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
         # here (rather than ``blocked``) is what keeps a cron from ever seeing
         # a dependency-wait as something to "unblock".
+        # A dependency wait that repeats VERBATIM is not waiting, it is looping.
+        # 2026-08-08: five consecutive runs returned an identical dependency
+        # verdict — 7 minutes 35 seconds of pure cycle — because a dependency
+        # wait always routes back to ``todo`` and nothing counts the repeat. The
+        # first identical repeat is the signal: the previous run changed nothing
+        # that the next run reads, so a third attempt cannot differ either.
+        # Escalate to the human bucket, where it is visible, instead of spinning.
+        if kind == "dependency" and _dependency_wait_is_repeating(conn, task_id, reason):
+            kind = "needs_input"
+            reason = (
+                "%s\n\n(эскалировано: тот же самый dependency-вердикт повторился "
+                "подряд — предыдущий прогон не изменил ничего, что читает следующий, "
+                "поэтому ожидание превратилось в петлю)" % (reason or "dependency wait")
+            )
+
         if kind == "dependency":
             cur = conn.execute(
                 """

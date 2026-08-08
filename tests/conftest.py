@@ -1725,3 +1725,211 @@ def _repo_mutation_guard(request, monkeypatch):
         if hasattr(_subprocess, _name):
             _wrap(_name)
     yield
+
+
+# ---------------------------------------------------------------------------
+# Repo-mutation guard — a test may never `git checkout`/`reset` a REAL clone.
+#
+# This is the most expensive lesson of 2026-08-08, learned twice in one day.
+#
+# 13:18 — a full ``tests/hermes_cli`` run whose cwd was inside
+# ``~/.hermes/hermes-agent`` executed the update-machinery tests, which performed
+# a real ``checkout main`` + ``reset --hard origin/main`` in that repo. All 23
+# local patches vanished from disk; the personal gateway restarted onto upstream
+# code 27 seconds later; the Telegram Business secretary died, and Sandro's
+# messages were silently rejected for six hours before a human noticed.
+#
+# 23:46 — the SAME accident, again, from the same command, while deliberately
+# re-running that suite to attribute red tests against a clean base. The reflog
+# of both repos reads identically: ``checkout: moving ... to main`` then
+# ``reset: moving to origin/main``.
+#
+# Twice in one day by two different intentions is not carelessness, it is a
+# missing guard. ``HERMES_HOME`` isolation does not help — that redirects state,
+# while this is about the CWD the tests run git against.
+#
+# So: any git subprocess whose verb can move HEAD or discard the working tree,
+# aimed at a protected clone, raises instead of running. Tests that legitimately
+# exercise the updater already build a throwaway repo under ``tmp_path`` and are
+# unaffected. ``hermes-deploy`` is unaffected too: it runs tests with the live
+# repo as cwd but never asks them to mutate it.
+#
+# Escape hatches, in order of preference:
+#   * run the suite from a scratch copy (what you almost always want);
+#   * HERMES_TESTS_PROTECTED_REPOS=<paths> to re-point the guard;
+#   * HERMES_TESTS_ALLOW_REPO_MUTATION=1 to disable it for one run;
+#   * @pytest.mark.repo_mutation_guard_bypass on a single test.
+# ---------------------------------------------------------------------------
+
+_REPO_MUTATION_GUARD_BYPASS_MARK = "repo_mutation_guard_bypass"
+
+#: git verbs that can move HEAD or throw away tracked work. ``stash`` is here
+#: because ``stash``/``stash pop`` is how the updater hides and restores the very
+#: patches this guard exists to protect.
+_GIT_MUTATION_VERBS = frozenset({
+    "checkout", "switch", "reset", "clean", "restore", "stash",
+})
+
+
+def _hermes_protected_repo_roots():
+    """Every real hermes clone on this machine, discovered rather than listed.
+
+    Hard-coding two paths was not enough: an inventory on 2026-08-09 found SEVEN
+    clones (hermes-bgfix, -staging, -pristine, -upgrade, -givi-reply-fix, -dev,
+    plus the live one), and production code had been deployed from one of them
+    whose branch exists on no network remote. A guard that protects two of seven
+    protects nothing in particular — the next accident just picks a different
+    directory.
+
+    So: the live repo, plus any direct child of $HOME that looks like a hermes
+    checkout (a git repo containing ``hermes_cli/``). A future clone is covered
+    the day it is created, without anyone remembering to add it here.
+    """
+    raw = os.environ.get("HERMES_TESTS_PROTECTED_REPOS")
+    if raw is not None:
+        candidates = [p for p in raw.split(os.pathsep) if p.strip()]
+    else:
+        home = os.path.expanduser("~")
+        candidates = [os.path.join(home, ".hermes", "hermes-agent")]
+        try:
+            for name in os.listdir(home):
+                path = os.path.join(home, name)
+                if os.path.isdir(os.path.join(path, "hermes_cli")):
+                    candidates.append(path)
+        except OSError:
+            pass
+    roots = []
+    for path in candidates:
+        try:
+            resolved = os.path.realpath(path)
+        except OSError:
+            continue
+        if os.path.isdir(os.path.join(resolved, ".git")) or os.path.exists(
+            os.path.join(resolved, ".git")
+        ):
+            roots.append(resolved)
+    return roots
+
+
+def _hermes_git_mutation_target(cmd, cwd):
+    """Return the directory a destructive git command would act on, else None.
+
+    Understands ``git -C <path>`` (which overrides cwd) and the wrapper forms
+    the live-system guard already taught us to expect — ``env git ...``,
+    ``sudo git ...``. A shell string is inspected token-wise; anything that is
+    not recognisably a git mutation returns None rather than guessing.
+    """
+    if isinstance(cmd, (list, tuple)):
+        tokens = [str(t) for t in cmd]
+    elif isinstance(cmd, str):
+        import shlex as _shlex
+
+        try:
+            tokens = _shlex.split(cmd)
+        except ValueError:
+            return None
+    else:
+        return None
+    if not tokens:
+        return None
+
+    # Skip wrappers until the actual program.
+    i = 0
+    while i < len(tokens) and os.path.basename(tokens[i]) in {"env", "sudo", "setsid", "nohup"}:
+        i += 1
+        # `env FOO=bar git ...`
+        while i < len(tokens) and "=" in tokens[i] and not tokens[i].startswith("-"):
+            i += 1
+    if i >= len(tokens) or os.path.basename(tokens[i]) != "git":
+        return None
+
+    target = cwd if cwd is not None else os.getcwd()
+    verb = None
+    j = i + 1
+    # git's global flags that consume the NEXT token. Without this list a
+    # command like `git -c core.hooksPath=/dev/null checkout main` reads its
+    # config VALUE as the verb and slips past — caught by test on 2026-08-08.
+    value_flags = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
+    while j < len(tokens):
+        tok = tokens[j]
+        if tok == "-C" and j + 1 < len(tokens):
+            target = tokens[j + 1]
+            j += 2
+            continue
+        if tok in value_flags and j + 1 < len(tokens):
+            j += 2
+            continue
+        if tok.startswith("-"):
+            j += 1
+            continue
+        verb = tok
+        break
+    if verb not in _GIT_MUTATION_VERBS:
+        return None
+    return str(target)
+
+
+def _hermes_repo_mutation_refusal(cmd, cwd, roots):
+    """The refusal message, or None if this command is allowed."""
+    target = _hermes_git_mutation_target(cmd, cwd)
+    if target is None:
+        return None
+    try:
+        resolved = os.path.realpath(target)
+    except OSError:
+        return None
+    for root in roots:
+        if resolved == root or resolved.startswith(root + os.sep):
+            return (
+                "repo-mutation guard: refusing a destructive git command against the "
+                "protected clone %s.\n"
+                "  command: %s\n"
+                "This is the 2026-08-08 accident: a test suite run with its cwd inside a real "
+                "clone performed `checkout main` + `reset --hard origin/main` there, wiping 23 "
+                "local patches and killing the Telegram Business secretary for six hours. It "
+                "happened twice that day.\n"
+                "Run the suite from a scratch copy, or set HERMES_TESTS_ALLOW_REPO_MUTATION=1 "
+                "if you are certain this repo is disposable." % (root, cmd)
+            )
+    return None
+
+
+@pytest.fixture(autouse=True)
+def _repo_mutation_guard(request, monkeypatch):
+    """Refuse destructive git commands aimed at a real hermes clone."""
+    if os.environ.get("HERMES_TESTS_ALLOW_REPO_MUTATION") == "1":
+        yield
+        return
+    if request.node.get_closest_marker(_REPO_MUTATION_GUARD_BYPASS_MARK):
+        yield
+        return
+    roots = _hermes_protected_repo_roots()
+    if not roots:
+        yield
+        return
+
+    import subprocess as _subprocess
+
+    def _wrap(name):
+        real = getattr(_subprocess, name)
+
+        def _guarded(*args, **kwargs):
+            cmd = kwargs.get("args") if "args" in kwargs else (args[0] if args else None)
+            refusal = _hermes_repo_mutation_refusal(cmd, kwargs.get("cwd"), roots)
+            if refusal:
+                raise RuntimeError(refusal)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(_subprocess, name, _guarded)
+
+    # Deliberately NOT Popen. Wrapping the CLASS turns it into a function and
+    # breaks every test that uses it as a context manager or checks its type —
+    # measured: 145 errors on top of the suite's own baseline, which is exactly
+    # how a guard earns itself an off-switch. The updater path this exists to
+    # stop goes through subprocess.run, and two independent backstops remain if
+    # something ever reaches for Popen directly: guard-monitor's branch-pin
+    # check and the hourly patch-integrity watchdog.
+    for _name in ("run", "call", "check_call", "check_output"):
+        if hasattr(_subprocess, _name):
+            _wrap(_name)
+    yield

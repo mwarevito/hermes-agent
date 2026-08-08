@@ -138,3 +138,41 @@ def test_target_resolution_falls_back_to_cwd(tmp_path):
 
 def test_a_read_only_verb_has_no_target(tmp_path):
     assert _hermes_git_mutation_target(["git", "status"], str(tmp_path)) is None
+
+
+# --- discovery: every hermes clone on the machine, not a hard-coded pair ------
+
+def test_a_hermes_clone_in_the_home_dir_is_discovered(tmp_path, monkeypatch):
+    """An inventory on 2026-08-09 found SEVEN clones; two were protected.
+
+    Production had been deployed from one of the unprotected ones. A guard that
+    covers a fixed pair just makes the next accident pick a different directory.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_TESTS_PROTECTED_REPOS", raising=False)
+    clone = tmp_path / "hermes-bgfix"
+    (clone / ".git").mkdir(parents=True)
+    (clone / "hermes_cli").mkdir()
+    from tests.conftest import _hermes_protected_repo_roots
+
+    assert os.path.realpath(str(clone)) in _hermes_protected_repo_roots()
+
+
+def test_an_unrelated_home_directory_is_not_protected(tmp_path, monkeypatch):
+    """Discovery must key on the hermes signature, not on being in $HOME."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_TESTS_PROTECTED_REPOS", raising=False)
+    other = tmp_path / "some-other-project"
+    (other / ".git").mkdir(parents=True)
+    from tests.conftest import _hermes_protected_repo_roots
+
+    assert os.path.realpath(str(other)) not in _hermes_protected_repo_roots()
+
+
+def test_an_explicit_env_list_still_overrides_discovery(tmp_path, monkeypatch):
+    repo = tmp_path / "only-this-one"
+    (repo / ".git").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_TESTS_PROTECTED_REPOS", str(repo))
+    from tests.conftest import _hermes_protected_repo_roots
+
+    assert _hermes_protected_repo_roots() == [os.path.realpath(str(repo))]

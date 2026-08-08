@@ -1127,17 +1127,48 @@ class GatewayKanbanWatchersMixin:
         # config from disk, and the notifier calls this every ~5s tick per sub
         # — without the cache the root-DM downgrade would also WARN-spam once
         # per tick for the whole lifetime of a task.
+        # The subscription's OWN stored anchor counts as an anchor. Without this
+        # the resolver asked `_thread_metadata_for_target` — which knows only
+        # the (chat, thread) target, not the subscription — whether an anchor
+        # exists, got "no", and downgraded a perfectly addressable topic to the
+        # root DM. For a user who reaches the bot only through a DM topic the
+        # root DM is not a weaker lane, it is a closed one: Telegram answers
+        # "Forbidden: bot can't initiate conversation with a user". Every
+        # background result for that user then died on a lane chosen *because*
+        # it was believed to be the visible one (observed all day 2026-08-08:
+        # 16 subscriptions, zero deliveries).
+        sub_anchor = None
+        _sub_meta = sub.get("delivery_metadata")
+        if isinstance(_sub_meta, dict):
+            sub_anchor = _sub_meta.get("telegram_reply_to_message_id") or None
+
         cache = getattr(self, "_kanban_thread_meta_cache", None)
         if cache is None:
             cache = {}
             self._kanban_thread_meta_cache = cache
-        key = (str(plat), str(sub.get("chat_id")), str(sub.get("thread_id") or ""))
+        # The anchor is part of the key: it is per-SUBSCRIPTION while the rest of
+        # the key is per-target, so two subscriptions on one topic with different
+        # anchors must not share a cached decision.
+        key = (
+            str(plat),
+            str(sub.get("chat_id")),
+            str(sub.get("thread_id") or ""),
+            str(sub_anchor or ""),
+        )
         if key in cache:
             return dict(cache[key])
 
         meta = self._thread_metadata_for_target(
             plat, sub["chat_id"], sub.get("thread_id") or None, adapter=adapter,
         ) or {}
+        if meta and not meta.get("telegram_reply_to_message_id") and sub_anchor:
+            # Threaded routing is legal again: adopt the subscription's anchor
+            # instead of throwing the thread away. A stale anchor now surfaces as
+            # a FAILED delivery in kanban_notify_deliveries — visible and
+            # retryable — which is strictly better than a send that is refused
+            # every time by design.
+            meta = dict(meta)
+            meta["telegram_reply_to_message_id"] = sub_anchor
         if meta and not meta.get("telegram_reply_to_message_id"):
             from gateway.config import Platform as _Platform
             # Upstream renamed the helper (dropped the leading underscore) in

@@ -24,6 +24,11 @@ from typing import Dict, List, Optional, Set, Any
 
 logger = logging.getLogger(__name__)
 
+#: How often a single unlisted chat may re-announce that it is being dropped.
+#: Once per hour: enough that a long-running gateway cannot hide the hole
+#: forever, rare enough that a chatty unlisted group cannot drown the log.
+_UNLISTED_CHAT_LOG_INTERVAL = 3600.0
+
 
 def _redact_telegram_error_text(error: object) -> str:
     """Redact secrets from Telegram transport errors before logging or returning them."""
@@ -9539,6 +9544,17 @@ class TelegramAdapter(BasePlatformAdapter):
         # exact message as an explicit direct mention. DMs are excluded above.
         allowed = self._telegram_allowed_chats()
         if allowed and chat_id_str not in allowed:
+            # Say it out loud. 2026-08-08: chat -1004386716667 ("Llucky / Ops")
+            # was absent from workbot's allowlist and had been since at least
+            # 25.07, so every forward Vito made into it was dropped here — the
+            # database holds ZERO observed messages from that chat for all
+            # time. Nothing logged, so from the outside the bot simply "did not
+            # react", and the hole stayed invisible for two weeks.
+            #
+            # One line at DEBUG (not INFO): an unlisted chat can be noisy, and a
+            # guard that floods the log at INFO gets muted, which recreates the
+            # blindness by another route.
+            self._log_unlisted_chat_drop(chat_id_str, guest_mention)
             return guest_mention
 
         if guest_mention:
@@ -9556,6 +9572,34 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._telegram_guest_mode() and self._message_mentions_bot(message):
             return True
         return self._message_matches_mention_patterns(message)
+
+    def _log_unlisted_chat_drop(self, chat_id_str: str, guest_mention: bool) -> None:
+        """Announce, once per chat, that messages here are being dropped.
+
+        The rate limit is deliberate and per-chat: the point is to make an
+        unlisted chat DISCOVERABLE, not to narrate every message in it. A first
+        line names the chat and how to admit it; a periodic repeat keeps a
+        long-running gateway from hiding the fact forever, without turning the
+        log into the very noise that gets a guard muted.
+        """
+        if guest_mention:
+            return  # not dropped — guest mode is letting this one through
+        seen = getattr(self, "_unlisted_chat_last_logged", None)
+        if seen is None:
+            seen = {}
+            self._unlisted_chat_last_logged = seen
+        now = time.time()
+        last = seen.get(chat_id_str)
+        if last is not None and now - last < _UNLISTED_CHAT_LOG_INTERVAL:
+            return
+        seen[chat_id_str] = now
+        logger.debug(
+            "[%s] Dropping message from chat %s — not in group_allowed_chats. "
+            "Nothing from this chat is observed or answered. To admit it: add "
+            "%s to telegram.group_allowed_chats in the profile config, or tell "
+            "the bot \"allow this group %s\" from an admin DM.",
+            self.name, chat_id_str, chat_id_str, chat_id_str,
+        )
 
     async def _ensure_forum_commands(self, message) -> None:
         """Lazy-register bot commands for forum supergroups.

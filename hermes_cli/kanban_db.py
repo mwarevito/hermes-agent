@@ -7062,6 +7062,31 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
 # Workspace resolution
 # ---------------------------------------------------------------------------
 
+def _same_dir(a: Optional[Path], b: Optional[Path]) -> bool:
+    """True if two paths name the SAME directory, not merely the same string.
+
+    2026-08-08: task t_923aa7f6 failed to start twice with "not inside a git
+    repo" pointing at a path that was a git repo — twice, so a whole plan was
+    lost and the chain had to be recreated as "(corrected)". The two paths
+    differed only in case (``/Users/tony/Coding/...`` vs ``/Users/tony/coding/...``).
+    macOS is case-insensitive, so both name one directory, but ``Path.resolve()``
+    preserves the case it was given while git reports its own — and ``==`` on
+    Path is a string comparison. The repo root therefore failed to equal itself.
+
+    ``os.path.samefile`` answers with the filesystem (device + inode), which is
+    the only authority on "same directory" across case-folding, symlinks and
+    bind mounts. It needs both paths to exist; when one does not, fall back to
+    ``os.path.normcase`` string comparison, which at least folds case on the
+    platforms where case does not distinguish paths.
+    """
+    if a is None or b is None:
+        return False
+    try:
+        return os.path.samefile(str(a), str(b))
+    except OSError:
+        return os.path.normcase(str(a)) == os.path.normcase(str(b))
+
+
 def _git_toplevel(path: Path) -> Optional[Path]:
     """Return the git toplevel containing ``path``, or ``None`` if not in a repo."""
     try:
@@ -7275,7 +7300,7 @@ def _resolve_worktree_workspace(
         fallback_root = _repo_root_for_worktree_target(requested.parent)
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
-            if fallback.resolve(strict=False) != requested_resolved:
+            if not _same_dir(fallback.resolve(strict=False), requested_resolved):
                 _ensure_git_worktree(fallback_root, fallback, branch_name)
                 return fallback.resolve(strict=False), branch_name
         # No repo to anchor a fallback on (or the occupied path IS this
@@ -7284,7 +7309,7 @@ def _resolve_worktree_workspace(
         return requested_resolved, actual_branch or branch_name
 
     repo_root = _git_toplevel(requested)
-    if repo_root is not None and requested_resolved == repo_root:
+    if repo_root is not None and _same_dir(requested_resolved, repo_root):
         target = repo_root / ".worktrees" / task.id
         _ensure_git_worktree(repo_root, target, branch_name)
         return target, branch_name

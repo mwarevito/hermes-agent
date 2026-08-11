@@ -832,6 +832,36 @@ def skills_list(category: str = None, task_id: str = None) -> str:
         # Sort by category then name
         all_skills = _sort_skills(all_skills)
 
+        # Whether autonomous curation may write to each skill. Without it a
+        # background improvement that got staged instead of applied is
+        # unexplainable from the listing alone — neither the agent nor the user
+        # can see which skills are curator-managed (2026-08-11). One usage-file
+        # read for the whole listing; the dicts are per-call copies, so
+        # annotating them cannot poison the discovery cache.
+        try:
+            from tools import skill_usage
+
+            _usage = skill_usage.load_usage()
+            _managed = {
+                _s.get("name"): skill_usage._is_curator_managed_record(
+                    _usage.get(_s.get("name"))
+                )
+                for _s in all_skills
+            }
+        except Exception:
+            # Warning, not debug: an unreadable usage file degrades every
+            # ownership answer in this listing, which is worth an operator's
+            # attention even though skill discovery itself still works.
+            logger.warning("curator_managed annotation failed", exc_info=True)
+            _managed = {}
+        for _s in all_skills:
+            # ``None`` means "could not be determined". Leaving the key ABSENT
+            # (the first version) is indistinguishable from ``False`` to every
+            # reader, so one unreadable usage file would have quietly relabelled
+            # every skill user-owned — and a partial failure mid-loop would have
+            # done it to an arbitrary suffix of the list (2026-08-11).
+            _s["curator_managed"] = _managed.get(_s.get("name"))
+
         # Extract unique categories
         categories = sorted(
             {s.get("category") for s in all_skills if s.get("category")}

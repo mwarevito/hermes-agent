@@ -298,6 +298,13 @@ def _pinned_guard(name: str) -> Optional[str]:
     return None
 
 
+# Autonomous curation of a USER-OWNED skill is a proposal, not a write. These
+# actions get staged for the owner instead of dropped; deletion is deliberately
+# absent, because #29912 was exactly the consolidation pass archiving live
+# skills, and a no-user-present actor must not queue that either.
+_OWNER_PROPOSAL_ACTIONS = frozenset({"edit", "patch", "write_file"})
+
+
 def _background_review_write_guard(
     name: str,
     skill_dir: Path,
@@ -334,6 +341,7 @@ def _background_review_write_guard(
                     "maintenance. Ask the user to run "
                     f"`hermes curator unpin {name}` if they want it changed."
                 ),
+                "refusal_class": "pinned",
             }
     except Exception:
         logger.debug("pinned skill guard lookup failed for %s", name, exc_info=True)
@@ -348,6 +356,7 @@ def _background_review_write_guard(
                     "the skill lives in skills.external_dirs, which are "
                     "externally owned and read-only to autonomous curation."
                 ),
+                "refusal_class": "external",
             }
     except Exception:
         logger.debug("external skill guard lookup failed for %s", name, exc_info=True)
@@ -361,6 +370,7 @@ def _background_review_write_guard(
                     f"Refusing background curator {action} for protected "
                     f"built-in skill '{name}'."
                 ),
+                "refusal_class": "protected-builtin",
             }
         if skill_usage.is_hub_installed(name):
             return {
@@ -369,6 +379,7 @@ def _background_review_write_guard(
                     f"Refusing background curator {action} for hub-installed "
                     f"skill '{name}'."
                 ),
+                "refusal_class": "hub-installed",
             }
         if skill_usage.is_bundled(name):
             return {
@@ -377,6 +388,7 @@ def _background_review_write_guard(
                     f"Refusing background curator {action} for bundled "
                     f"skill '{name}'."
                 ),
+                "refusal_class": "bundled",
             }
         # Skills that are not curator-managed are off-limits to autonomous
         # curation. This prevents the LLM consolidation pass from mutating
@@ -407,6 +419,19 @@ def _background_review_write_guard(
                     "User-owned skills are off-limits to autonomous curation. "
                     f"Run `hermes curator adopt {name}` to opt it in."
                 ),
+                # The refusal CLASS, not a private routing flag. Two readers
+                # need it and neither may grep the prose above: skill_manage
+                # routes this class to a proposal (ownership is a routing
+                # decision, not a verdict — measured cost of treating it as a
+                # verdict on the live personal bot: 47 dropped improvements
+                # across 10 skills in 3.2 days, none reported), and
+                # summarize_background_review_actions announces THIS class and
+                # no other, because `hermes curator adopt` is a decision only
+                # the user can make. The earlier `_stage_for_owner` key
+                # carried the routing answer instead of the fact, and being
+                # answer-shaped it also leaked our internals into the JSON the
+                # review fork reads (2026-08-11).
+                "refusal_class": "ownership",
             }
     except Exception:
         logger.warning("owned skill guard lookup failed for %s", name, exc_info=True)
@@ -417,6 +442,11 @@ def _background_review_write_guard(
                 "agent ownership could not be verified because the provenance "
                 "record is unavailable or unreadable."
             ),
+            # Deliberately NOT the "ownership" class: `hermes curator adopt`
+            # does not fix an unreadable provenance file, so there is no user
+            # decision to ask for. The operator signal for this one is the
+            # logger.warning above, not a line in the chat.
+            "refusal_class": "ownership-unverifiable",
         }
     return None
 
@@ -448,6 +478,7 @@ def _background_review_read_before_write_guard(
             "retry the write using the content just returned."
         ),
         "_read_before_write_required": True,
+        "refusal_class": "read-before-write",
     }
 
 
@@ -1399,10 +1430,17 @@ _skill_gate_bypass: "_ctxvars.ContextVar[bool]" = _ctxvars.ContextVar(
 )
 
 
-def _apply_skill_write_gate(action, name, **payload_kwargs):
+def _apply_skill_write_gate(action, name, *, force_stage=False,
+                            stage_reason="", **payload_kwargs):
     """Evaluate the skill write gate. Returns a JSON tool-result string when the
     write should NOT proceed (blocked or staged), or None to perform the real
     write. Bypassed during approved-pending replay.
+
+    ``force_stage`` routes ONE case through the pending store regardless of the
+    config flag: a background review improving a user-owned skill. Turning
+    ``skills.write_approval`` on globally would instead stage every foreground
+    write of any origin, which is a ceremony tax on ordinary user-directed
+    edits — the opposite of what this path is for.
     """
     if action not in {"create", "edit", "patch", "delete", "write_file", "remove_file"}:
         return None
@@ -1412,13 +1450,32 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
     try:
         from tools import write_approval as wa
     except Exception:
+        # Fail open for the config-driven gate, but fail CLOSED for an
+        # ownership proposal: with no pending store there is nowhere to park
+        # it, and letting it through would write to the owner's skill.
+        if force_stage:
+            return tool_error(stage_reason, success=False)
         return None  # fail open
 
-    decision = wa.evaluate_gate(wa.SKILLS)
-    if decision.allow:
-        return None
-    if decision.blocked:
-        return tool_error(decision.message, success=False)
+    if force_stage:
+        # Name the surface: the pending queue is reviewable only from the
+        # interactive CLI (hermes_cli.cli_commands_mixin is the sole caller
+        # of handle_pending_subcommand — the gateway has no /skills route),
+        # so telling a Telegram user to "run /skills pending" is a dead end.
+        message = (
+            f"Not applied: '{name}' is user-owned, so autonomous curation may "
+            "only propose. The full change is saved as a pending proposal: "
+            "review it with `/skills pending` in the Hermes CLI on the host, "
+            f"or run `hermes curator adopt {name}` to let the curator write "
+            "to this skill directly from now on."
+        )
+    else:
+        decision = wa.evaluate_gate(wa.SKILLS)
+        if decision.allow:
+            return None
+        if decision.blocked:
+            return tool_error(decision.message, success=False)
+        message = decision.message
 
     # stage — record the full skill_manage kwargs so approval can replay it.
     payload = {"action": action, "name": name}
@@ -1430,10 +1487,31 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
         old_string=payload_kwargs.get("old_string") or "",
         new_string=payload_kwargs.get("new_string") or "",
     )
-    record = wa.stage_write(wa.SKILLS, payload, summary=gist, origin=wa.current_origin())
+    record = None
+    if force_stage:
+        # The review fork re-proposes the same edit on every pass (the live
+        # bot produced 47 attempts in 3.2 days). Reuse a byte-identical pending
+        # record so the owner reviews one proposal, not a queue of duplicates.
+        try:
+            for existing in wa.list_pending(wa.SKILLS):
+                if existing.get("payload") == payload:
+                    record = existing
+                    break
+        except Exception:
+            # Degrades to a duplicate proposal, never to a lost one: the
+            # staging call below runs regardless. Debug level is the right
+            # level for that — the owner still gets the change, just twice —
+            # but it must leave a trace, because a permanently unreadable
+            # pending store would otherwise show up only as a slowly growing
+            # queue with no explanation (2026-08-11).
+            logger.debug("pending dedup lookup failed for %s", name, exc_info=True)
+            record = None
+    if record is None:
+        record = wa.stage_write(wa.SKILLS, payload, summary=gist,
+                                origin=wa.current_origin())
     return json.dumps(
         {"success": True, "staged": True, "pending_id": record["id"],
-         "gist": gist, "message": decision.message},
+         "gist": gist, "message": message},
         ensure_ascii=False,
     )
 
@@ -1528,7 +1606,24 @@ def skill_manage(
     Returns JSON string with results.
     """
     preflight = _background_review_preflight(action, name)
-    if preflight is not None:
+    # Derived from the PUBLIC refusal class plus the action rather than read
+    # from a private key inside the payload: the payload is returned verbatim
+    # to the model on the refusal path, so anything put there for our own
+    # routing is also something the review fork gets to reason about
+    # (2026-08-11).
+    stage_for_owner = (
+        preflight is not None
+        and preflight.get("refusal_class") == "ownership"
+        and action in _OWNER_PROPOSAL_ACTIONS
+    )
+    # An approved replay carries the owner's consent, so the ownership check
+    # that produced the proposal must not refuse its own approved outcome.
+    if stage_for_owner and _skill_gate_bypass.get():
+        preflight = None
+        stage_for_owner = False
+    # Every other preflight refusal (pinned, external, bundled, hub-installed,
+    # unverifiable ownership, autonomous delete) stays a hard refusal.
+    if preflight is not None and not stage_for_owner:
         return json.dumps(preflight, ensure_ascii=False)
 
     # Approval gate: when on, stages the write for review (skills are too large
@@ -1536,7 +1631,10 @@ def skill_manage(
     # (default) passes straight through. The gate is bypassed when this call is
     # itself replaying an already-approved staged write (_skill_apply_pending).
     gate_result = _apply_skill_write_gate(
-        action, name, content=content, category=category,
+        action, name,
+        force_stage=stage_for_owner,
+        stage_reason=(preflight or {}).get("error", ""),
+        content=content, category=category,
         file_path=file_path, file_content=file_content,
         old_string=old_string, new_string=new_string,
         replace_all=replace_all, absorbed_into=absorbed_into,

@@ -607,7 +607,16 @@ class TestBackgroundOwnershipPolicyConsistency:
             "autonomous write policy flipped between two identical attempts: "
             f"first={first.get('success')} second={second.get('success')}"
         )
-        assert first["success"] is False
+        # Since 2026-08-11 the consistent answer is "staged as a proposal for
+        # the owner", not "refused". What #67140 was really about survives
+        # intact and is asserted directly: neither attempt may reach the
+        # owner's file (the old bug let the FIRST one land, then refused the
+        # identical second).
+        assert first.get("staged") is True and second.get("staged") is True
+        assert first.get("pending_id") == second.get("pending_id")
+        assert "Do the thing." in (
+            tmp_path / "flip-skill" / "SKILL.md"
+        ).read_text(encoding="utf-8")
 
     def test_foreground_write_to_unmanaged_skill_still_allowed(self, tmp_path, monkeypatch):
         """Fail-closed applies to AUTONOMOUS writes only. A user-directed
@@ -642,8 +651,13 @@ class TestBackgroundOwnershipPolicyConsistency:
                     tmp_path, "adopt-me", "Do the thing.", "Do the new thing.",
                 )
 
-        assert before["success"] is False
-        assert after["success"] is True, after
+        # Before adoption the write is a staged proposal — real, visible, and
+        # NOT on disk. Adoption is what lets autonomous curation write directly.
+        assert before.get("staged") is True, before
+        assert after["success"] is True and not after.get("staged"), after
+        assert "Do the new thing." in (
+            tmp_path / "adopt-me" / "SKILL.md"
+        ).read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------

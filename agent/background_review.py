@@ -292,13 +292,16 @@ _SKILL_REVIEW_PROMPT = (
     "autonomous no-user-present actor, so pin blocks your writes too — "
     "content updates included. Only the user, in a foreground session, "
     "can change a pinned skill.\n"
-    "  • USER-OWNED skills — anything not curator-managed. A skill the "
-    "user hand-wrote, installed by URL, or asked a foreground agent to "
-    "create is theirs, not yours; your writes to it WILL be refused. "
-    "This includes skills that were loaded or consulted this session: "
-    "being in play does not make one yours to edit. If such a skill is "
-    "wrong or outdated, say so in your reply and recommend "
-    "'hermes curator adopt <name>' — do not try to patch it.\n"
+    "USER-OWNED skills (anything not curator-managed — hand-written, "
+    "URL-installed, or created by a foreground agent at the user's "
+    "request) are NOT protected, they are PROPOSAL-ONLY: an edit, patch "
+    "or write_file you make to one is staged for the owner to approve and "
+    "is never applied directly, while deleting one is refused outright. "
+    "Skills loaded or consulted this session are included. So do improve "
+    "them when they carry the lesson — propose only a change you would "
+    "defend, and say in your reply what you proposed. Mention "
+    "'hermes curator adopt <name>' if the user would rather the curator "
+    "maintain that skill directly.\n"
     "If the only skills that need updating are protected, say\n"
     "'Nothing to save.' and stop.\n\n"
     "Do NOT capture (these become persistent self-imposed constraints "
@@ -396,11 +399,16 @@ _COMBINED_REVIEW_PROMPT = (
     "  • PINNED skills (marked via 'hermes curator pin'). Pin blocks "
     "autonomous writes entirely — content updates included — because no "
     "user is present to consent. Only a foreground session can change one.\n"
-    "  • USER-OWNED skills — anything not curator-managed (hand-written, "
+    "USER-OWNED skills (anything not curator-managed — hand-written, "
     "URL-installed, or created by a foreground agent at the user's "
-    "request). Your writes to these WILL be refused, including to skills "
-    "loaded or consulted this session. If one is wrong, say so in your "
-    "reply and recommend 'hermes curator adopt <name>' instead.\n"
+    "request) are NOT protected, they are PROPOSAL-ONLY: an edit, patch "
+    "or write_file you make to one is staged for the owner to approve and "
+    "is never applied directly, while deleting one is refused outright. "
+    "Skills loaded or consulted this session are included. Improve them "
+    "when they carry the lesson, propose only a change you would defend, "
+    "and say in your reply what you proposed. Mention "
+    "'hermes curator adopt <name>' if the user would rather the curator "
+    "maintain that skill directly.\n"
     "If the only skills that need updating are protected, say\n"
     "'Nothing to save.' and stop.\n\n"
     "Do NOT capture as skills (these become persistent self-imposed "
@@ -437,6 +445,13 @@ _COMBINED_REVIEW_PROMPT = (
     "and stop — but don't reach for that conclusion as a default."
 )
 
+
+
+def _clip(text: Any, limit: int) -> str:
+    """Collapse whitespace and cap length so one guard message cannot take over
+    the single-line review notice."""
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
 
 
 def summarize_background_review_actions(
@@ -537,7 +552,7 @@ def summarize_background_review_actions(
         # Defensively normalize everything through a dict-typed alias so
         # the rest of the function can stay terse without per-call
         # ``isinstance`` guards (#59437).
-        if not isinstance(data, dict) or not data.get("success"):
+        if not isinstance(data, dict):
             continue
         message = data.get("message", "")
         detail = call_details.get(tcid) or {}
@@ -545,6 +560,70 @@ def summarize_background_review_actions(
             detail = {}
         target = data.get("target", "") or detail.get("target", "")
         is_skill = detail.get("tool") == "skill_manage"
+
+        if is_skill:
+            _label = "Skill"
+        elif target:
+            _label = "Memory" if target == "memory" else "User profile" if target == "user" else target
+        else:
+            _label = ""
+        _name_hint = detail.get("name", "")
+        _what = f"{_label} '{_name_hint}'" if (_label and _name_hint) else _label
+        _act = detail.get("action", "") or "write"
+
+        # A refused write can be the ONLY evidence the user gets that the
+        # agent tried to improve something and could not. Walking past all of
+        # them (the pre-2026-08-11 `not data.get("success") → continue`) hid a
+        # 3.2-day, 47-refusal outage on the live personal bot behind an empty
+        # summary. Announcing all of them is not the fix either — it is a
+        # different failure:
+        #
+        #   * ownership → ANNOUNCE. Only the user can lift it, with
+        #     `hermes curator adopt <name>`, so silence costs them the work.
+        #   * pinned / bundled / hub-installed / external / read-before-write /
+        #     unverifiable provenance, and EVERY memory-tool error (a full
+        #     store answers success=False on every turn) → STAY SILENT. No
+        #     user decision unblocks those; they are the system working as
+        #     designed or the fork misusing a tool, and putting them in the
+        #     chat exports curation internals to whoever is talking to the bot.
+        #     Concretely: profile `kivi` (Gogi — the sales bot sitting in chats
+        #     with Llucky CLIENTS) has no `display.memory_notifications` key
+        #     and takes the "on" default (hermes_cli/config_defaults.py,
+        #     gateway/run.py), so a prospect would have read "⚠️ Skill
+        #     'apple-notes' patch not saved: Refusing background curator patch
+        #     for bundled skill" and a "Memory is full (2200 char limit)" line
+        #     under every reply.
+        #
+        # The class comes from `refusal_class`, set where the refusal is BUILT
+        # (tools/skill_manager_tool.py). Never grep the error prose for it:
+        # message wording is a transport artefact, and keying policy off it is
+        # the same coupling this file spent the day removing. An unclassified
+        # refusal stays silent, so a guard added later is quiet by default.
+        if not data.get("success"):
+            if data.get("refusal_class") == "ownership":
+                # Unconditional on purpose. The earlier `if _what and reason`
+                # dropped, in silence, a result whose tool_call_id is missing
+                # and whose call arguments are therefore unrecoverable — the
+                # exact shape this branch exists to report. The class is only
+                # ever set by skill_manage, so the subject is known even when
+                # the arguments are not.
+                reason = _clip(data.get("error") or message, 200) or (
+                    "it is user-owned, so autonomous curation may only "
+                    "propose changes to it"
+                )
+                actions.append(
+                    f"⚠️ {_what or 'Skill'} {_act} not saved: {reason}"
+                )
+            continue
+        if data.get("staged"):
+            gist = _clip(data.get("gist"), 120)
+            suffix = f" — {gist}" if gist else ""
+            actions.append(
+                f"⏸ {_what or 'Write'} {_act} saved as a proposal "
+                f"awaiting your approval (`/skills pending` in the CLI)"
+                f"{suffix}"
+            )
+            continue
 
         message_lower = message.lower()
         if not verbose:

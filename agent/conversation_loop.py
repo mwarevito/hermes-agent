@@ -85,9 +85,19 @@ from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
-from utils import base_url_host_matches, env_var_enabled
+from utils import base_url_host_matches, env_float, env_var_enabled
 
 logger = logging.getLogger(__name__)
+
+# Default wall-clock budget for ONE logical API call, spanning every retry of
+# it (2026-08-11).  Every other timeout in the stack is per-ATTEMPT and this
+# loop multiplies them: three attempts against the 1500s absolute stream
+# ceiling is 75 minutes on a single logical call, with every liveness signal
+# reporting "healthy" for the duration.  Must stay ABOVE one full per-attempt
+# ceiling, or it would forbid retrying after a single attempt that legitimately
+# used all of its own.  Named rather than inlined so a regression test can
+# assert the shipped default is finite and generous.
+_API_CALL_TOTAL_BUDGET_DEFAULT_SECONDS = 3600.0
 
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
@@ -2115,7 +2125,17 @@ def run_conversation(
             logging.debug(f"Total message size: ~{approx_tokens:,} tokens")
         
         api_start_time = time.time()
+        # Separate monotonic origin for the total-budget gate below: a
+        # wall-clock delta is not a duration (an NTP step or a host resume
+        # moves time.time() by minutes with no work having happened), and
+        # api_start_time is also read for user-facing elapsed reporting.
+        api_start_monotonic = time.monotonic()
         retry_count = 0
+        # Attempts actually started for THIS logical call.  Distinct from
+        # retry_count, which is reset to 0 by fallback activation and by
+        # primary-transport recovery — so retry_count alone cannot bound the
+        # call's total cost (2026-08-11).
+        api_attempts_started = 0
         max_retries = agent._api_max_retries
         _retry = TurnRetryState()
 
@@ -2126,6 +2146,60 @@ def run_conversation(
         agent._current_api_request_id = api_request_id
 
         while retry_count < max_retries:
+            # ── Total budget for this logical API call ────────────
+            # Bounds the call as a whole, which nothing else does: the
+            # watchdogs below all measure a single attempt, and this loop
+            # multiplies them (attempt x max_retries, and retry_count is reset
+            # again by fallback / transport recovery).  Deliberately a gate on
+            # STARTING another attempt, never a kill of one in flight — a
+            # budget that could truncate a healthy long generation would be
+            # worse than the multiplication it prevents.  Set
+            # HERMES_API_CALL_TOTAL_BUDGET_SECONDS=0 to disable.
+            _total_budget = env_float(
+                "HERMES_API_CALL_TOTAL_BUDGET_SECONDS",
+                _API_CALL_TOTAL_BUDGET_DEFAULT_SECONDS,
+            )
+            _logical_elapsed = time.monotonic() - api_start_monotonic
+            if (
+                _total_budget > 0
+                and api_attempts_started > 0
+                and _logical_elapsed > _total_budget
+            ):
+                _budget_msg = (
+                    f"API call exceeded its total budget: "
+                    f"{int(_logical_elapsed)}s across {api_attempts_started} "
+                    f"attempt(s), budget {int(_total_budget)}s. "
+                    f"Refusing to start another attempt."
+                )
+                # Loud on purpose: the class of bug this closes is one where a
+                # call that stopped progressing kept reporting itself healthy,
+                # so this must never look like one more quiet internal retry.
+                logger.error(
+                    "%s%s provider=%s model=%s — tune or disable with "
+                    "HERMES_API_CALL_TOTAL_BUDGET_SECONDS.",
+                    agent.log_prefix,
+                    _budget_msg,
+                    agent.provider,
+                    agent.model,
+                )
+                agent._flush_status_buffer()
+                agent._emit_status(f"⛔ {_budget_msg}")
+                agent._persist_session(messages, conversation_history)
+                return {
+                    "final_response": (
+                        f"⛔ {_budget_msg}\n\n"
+                        "The provider kept accepting the request without "
+                        "completing it. Try again, or raise "
+                        "HERMES_API_CALL_TOTAL_BUDGET_SECONDS if this model "
+                        "legitimately needs longer."
+                    ),
+                    "messages": messages,
+                    "api_calls": api_call_count,
+                    "completed": False,
+                    "failed": True,
+                    "error": _budget_msg,
+                }
+
             # ── Nous Portal rate limit guard ──────────────────────
             # If another session already recorded that Nous is rate-
             # limited, skip the API call entirely.  Each attempt
@@ -2177,6 +2251,7 @@ def run_conversation(
                     pass  # Never let rate guard break the agent loop
 
             try:
+                api_attempts_started += 1
                 agent._reset_stream_delivery_tracking()
                 # api_messages is built once, before this retry loop, while the
                 # primary provider is active.  A mid-conversation fallback can

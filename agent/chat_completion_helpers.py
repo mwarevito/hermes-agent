@@ -57,6 +57,15 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 # narrower non-rate-limit case.  See issue #24996.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 
+# Default absolute ceiling on ONE streaming provider call, measured from the
+# start of the call (2026-08-11).  It must stay above every stale floor this
+# module can raise (the largest is the 1200s openai-codex floor at >100k
+# tokens) so it never clamps a deliberately-widened healthy timeout — it is a
+# backstop against unbounded growth, not a tighter limit.  Named rather than
+# inlined so a regression test can assert the shipped default is finite and
+# generous: an env-only default can be zeroed in a diff with nothing failing.
+_STREAM_HARD_TIMEOUT_DEFAULT_SECONDS = 1500.0
+
 
 def _context_thread_target(callback):
     """Bind a no-argument thread target to the caller's ContextVars."""
@@ -4100,6 +4109,25 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         if _reasoning_floor is not None:
             _stream_stale_timeout = max(_stream_stale_timeout, _reasoning_floor)
 
+    # ── Absolute per-call ceiling (2026-08-11) ──────────────────────────
+    # Every watchdog above measures the gap since the LAST frame, and
+    # ``last_chunk_time`` is refreshed by *any* frame — so a stream that drips
+    # content-free keepalives is bounded by nothing at all (measured on this
+    # code: a 0.05s-interval ping stream ran 20s without the stale detector
+    # firing once, and would have run forever).  This ceiling is measured from
+    # the START of the call instead, so "still connected" can no longer be read
+    # as "still working".  The default is deliberately generous — above every
+    # stale floor in this function — because a ceiling low enough to chop a
+    # healthy long generation would be worse than the disease; it bounds a call
+    # that stopped being one, it does not tighten a healthy one.  Set
+    # HERMES_STREAM_HARD_TIMEOUT_SECONDS=0 to disable.
+    _stream_hard_timeout = env_float(
+        "HERMES_STREAM_HARD_TIMEOUT_SECONDS", _STREAM_HARD_TIMEOUT_DEFAULT_SECONDS
+    )
+
+    # Monotonic: a wall-clock delta is not a duration — an NTP step or a
+    # host resume would move it by minutes with no work having happened.
+    _stream_call_start = time.monotonic()
     t = threading.Thread(target=_context_thread_target(_call), daemon=True)
     t.start()
     _last_heartbeat = time.time()
@@ -4142,6 +4170,71 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 agent._touch_activity(
                     f"waiting for stream response ({_waiting_secs}s, no chunks yet)"
                 )
+
+        # Absolute ceiling: measured from call start, immune to the frame
+        # drip that keeps every other watchdog satisfied.  Loud on purpose —
+        # the failure mode being closed here is one where silence read as
+        # health, so this must never look like a quiet internal retry.
+        _call_elapsed = time.monotonic() - _stream_call_start
+        if _stream_hard_timeout > 0 and _call_elapsed > _stream_hard_timeout:
+            _est_ctx = estimate_request_context_tokens(api_kwargs)
+            _since_chunk = time.time() - last_chunk_time["t"]
+            logger.error(
+                "Streaming call hit the absolute hard ceiling: %.0fs elapsed "
+                "since call start (ceiling %.0fs, last frame %.0fs ago, "
+                "model=%s, context=~%s tokens). Frames were still arriving, so "
+                "no frame-relative watchdog would ever have fired. Killing the "
+                "connection. Tune or disable with "
+                "HERMES_STREAM_HARD_TIMEOUT_SECONDS.",
+                _call_elapsed, _stream_hard_timeout, _since_chunk,
+                api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
+            )
+            agent._buffer_status(
+                f"⛔ Aborting call after {int(_call_elapsed)}s — absolute "
+                f"ceiling reached (model: {api_kwargs.get('model', 'unknown')}, "
+                f"last frame {int(_since_chunk)}s ago). The provider kept the "
+                f"stream open without finishing the answer."
+            )
+            agent._emit_wait_notice(
+                f"⛔ giving up after {int(_call_elapsed)}s — provider stream "
+                f"never completed"
+            )
+            # The worker retries transport errors on its own, and the abort
+            # below looks like one.  We are abandoning this call, not
+            # reconnecting it, so flag the cancel first — otherwise the
+            # orphaned daemon thread opens a fresh provider stream after the
+            # main thread has already given up (runaway request + a second
+            # writer racing the retry's stream).  Unlike the stale branch
+            # below, whose kill IS the reconnect.
+            _request_cancelled["value"] = True
+            try:
+                _cancel_current_stream_attempt("stream_hard_ceiling_kill")
+                _close_request_client_once("stream_hard_ceiling_kill")
+            except Exception:
+                pass
+            _bump_stale_streak(agent)
+            agent._touch_activity(
+                f"streaming call killed at hard ceiling after {int(_call_elapsed)}s"
+            )
+            t.join(timeout=2.0)
+            if result["response"] is None:
+                # Overwrite, don't defer: the abort above usually makes the
+                # worker die of a transport error, and surfacing THAT would
+                # report a network fault and hide the ceiling — the same
+                # "silence reads as normal" failure this ceiling exists to
+                # end. Keep the original as __cause__ for the log.
+                _ceiling_error = TimeoutError(
+                    f"Streaming API call aborted after {int(_call_elapsed)}s by "
+                    f"the absolute hard ceiling "
+                    f"({int(_stream_hard_timeout)}s): the provider kept the "
+                    f"stream alive (last frame {int(_since_chunk)}s ago) but "
+                    f"never completed the response"
+                )
+                _worker_error = result["error"]
+                if _worker_error is not None:
+                    _ceiling_error.__cause__ = _worker_error
+                result["error"] = _ceiling_error
+            break
 
         # Detect stale streams: connections kept alive by SSE pings
         # but delivering no real chunks.  Kill the client so the
@@ -4193,6 +4286,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # Reset the timer so we don't kill repeatedly while
             # the inner thread processes the closure.
             last_chunk_time["t"] = time.time()
+            # Do NOT count failed kills and give up on the call: two different stalls in ONE call, each reconnecting successfully, is a normal recoverable path (measured 2026-08-11 — a give-up after 2 kills killed a call whose 3rd stream completed fine); an abort that truly never takes effect is bounded by the absolute hard ceiling above, not by a kill counter.
             agent._emit_wait_notice(
                 f"⚠ no output from provider for {int(_stale_elapsed)}s — "
                 f"reconnecting..."

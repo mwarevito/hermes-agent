@@ -1058,11 +1058,44 @@ class ProcessRegistry:
                     _append_chunk(tail)
             except Exception:
                 pass
-            # Always reap the child to prevent zombie processes.
-            try:
-                session.process.wait(timeout=5)
-            except Exception as e:
-                logger.debug("Process wait timed out or failed: %s", e)
+            # Reap the child — but the read end reaching EOF is NOT the child
+            # ending.  A command that redirects its own stdout
+            # (``claude-hermes … > /tmp/result.txt``) closes our pipe within
+            # milliseconds and then runs for minutes.  The old code waited 5s,
+            # swallowed the TimeoutExpired and marked the session ``exited``
+            # with ``returncode`` still None: 20 of 20 background Claude Code
+            # launches were reported finished in 5-28 seconds while the run was
+            # going (measured 2026-08-11).  The caller read an empty result file
+            # and relaunched the job — two live sessions writing one file, the
+            # first one's work overwritten.  ``exit_code=None`` with
+            # ``completion_reason="exited"`` is the signature of that lie: a
+            # process that really exited always has an int.
+            #
+            # So poll until the child is actually gone.  The orphaned-pipe case
+            # this thread was built for still terminates promptly: there the
+            # DIRECT child exits and the grandchild holds the pipe, so poll()
+            # returns immediately and only the drained pipe is left behind.
+            pipe_close_logged = False
+            while True:
+                try:
+                    session.process.wait(timeout=5)
+                    break
+                except Exception as e:
+                    if session.process.poll() is not None:
+                        break
+                    if session.exited:
+                        # kill_process()/_reconcile_local_exit() already
+                        # finished this session; do not move it twice.
+                        return
+                    if not pipe_close_logged:
+                        pipe_close_logged = True
+                        logger.debug(
+                            "Process %s: stdout pipe closed but pid %s is still "
+                            "running (%s) — session stays running",
+                            session.id,
+                            getattr(session.process, "pid", "?"),
+                            e,
+                        )
             session.exited = True
             if session.completion_reason != "killed":
                 session.exit_code = session.process.returncode

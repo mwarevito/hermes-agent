@@ -1564,6 +1564,7 @@ class ProcessRegistry:
             and output snapshot.
         """
         from tools.ansi_strip import strip_ansi
+        from tools.environments.base import touch_activity_if_due
         from tools.interrupt import is_interrupted as _is_interrupted
 
         try:
@@ -1609,6 +1610,21 @@ class ProcessRegistry:
 
         deadline = time.monotonic() + effective_timeout
 
+        # Blocking here used to emit no activity whatsoever, so a worker parked
+        # on a legitimate 40-minute build and a wedged worker looked identical
+        # from outside — both silent — and the kanban card got no heartbeat for
+        # the whole window. Tick the same liveness signal _wait_for_process
+        # already uses (tools/environments/base.py, 10 s cadence), which is well
+        # inside the 60 s the watchdogs allow.
+        #
+        # The callback is THREAD-LOCAL: touch_activity_if_due resolves it via
+        # get_activity_callback() at fire time, so the tick has to stay on this,
+        # the calling thread — that is where the tool executor installed it.
+        # Handing the tick to a helper thread reads back None and heartbeats
+        # nothing, silently (#76502).
+        _activity_now = time.monotonic()
+        _activity_state = {"last_touch": _activity_now, "start": _activity_now}
+
         while time.monotonic() < deadline:
             session = self._refresh_detached_session(session)
             if session is None:
@@ -1645,6 +1661,11 @@ class ProcessRegistry:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
+            # After the exit/interrupt checks: only a wait that really is going
+            # to keep blocking reports itself as alive.
+            touch_activity_if_due(
+                _activity_state, f"waiting for background process {session_id}"
+            )
             session._completion_event.wait(timeout=min(1.0, remaining))
 
         result = {

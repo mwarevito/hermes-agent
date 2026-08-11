@@ -18212,6 +18212,18 @@ def main(
         # the flush against any rare blocking-I/O case (the reporter measured
         # flush in <1ms; the alarm is a failsafe, not the common path).
         if os.environ.get("HERMES_KANBAN_TASK"):
+            # Hand the next attempt what this one finished, before the pid goes
+            # away. 2026-08-11: all four timed_out runs in the board history
+            # closed with an EMPTY summary while their own checkpoints sat in
+            # task_events, so every retry began at zero against the same budget.
+            # The call is deadman-timed inside (a blocked DB write must never
+            # park us in the handler until the dispatcher's SIGKILL lands) and
+            # never raises.
+            try:
+                from hermes_cli.kanban_db import flush_interrupted_run_summary
+                flush_interrupted_run_summary(reason=f"signal {signum}")
+            except Exception:
+                pass
             try:
                 import signal as _sig_mod
                 if hasattr(_sig_mod, "SIGALRM"):

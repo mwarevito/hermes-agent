@@ -274,6 +274,137 @@ def _dependency_wait_is_repeating(conn, task_id: str, reason) -> bool:
 # effect of normal API traffic.
 DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS = 60 * 60
 
+# Divisor for the budget-derived form of the threshold above.
+#
+# The flat constant is unreachable on a default board: the dispatcher auto-caps
+# a card at ``max_runtime_seconds=3600`` and the backstop only fires ABOVE 3600s
+# of heartbeat silence, so ``enforce_max_runtime`` always kills the run first.
+# Measured 2026-08-11 over the whole recorded history of the three live boards:
+# 1839 heartbeat events, zero ``stale`` events, ever. Run 35 of ``t_a6c52bb1``
+# spent 52 minutes past its last heartbeat (17:24) while its claim was extended
+# three times on ``pid_alive`` alone before the cap fired at 18:16.
+#
+# A third of the budget is strictly below the cap for any positive budget — the
+# threshold can therefore always fire BEFORE the thing it is supposed to
+# pre-empt. Backtest over all 46 completed runs on those boards: none would have
+# been reclaimed, but the widest heartbeat gap inside a run that went on to
+# SUCCEED is 1046s against the 1200s this yields for a 3600s card. A 154s margin
+# is not much; that thin margin, not the arithmetic, is the reason the derived
+# threshold ships off until the activity tick makes the heartbeat mean
+# "something happened" rather than "a tool call has not returned yet".
+HEARTBEAT_STALE_BUDGET_DIVISOR = 3
+
+# Env seams. ``..._MAX_STALE_SECONDS`` is a ceiling on the threshold;
+# ``..._STALE_FROM_BUDGET`` switches the budget-derived value on.
+#
+# The budget-derived threshold ships OFF. Lowering the threshold is only safe
+# together with an activity tick that bridges a long single tool call into
+# ``last_heartbeat_at``: without it, a run legitimately parked in one process
+# wait (15m04s measured 2026-08-11) is indistinguishable from a stopped one.
+HEARTBEAT_MAX_STALE_ENV = "HERMES_KANBAN_HEARTBEAT_MAX_STALE_SECONDS"
+HEARTBEAT_STALE_FROM_BUDGET_ENV = "HERMES_KANBAN_HEARTBEAT_STALE_FROM_BUDGET"
+
+
+def _heartbeat_stale_from_budget_enabled() -> bool:
+    return os.environ.get(
+        HEARTBEAT_STALE_FROM_BUDGET_ENV, ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _configured_heartbeat_max_stale_seconds() -> tuple[int, bool]:
+    """``(threshold, came_from_env)`` before the run's budget is considered."""
+    raw = os.environ.get(HEARTBEAT_MAX_STALE_ENV, "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = 0
+        if parsed > 0:
+            return parsed, True
+    return DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS, False
+
+
+def resolve_heartbeat_max_stale_seconds(
+    max_runtime_seconds: Optional[int] = None,
+) -> int:
+    """Heartbeat silence after which a run counts as stopped, not slow.
+
+    ``min(configured, budget // HEARTBEAT_STALE_BUDGET_DIVISOR)``: the configured
+    value is a ceiling, the run's own budget decides the rest. A card with no
+    budget keeps the flat configured value — there is nothing to derive from.
+
+    To make the derived threshold the default, drop the
+    ``_heartbeat_stale_from_budget_enabled()`` guard below (one line). Do that
+    only together with the activity tick that keeps ``last_heartbeat_at`` fresh
+    across a long single tool call, or healthy runs parked in a process wait get
+    reclaimed.
+    """
+    configured, _from_env = _configured_heartbeat_max_stale_seconds()
+    if not _heartbeat_stale_from_budget_enabled():
+        return configured
+    try:
+        budget = int(max_runtime_seconds or 0)
+    except (TypeError, ValueError):
+        budget = 0
+    if budget <= 0:
+        return configured
+    return max(1, min(configured, budget // HEARTBEAT_STALE_BUDGET_DIVISOR))
+
+
+def validate_heartbeat_stale_threshold(
+    max_runtime_seconds: Optional[int] = None,
+) -> None:
+    """Refuse a threshold that the runtime cap makes unreachable.
+
+    A threshold at or above the cap can never fire — the cap kills the run
+    first — so the "pid alive but nothing moving" backstop silently stops
+    existing. That is the 2026-08-11 defect; it must not be re-expressible by
+    hand.
+
+    The compiled-in default is deliberately NOT fatal even though it is
+    unreachable at the default cap: raising on a value nobody chose would turn a
+    silent gap into a dispatcher outage on every existing install. Only an
+    explicit env value raises.
+    """
+    try:
+        cap = int(max_runtime_seconds or 0)
+    except (TypeError, ValueError):
+        cap = 0
+    if cap <= 0:
+        return
+    configured, from_env = _configured_heartbeat_max_stale_seconds()
+    if not from_env:
+        return
+    if resolve_heartbeat_max_stale_seconds(cap) >= cap:
+        raise ValueError(
+            f"{HEARTBEAT_MAX_STALE_ENV}={configured} is >= the runtime cap "
+            f"{cap}s, so the heartbeat backstop can never fire (the cap ends "
+            f"the run first). Set it below the cap; a third of the budget is "
+            f"the built-in derivation."
+        )
+
+
+def _heartbeat_is_stale(
+    now: int,
+    last_heartbeat_at: Optional[int],
+    max_runtime_seconds: Optional[int] = None,
+    *,
+    missing_is_stale: bool = False,
+) -> bool:
+    """The single rule for "this run stopped showing progress".
+
+    Both reapers ask this and nothing else, so they cannot answer differently
+    about the same run. ``missing_is_stale`` is the one place they legitimately
+    differ: ``release_stale_claims`` runs against live claims where a missing
+    heartbeat usually means "just spawned", while ``detect_stale_running`` is
+    only reached after its own multi-hour gate, where "never heartbeated" is
+    itself the finding.
+    """
+    if last_heartbeat_at is None:
+        return bool(missing_is_stale)
+    threshold = resolve_heartbeat_max_stale_seconds(max_runtime_seconds)
+    return (now - int(last_heartbeat_at)) > threshold
+
 # Grace added to a claim when a reclaim is deferred because the previous
 # host-local worker is still alive after a termination attempt. Releasing the
 # claim in that state would spawn a duplicate alongside the surviving worker —
@@ -367,6 +498,36 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
         if parsed >= 0:
             return parsed
     return DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+
+
+def _resolve_out_of_time_limit() -> int:
+    """How many consecutive out-of-time runs a card gets before it blocks."""
+    raw = os.environ.get("HERMES_KANBAN_OUT_OF_TIME_LIMIT", "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = 0
+        if parsed > 0:
+            return parsed
+    return DEFAULT_OUT_OF_TIME_LIMIT
+
+
+def _resolve_timeout_cooldown_seconds() -> int:
+    """Seconds to wait after a run ended on the clock before re-claiming it.
+
+    0 disables the wait (tests, and operators who want the old same-tick
+    respawn back).
+    """
+    raw = os.environ.get("HERMES_KANBAN_TIMEOUT_COOLDOWN_SECONDS", "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = -1
+        if parsed >= 0:
+            return parsed
+    return DEFAULT_TIMEOUT_COOLDOWN_SECONDS
 
 
 # Worker-context caps so build_worker_context() stays bounded on
@@ -4484,7 +4645,15 @@ def _end_run(
         UPDATE task_runs
            SET status        = ?,
                outcome       = ?,
-               summary       = ?,
+               -- COALESCE, not a plain assignment (2026-08-11): the reaper that
+               -- closes a killed run passes summary=None, which used to
+               -- overwrite the handoff the worker had already written on its
+               -- way out. All four timed_out runs in the board history closed
+               -- with an empty summary while their own checkpoints sat in
+               -- task_events, so every retry restarted from zero. A caller that
+               -- means to replace the summary still can; one that says nothing
+               -- no longer destroys it.
+               summary       = COALESCE(?, summary),
                error         = ?,
                metadata      = ?,
                ended_at      = ?,
@@ -5037,30 +5206,49 @@ def release_stale_claims(
     now = int(time.time())
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
-    stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
-        "FROM tasks "
-        "WHERE status = 'running' AND claim_expires IS NOT NULL "
-        "  AND claim_expires < ?",
-        (now,),
+    # 2026-08-11: this scans EVERY running row, not only TTL-expired ones.
+    # Heartbeat staleness used to be reachable only on a row whose claim had
+    # already expired, so a stopped run kept its claim until the next 15-minute
+    # expiry and was then extended again on pid liveness: run 35 of t_a6c52bb1
+    # was extended at 17:40, 17:55 and 18:10 with a heartbeat that died at
+    # 17:24. Making this the single decision point means the criterion is
+    # applied when it becomes true, not when the TTL next happens to lapse.
+    #
+    # The worker pid is read from ``task_runs.worker_pid`` — the run's own pid.
+    # ``tasks.worker_pid`` is a copy that can outlive the run it belongs to, and
+    # the pid embedded in ``claim_lock`` is the DISPATCHER's: with the
+    # dispatcher running in-gateway that is the gateway process itself, so
+    # signalling it would take down every bot on the host.
+    rows = conn.execute(
+        "SELECT t.id, t.claim_lock, t.claim_expires, t.last_heartbeat_at, "
+        "       t.current_run_id, r.worker_pid AS worker_pid, "
+        "       COALESCE(r.max_runtime_seconds, t.max_runtime_seconds) AS budget "
+        "FROM tasks t "
+        "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.status = 'running' AND t.claim_lock IS NOT NULL"
     ).fetchall()
-    for row in stale:
+    for row in rows:
         lock = row["claim_lock"] or ""
         host_local = lock.startswith(host_prefix)
         hb = row["last_heartbeat_at"]
-        # Heartbeat staleness backstop: if we have a heartbeat at all
-        # and it's older than the max-stale threshold, the worker is
-        # not making observable progress.  Reclaim instead of extending,
-        # even if the PID is still alive (it's likely in a logic loop).
-        heartbeat_stale = (
-            hb is not None
-            and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+        expired = (
+            row["claim_expires"] is not None
+            and int(row["claim_expires"]) < now
         )
+        # Heartbeat staleness backstop: a worker whose heartbeat is older than
+        # the threshold is not making observable progress. Reclaim instead of
+        # extending, even if the PID is still alive (it's likely in a logic
+        # loop). ``_heartbeat_is_stale`` is the shared rule — see there for why
+        # a missing heartbeat is not stale on this path.
+        heartbeat_stale = _heartbeat_is_stale(now, hb, row["budget"])
+        if not expired and not heartbeat_stale:
+            continue
         if (
-            host_local
+            expired
+            and not heartbeat_stale
+            and host_local
             and row["worker_pid"]
             and _pid_alive(row["worker_pid"])
-            and not heartbeat_stale
         ):
             new_expires = now + _resolve_claim_ttl_seconds()
             with write_txn(conn):
@@ -5106,7 +5294,10 @@ def release_stale_claims(
         if _worker_survived_termination(termination):
             _defer_reclaim_for_live_worker(
                 conn, row["id"], row["claim_lock"], now, termination,
-                reason="ttl_expired_worker_alive",
+                reason=(
+                    "heartbeat_stale_worker_alive" if heartbeat_stale
+                    else "ttl_expired_worker_alive"
+                ),
             )
             continue
         with write_txn(conn):
@@ -5114,8 +5305,8 @@ def release_stale_claims(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
-                "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (row["id"], row["claim_lock"], now),
+                "AND current_run_id IS ?",
+                (row["id"], row["claim_lock"], row["current_run_id"]),
             )
             if cur.rowcount != 1:
                 continue
@@ -5131,10 +5322,17 @@ def release_stale_claims(
                     int(row["worker_pid"])
                     if row["worker_pid"] is not None else None
                 ),
-                "claim_expires": int(row["claim_expires"]),
+                "claim_expires": (
+                    int(row["claim_expires"])
+                    if row["claim_expires"] is not None else None
+                ),
+                "claim_expired": bool(expired),
                 "last_heartbeat_at": (
                     int(row["last_heartbeat_at"])
                     if row["last_heartbeat_at"] is not None else None
+                ),
+                "heartbeat_max_stale_seconds": (
+                    resolve_heartbeat_max_stale_seconds(row["budget"])
                 ),
                 "now": now,
                 "host_local": host_local,
@@ -5168,8 +5366,12 @@ def reclaim_task(
     Returns True if a reclaim happened, False if the task isn't in a
     reclaimable state (not running, or doesn't exist).
     """
+    # worker_pid comes from the run, not the task row: see release_stale_claims
+    # for why the task-row copy and the claim_lock pid are both wrong targets.
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+        "SELECT t.status, t.claim_lock, r.worker_pid AS worker_pid "
+        "FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.id = ?",
         (task_id,),
     ).fetchone()
     if not row:
@@ -7669,6 +7871,30 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # for operators who want a tighter/looser probe cadence.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
+# A run that produced progress and then hit its runtime cap ran out of TIME; it
+# did not fail. 2026-08-11: runs 34 and 35 of t_a6c52bb1 (3611s and 3661s
+# against a 3600s cap) each recorded a checkpoint — "diagnosis-complete",
+# "focused-tests-green" — and each was counted into ``consecutive_failures``.
+# With DEFAULT_FAILURE_LIMIT = 2 the second shortfall of time blocked the card
+# permanently, and nobody read the two checkpoints it had produced.
+#
+# It gets its own budget rather than no budget at all: a card that can never fit
+# its cap would otherwise be killed and respawned forever. Three is deliberately
+# looser than the failure limit (2) — the fix for repeated out-of-time is a
+# bigger budget or a smaller card, and a human has to be given the chance to see
+# that — but no looser than three: measured on the 2026-08-11 boards a capped
+# card is killed at its cap every time, so four attempts against the 3600s cap
+# of ``t_a6c52bb1`` is four hours of wall clock and four Claude/Codex runs spent
+# before anybody is told the budget is the thing that is wrong.
+DEFAULT_OUT_OF_TIME_LIMIT = 3
+
+# Cooldown between a run ending on the clock and the next claim of that card.
+# Today the kill and the respawn happen inside ONE dispatcher tick: run 35 was
+# claimed in the same second run 34 was killed (17:15:17), and hit the same wall
+# 61 minutes later. Whatever would let attempt N+1 finish — a raised cap, a
+# narrowed scope, an operator — cannot arrive inside that same second.
+DEFAULT_TIMEOUT_COOLDOWN_SECONDS = 300  # 5 minutes
+
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
@@ -7911,7 +8137,30 @@ def _terminate_reclaimed_worker(
     *,
     signal_fn=None,
 ) -> dict[str, Any]:
-    """Best-effort host-local worker termination for reclaim paths."""
+    """Best-effort host-local worker termination for reclaim paths.
+
+    Signals the worker's whole process GROUP, not the bare pid. A kanban worker
+    is spawned with ``start_new_session=True``, so everything it started (a
+    Claude Code run, a test subprocess, a git command) lives in its group;
+    signalling only the wrapper leaves those children running, unowned, and
+    still holding whatever they took — how a timed-out worker left a Claude
+    process squatting the launcher's lane slot and guaranteed the retry would
+    time out as well (2026-08-06). ``_signal_worker_tree`` degrades to the
+    single pid whenever the pid does not lead its own group, so an in-gateway
+    dispatcher can never killpg its own supervisor.
+
+    ``signal_fn`` (the test seam) is used for BOTH the group and the single-pid
+    delivery: replacing only ``os.kill`` would have left tests reaching a real
+    process group.
+
+    ⚑ Never purge this run's ``processes.json`` rows here (tried and reverted
+    2026-08-11): the worker's children are themselves spawned with
+    ``start_new_session=True`` (tools/process_registry.py), so the killpg above
+    provably never reaches them, and deleting their rows would destroy the only
+    handle a survivor has left — live at the time of the revert, pid 53706
+    ``claude-hermes … --model opus``, session_key ``20260811_161505_13208e`` =
+    run 34's owner session, still running after run 34 was killed.
+    """
     import signal
 
     info: dict[str, Any] = {
@@ -7921,6 +8170,7 @@ def _terminate_reclaimed_worker(
         "terminated": False,
         "sigkill": False,
     }
+
     if not pid or pid <= 0 or not claim_lock:
         return info
 
@@ -7934,18 +8184,16 @@ def _terminate_reclaimed_worker(
     )
     if kill is None:
         return info
+    killpg = kill if signal_fn is not None else None
 
     info["termination_attempted"] = True
-    try:
-        kill(int(pid), signal.SIGTERM)
-    except ProcessLookupError:
-        # Process is already gone — that's a successful termination, not a
-        # survival. Leaving terminated=False here would make the reclaim guard
-        # misread a dead worker as still-alive and defer forever.
-        info["terminated"] = True
-        return info
-    except OSError:
-        return info
+    # A pid that is already gone is a successful termination, not a survival:
+    # _signal_worker_tree swallows ProcessLookupError and the liveness poll
+    # below settles it on the first iteration. Leaving terminated=False would
+    # make the reclaim guard misread a dead worker as alive and defer forever.
+    info["group_signalled"] = _signal_worker_tree(
+        int(pid), signal.SIGTERM, kill=kill, killpg=killpg,
+    )
 
     for _ in range(10):
         if not _pid_alive(pid):
@@ -7954,14 +8202,11 @@ def _terminate_reclaimed_worker(
         time.sleep(0.5)
 
     if _pid_alive(pid):
-        try:
-            # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM
-            # (which maps to TerminateProcess via the stdlib shim).
-            _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-            kill(int(pid), _sigkill)
-            info["sigkill"] = True
-        except (ProcessLookupError, OSError):
-            return info
+        # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM
+        # (which maps to TerminateProcess via the stdlib shim).
+        _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+        _signal_worker_tree(int(pid), _sigkill, kill=kill, killpg=killpg)
+        info["sigkill"] = True
 
     info["terminated"] = not _pid_alive(pid)
     return info
@@ -8075,6 +8320,76 @@ def heartbeat_worker(
     return True
 
 
+def _checkpoint_workspace(
+    conn: sqlite3.Connection,
+    task_id: str,
+    workspace: Optional[str] = None,
+) -> Optional[str]:
+    """Where this task's work lives, without materializing anything.
+
+    Deliberately NOT :func:`resolve_workspace`: that creates directories and
+    git worktrees. A checkpoint — and especially a worker on its way out of a
+    signal handler — must never create anything.
+    """
+    for cand in (workspace, os.environ.get("HERMES_KANBAN_WORKSPACE")):
+        if cand and os.path.isabs(str(cand)) and os.path.isdir(str(cand)):
+            return str(cand)
+    try:
+        row = conn.execute(
+            "SELECT workspace_path FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+    except Exception:
+        return None
+    path = row["workspace_path"] if row else None
+    if path and os.path.isabs(str(path)) and os.path.isdir(str(path)):
+        return str(path)
+    return None
+
+
+def _git_dirty_artifacts(
+    workspace: Optional[str],
+    *,
+    limit: int = 20,
+    timeout: float = 5.0,
+) -> list:
+    """Absolute paths git says this run touched, newest state on disk.
+
+    A worker that names no artifacts has not necessarily produced none: on
+    2026-08-11 every checkpoint of the two timed-out runs carried
+    ``artifacts: []`` while the workspace held the narrowed diff the next
+    attempt needed. ``git status --porcelain`` is the cheapest honest answer and
+    the same list a human would look at.
+
+    Never raises: no repo, no git on PATH, or an index too slow to answer inside
+    ``timeout`` simply means no autofill.
+    """
+    if not workspace:
+        return []
+    try:
+        proc = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=workspace, capture_output=True, text=True, timeout=timeout,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+    out: list = []
+    for line in (proc.stdout or "").splitlines():
+        raw = line[3:].strip() if len(line) > 3 else ""
+        if not raw:
+            continue
+        if " -> " in raw:  # rename: the destination is what exists now
+            raw = raw.split(" -> ", 1)[1]
+        raw = raw.strip().strip('"')
+        path = os.path.join(workspace, raw)
+        if os.path.exists(path):
+            out.append(path)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def record_checkpoint(
     conn: sqlite3.Connection,
     task_id: str,
@@ -8083,6 +8398,7 @@ def record_checkpoint(
     artifacts: Optional[list] = None,
     note: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    workspace: Optional[str] = None,
 ) -> bool:
     """Persist "this phase is FINISHED" so a retry resumes instead of redoing it.
 
@@ -8103,7 +8419,11 @@ def record_checkpoint(
 
     Artifacts are verified against disk here rather than trusted: a path that no
     longer exists is dropped, so a resumed worker is never pointed at a file that
-    was cleaned up between runs. Returns True only when a checkpoint was written.
+    was cleaned up between runs. When the caller names none at all they are
+    filled in from ``git status --porcelain`` of the workspace (one bounded
+    subprocess, only on that branch) — on 2026-08-11 every checkpoint of the two
+    timed-out runs carried ``artifacts: []`` while the workspace held the diff
+    the next attempt needed. Returns True only when a checkpoint was written.
     """
     key = " ".join(str(step_key or "").split())[:64].strip()
     if not key:
@@ -8118,6 +8438,12 @@ def record_checkpoint(
             continue
         if os.path.isabs(sp) and os.path.exists(sp):
             kept.append(sp)
+    if not kept and not artifacts:
+        # Autofill only when the caller named nothing — a worker that listed its
+        # artifacts is never second-guessed. See _git_dirty_artifacts.
+        kept = _git_dirty_artifacts(
+            _checkpoint_workspace(conn, task_id, workspace)
+        )
     now = int(time.time())
     with write_txn(conn):
         if expected_run_id is None:
@@ -8145,6 +8471,175 @@ def record_checkpoint(
         _append_event(conn, task_id, "checkpoint", payload, run_id=run_id)
         _ = now
     return True
+
+
+# How long the dying worker may spend persisting its summary, and how long the
+# git probe inside that may take. Both are bounded well under the dispatcher's
+# SIGTERM→SIGKILL grace (5s): the point of the flush is to fit inside the window
+# the reaper already gives, not to widen it.
+# 1.5s of HERMES_SIGTERM_GRACE already burned in the handler + 2.0s here =
+# 3.5s, against the 5s the reaper waits between SIGTERM and SIGKILL.
+DEFAULT_INTERRUPT_FLUSH_DEADLINE_SECONDS = 2.0
+_INTERRUPT_GIT_TIMEOUT_SECONDS = 1.5
+
+
+def _resolve_interrupt_flush_deadline() -> float:
+    raw = os.environ.get(
+        "HERMES_KANBAN_INTERRUPT_FLUSH_DEADLINE_SECONDS", "",
+    ).strip()
+    if raw:
+        try:
+            parsed = float(raw)
+        except ValueError:
+            parsed = 0.0
+        if parsed > 0:
+            return parsed
+    return DEFAULT_INTERRUPT_FLUSH_DEADLINE_SECONDS
+
+
+def _write_interrupted_run_summary(
+    task_id: str,
+    run_id: Optional[int],
+    board: Optional[str],
+    workspace: Optional[str],
+    reason: Optional[str],
+) -> bool:
+    """Persist a handoff for the run that is being interrupted. Blocking."""
+    with connect(board=board) as conn:
+        row = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        rid = run_id if run_id is not None else row["current_run_id"]
+        if rid is None:
+            return False
+        rid = int(rid)
+
+        ws = _checkpoint_workspace(conn, task_id, workspace)
+        artifacts = _git_dirty_artifacts(
+            ws, timeout=_INTERRUPT_GIT_TIMEOUT_SECONDS,
+        )
+
+        finished: list = []
+        last_note = ""
+        for ev in conn.execute(
+            "SELECT kind, payload FROM task_events "
+            "WHERE task_id = ? AND run_id IS ? "
+            "  AND kind IN ('checkpoint', 'heartbeat') ORDER BY id",
+            (task_id, rid),
+        ).fetchall():
+            try:
+                payload = json.loads(ev["payload"] or "{}")
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            note = str(payload.get("note") or "").strip()
+            if ev["kind"] == "checkpoint":
+                key = str(payload.get("step_key") or "").strip()
+                finished.append(f"{key}: {note}" if note else key)
+            elif note:
+                last_note = note
+
+        lines = [
+            f"INTERRUPTED ({reason or 'signal'}) — this run was stopped, "
+            f"not finished."
+        ]
+        if finished:
+            lines.append("FINISHED PHASES: " + "; ".join(finished[-5:]))
+        if last_note:
+            lines.append("LAST REPORT: " + last_note)
+        if artifacts:
+            lines.append("ARTIFACTS: " + ", ".join(artifacts[:10]))
+        lines.append(
+            "NEXT: resume from the last finished phase — do not redo it."
+        )
+        text = "\n".join(lines)[:_CTX_MAX_FIELD_BYTES]
+
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE task_runs SET summary = ? "
+                "WHERE id = ? AND (summary IS NULL OR summary = '')",
+                (text, rid),
+            )
+            wrote = cur.rowcount == 1
+        checkpointed = False
+        if artifacts or finished:
+            checkpointed = record_checkpoint(
+                conn, task_id, step_key="interrupted",
+                artifacts=artifacts, note=lines[0], expected_run_id=rid,
+                workspace=ws,
+            )
+        return bool(wrote or checkpointed)
+
+
+def flush_interrupted_run_summary(
+    *,
+    task_id: Optional[str] = None,
+    run_id: Optional[int] = None,
+    board: Optional[str] = None,
+    workspace: Optional[str] = None,
+    reason: Optional[str] = None,
+    deadline_seconds: Optional[float] = None,
+) -> bool:
+    """Persist what this run already did, before its process goes away.
+
+    Called from the worker's SIGTERM path (``hermes_cli/cli.py``, the
+    ``HERMES_KANBAN_TASK`` branch that ends in ``os._exit(0)``): every
+    ``timed_out`` run in the recorded board history closed with an empty
+    summary while its own checkpoints sat in ``task_events``, so each retry
+    began at zero against the same budget.
+
+    ⚑ The write runs in a daemon thread joined with a deadline, and the deadline
+    IS the feature. Doing DB work inline in a signal handler parks the process
+    inside the handler whenever the write blocks (a locked DB, a slow fs) — and
+    the dispatcher's SIGKILL lands a few seconds later, costing both the summary
+    and the clean exit. An overrunning thread is simply abandoned; ``os._exit``
+    reaps it. A joined-with-timeout thread is also the only deadman that works
+    here: a Python-level SIGALRM cannot interrupt a blocked sqlite C call.
+
+    Returns True only when something was actually persisted. Never raises.
+    """
+    try:
+        task_id = task_id or os.environ.get("HERMES_KANBAN_TASK", "").strip()
+        if not task_id:
+            return False
+        if run_id is None:
+            raw = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
+            run_id = int(raw) if raw.isdigit() else None
+        workspace = workspace or os.environ.get(
+            "HERMES_KANBAN_WORKSPACE", "",
+        ).strip() or None
+        board = board or os.environ.get("HERMES_KANBAN_BOARD", "").strip() or None
+        deadline = (
+            float(deadline_seconds) if deadline_seconds is not None
+            else _resolve_interrupt_flush_deadline()
+        )
+    except Exception:
+        return False
+
+    outcome = {"ok": False}
+
+    def _work():
+        try:
+            outcome["ok"] = bool(_write_interrupted_run_summary(
+                task_id, run_id, board, workspace, reason,
+            ))
+        except Exception:
+            outcome["ok"] = False
+
+    worker = threading.Thread(
+        target=_work, name="kanban-interrupt-flush", daemon=True,
+    )
+    try:
+        worker.start()
+        worker.join(max(0.1, deadline))
+    except Exception:
+        return False
+    if worker.is_alive():
+        return False
+    return bool(outcome["ok"])
 
 
 def _signal_worker_tree(pid, sig, *, kill=None, killpg=None):
@@ -8211,7 +8706,7 @@ def enforce_max_runtime(
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, "
+        "SELECT t.id, t.worker_pid, t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
@@ -8233,6 +8728,10 @@ def enforce_max_runtime(
 
         pid = int(row["worker_pid"])
         tid = row["id"]
+        # Classified BEFORE the run is closed: _end_run clears current_run_id,
+        # and the evidence lives on the run's own events.
+        progressed = _run_made_progress(conn, tid, row["current_run_id"])
+        outcome = "out_of_time" if progressed else "timed_out"
         # SIGTERM then SIGKILL. Keep it simple: 5 s grace. Workers that
         # want a cleaner shutdown can install their own SIGTERM handler
         # before the grace expires.
@@ -8269,10 +8768,12 @@ def enforce_max_runtime(
                     "elapsed_seconds": int(elapsed),
                     "limit_seconds": int(row["max_runtime_seconds"]),
                     "sigkill": killed,
+                    "outcome": outcome,
+                    "progress": bool(progressed),
                 }
                 run_id = _end_run(
                     conn, tid,
-                    outcome="timed_out", status="timed_out",
+                    outcome=outcome, status=outcome,
                     error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
                     metadata=payload,
                 )
@@ -8285,22 +8786,61 @@ def enforce_max_runtime(
         # breaker trips, this flips the task ``ready → blocked`` and
         # emits a ``gave_up`` event on top of the ``timed_out`` we
         # already emitted.
+        #
+        # 2026-08-11: only when nothing moved. A run that checkpointed and then
+        # hit the clock is short of TIME, not broken, and the counter it shares
+        # with crashes and spawn failures trips after two. This mirrors the
+        # decision ``detect_stale_running`` already documents at the end of its
+        # loop ("Intentionally NOT calling _record_task_failure here… two
+        # legitimately-long-running tasks would trip the circuit breaker even
+        # though no worker actually failed") — same reasoning, same class of
+        # ending, so the same answer. The difference is that this one is not
+        # free: out-of-time has its own streak budget below, because unlike a
+        # missing heartbeat it CAN repeat forever on a card that simply does not
+        # fit its cap.
         if cur.rowcount == 1:
-            _record_task_failure(
-                conn, tid,
-                error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
-                outcome="timed_out",
-                release_claim=False,
-                end_run=False,
-                event_payload_extra={"pid": pid, "sigkill": killed},
+            _error = (
+                f"elapsed {int(elapsed)}s > "
+                f"limit {int(row['max_runtime_seconds'])}s"
             )
+            if not progressed:
+                _record_task_failure(
+                    conn, tid,
+                    error=_error,
+                    outcome="timed_out",
+                    release_claim=False,
+                    end_run=False,
+                    event_payload_extra={"pid": pid, "sigkill": killed},
+                )
+            else:
+                _streak = _out_of_time_streak(conn, tid)
+                _limit = _resolve_out_of_time_limit()
+                if _streak >= _limit:
+                    _record_task_failure(
+                        conn, tid,
+                        error=(
+                            f"{_error} ({_streak} runs in a row ended on the "
+                            f"clock with progress — the budget, not the work, "
+                            f"is what is wrong)"
+                        ),
+                        outcome="out_of_time",
+                        force_trip=True,
+                        release_claim=False,
+                        end_run=False,
+                        event_payload_extra={
+                            "pid": pid,
+                            "sigkill": killed,
+                            "out_of_time_streak": _streak,
+                            "out_of_time_limit": _limit,
+                        },
+                    )
     return timed_out
 
 
-# Heartbeat staleness heartbeat gap — if a running task hasn't sent a
-# heartbeat in this many seconds it's considered inactive regardless of
-# the ``dispatch_stale_timeout_seconds`` threshold.  Hardcoded at 1 hour
-# to match the original spec (">4h started + no commits in 1h").
+# Superseded 2026-08-11 by ``resolve_heartbeat_max_stale_seconds``. This was a
+# SECOND hardcoded 1-hour gap, independent of the one in release_stale_claims,
+# so the two reapers could — and did — disagree about whether the same run had
+# stopped. Kept only as the documented historical default; nothing reads it.
 _STALE_HEARTBEAT_GAP_SECONDS = 3600
 
 
@@ -8340,7 +8880,9 @@ def detect_stale_running(
     reclaimed: list[str] = []
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
+        "SELECT t.id, t.last_heartbeat_at, t.claim_lock, "
+        "       r.worker_pid AS worker_pid, "
+        "       COALESCE(r.max_runtime_seconds, t.max_runtime_seconds) AS budget, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -8358,7 +8900,15 @@ def detect_stale_running(
 
         last_hb = row["last_heartbeat_at"]
         hb_age = (now - int(last_hb)) if last_hb is not None else None
-        if hb_age is not None and hb_age < _STALE_HEARTBEAT_GAP_SECONDS:
+        # One rule, shared with release_stale_claims (2026-08-11). This used to
+        # carry its own flat 3600s gap, so the two reapers could answer
+        # differently about the same run's heartbeat. ``missing_is_stale`` is
+        # True here and only here: this branch is already behind a multi-hour
+        # gate, where "never heartbeated at all" is the finding, not a
+        # just-spawned worker.
+        if not _heartbeat_is_stale(
+            now, last_hb, row["budget"], missing_is_stale=True,
+        ):
             continue  # recent heartbeat → still alive
 
         pid = row["worker_pid"]
@@ -8400,6 +8950,9 @@ def detect_stale_running(
                     int(hb_age) if hb_age is not None else None
                 ),
                 "timeout_seconds": stale_timeout_seconds,
+                "heartbeat_max_stale_seconds": (
+                    resolve_heartbeat_max_stale_seconds(row["budget"])
+                ),
                 "pid": int(pid) if pid else None,
             }
             payload.update(termination)
@@ -8430,6 +8983,105 @@ def detect_stale_running(
         # spawn_failed / timed_out / crashed counters.
 
     return reclaimed
+
+
+def _checkpoint_step_keys(rows) -> set:
+    """Normalized ``step_key`` set from ``checkpoint`` event payload rows."""
+    keys = set()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (ValueError, TypeError):
+            continue
+        raw = (payload or {}).get("step_key") if isinstance(payload, dict) else None
+        key = " ".join(str(raw or "").split())
+        if key:
+            keys.add(key)
+    return keys
+
+
+def _run_made_progress(
+    conn: sqlite3.Connection, task_id: str, run_id: Optional[int],
+) -> bool:
+    """True when this run FINISHED a phase the task had never finished before.
+
+    The only evidence is a ``checkpoint`` — a named phase the worker declared
+    done, carrying artifacts verified against (or autofilled from) the
+    workspace. Nothing the worker merely *says* counts.
+
+    ⚑ A heartbeat note used to qualify at >=20 chars, and that was the same
+    mistake in prose that a bare heartbeat is in binary: it measures liveness,
+    not work. Backtested 2026-08-11 across every recorded run of the three live
+    boards: of the 9 historical ``timed_out`` runs the note rule re-labels 8 as
+    "out of time", and the qualifying notes are literally about waiting —
+    "Queued behind one legitimate external Claude review…", "Producer
+    implementation still running". Not-a-failure would become the default, and a
+    card that cannot fit its cap would burn the whole out-of-time budget an hour
+    per attempt. The checkpoint rule re-labels 4 of the 9, and each of those four
+    finished a real phase (qmd-bd-tests-green, implementation-draft-finished,
+    diagnosis-complete, focused-tests-green).
+
+    ⚑ The ``step_key`` must be NEW for the task, not merely present in this run.
+    Re-declaring a phase an earlier attempt already finished is the work
+    repeating itself, not moving — and it is the one way left for a worker to
+    mint unlimited "progress" on a timer. Same rule ``record_checkpoint``
+    documents for DET-E ("Name the phase you finished, not the one you are
+    starting"). Historically free: runs 34 and 35 of ``t_a6c52bb1`` checkpointed
+    two different phases, so the backtest number above is unchanged by it.
+
+    Any read failure answers False: an unreadable history must not invent
+    progress, and the failure it fails to excuse is the status quo.
+    """
+    try:
+        mine = _checkpoint_step_keys(conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND run_id IS ? AND kind = 'checkpoint'",
+            (task_id, run_id),
+        ).fetchall())
+        if not mine:
+            return False
+        # Every checkpoint of this task that is NOT this run's. Classification
+        # happens before ``_end_run`` closes the run, so "not mine" is "an
+        # earlier attempt's" — no ordering predicate needed, and it stays
+        # correct when ``run_id`` is NULL.
+        others = _checkpoint_step_keys(conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'checkpoint' AND run_id IS NOT ?",
+            (task_id, run_id),
+        ).fetchall())
+    except Exception:
+        return False
+    return bool(mine - others)
+
+
+def _out_of_time_streak(conn: sqlite3.Connection, task_id: str) -> int:
+    """Count the task's trailing run of out-of-time endings.
+
+    Same shape as ``_protocol_violation_streak``: ``rate_limited`` runs are
+    neutral (a quota wall says nothing about the card's size), any other closed
+    outcome breaks the streak. So a card that times out, succeeds, and times out
+    again starts over — only a card that repeatedly cannot fit its budget
+    accumulates.
+    """
+    streak = 0
+    try:
+        rows = conn.execute(
+            "SELECT outcome FROM task_runs "
+            "WHERE task_id = ? AND ended_at IS NOT NULL "
+            "ORDER BY id DESC LIMIT ?",
+            (task_id, _PROTOCOL_VIOLATION_SCAN_LIMIT),
+        ).fetchall()
+    except Exception:
+        return 0
+    for row in rows:
+        outcome = row["outcome"] or ""
+        if outcome == "rate_limited":
+            continue
+        if outcome == "out_of_time":
+            streak += 1
+            continue
+        break
+    return streak
 
 
 def _error_fingerprint(error_text: str) -> str:
@@ -9104,6 +9756,26 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         # crash/completion supersedes it.
         return None
 
+    # 1b. Timeout cooldown. The last run ended on the clock. Killing and
+    #     respawning inside one tick guarantees attempt N+1 meets the same wall
+    #     attempt N just hit — on 2026-08-11 run 35 was claimed in the same
+    #     second run 34 was killed. Space the retry so a bigger budget, a
+    #     narrowed card, or a human can get between the two. Placed before the
+    #     blocker_auth regex for the same reason the rate-limit check is: the
+    #     stamped timeout text must not be re-read as a permanent blocker.
+    if (
+        latest_run is not None
+        and (latest_run["outcome"] or "") in {"timed_out", "out_of_time"}
+    ):
+        to_cooldown = _resolve_timeout_cooldown_seconds()
+        ended_at = latest_run["ended_at"]
+        if (
+            to_cooldown > 0
+            and ended_at is not None
+            and (now - int(ended_at)) < to_cooldown
+        ):
+            return "timeout_cooldown"
+
     # 2. Quota / auth blocker: retrying immediately will not help.
     err = row["last_failure_error"]
     if err and _RESPAWN_BLOCKER_RE.search(err):
@@ -9319,6 +9991,13 @@ def _dispatch_once_locked(
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
     """
+    # A heartbeat threshold at or above the runtime cap can never fire — the
+    # cap ends the run first — which is exactly how the "pid alive but nothing
+    # moving" backstop silently stopped existing (2026-08-11). Refuse to tick
+    # with a threshold configured that way rather than tick with a detector
+    # that is dead by arithmetic.
+    validate_heartbeat_stale_threshold(default_max_runtime_seconds)
+
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()

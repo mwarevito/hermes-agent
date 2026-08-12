@@ -595,6 +595,13 @@ def init_agent(
     # would mangle the escape sequences.  None = use builtins.print.
     agent._print_fn = None
     agent.background_review_callback = None  # Optional sync callback for gateway delivery
+    # Owner-only variant of the above: staged self-improvement proposals go
+    # here instead, because the chat the turn happened in is not always the
+    # owner (profile kivi talks to Llucky clients). Left None when the
+    # owner cannot be addressed; the notice is then suppressed and logged,
+    # never rerouted to the public rail. See
+    # gateway.pending_review_access.make_owner_notice_sender.
+    agent.background_review_owner_callback = None
     agent.memory_notifications = "on"  # Memory update notifications: "off", "on", "verbose"
     agent.skip_context_files = skip_context_files
     agent.load_soul_identity = load_soul_identity

@@ -30,20 +30,75 @@ def _fmt_state(subsystem: str) -> str:
 # Formatting helpers
 # ---------------------------------------------------------------------------
 
+# Per-record diff excerpt budget for the pending list. A skill proposal is the
+# only thing here big enough to need one: the summary line ("patch 'x' SKILL.md
+# (+14/-4 lines)") names the file but not the change, and approving on a name
+# alone is what left seven un-reviewed proposals sitting in profile kivi's
+# queue from 16-28 June 2026. So the list carries the real unified diff against
+# what is on disk — the same ``wa.skill_pending_diff`` the approve path replays
+# and ``diff <id>`` prints — clipped to stay inside one chat bubble. The total
+# budget is what stops a 7-record queue from becoming a 40 KB message; records
+# past it keep their id and a pointer to ``diff <id>``.
+_DIFF_LINES_PER_RECORD = 14
+_DIFF_CHARS_PER_RECORD = 700
+_DIFF_TOTAL_BUDGET = 2400
+
+
+def _diff_excerpt(record) -> str:
+    """Clipped unified diff for one staged skill write.
+
+    Never returns "" on failure: a diff we could not compute is reported as
+    such, because a silently missing diff reads exactly like "no change" and
+    would make the owner approve blind.
+    """
+    try:
+        diff = wa.skill_pending_diff(record) or ""
+    except Exception as e:  # pragma: no cover - defensive
+        return f"(diff unavailable: {e})"
+    diff = diff.rstrip("\n")
+    if not diff:
+        return "(no textual change)"
+    lines = diff.split("\n")
+    clipped = lines[:_DIFF_LINES_PER_RECORD]
+    text = "\n".join(clipped)
+    if len(text) > _DIFF_CHARS_PER_RECORD:
+        text = text[:_DIFF_CHARS_PER_RECORD]
+        omitted = True
+    else:
+        omitted = len(lines) > len(clipped)
+    if omitted:
+        text += f"\n… (+{len(lines) - len(clipped)} more lines)"
+    return text
+
+
 def _fmt_pending_list(subsystem: str) -> str:
     records = wa.list_pending(subsystem)
     if not records:
         return f"No pending {subsystem} writes."
     lines = [f"Pending {subsystem} writes ({len(records)}):"]
+    budget = _DIFF_TOTAL_BUDGET
     for r in records:
         origin = r.get("origin", "foreground")
         tag = " [auto]" if origin == "background_review" else ""
-        lines.append(f"  {r['id']}{tag}  {r.get('summary', '')}")
-    where = "/{s} approve <id>".format(s=subsystem)
-    lines.append("")
-    lines.append(f"Apply: {where}   Reject: /{subsystem} reject <id>")
+        rid = r["id"]
+        lines.append(f"  {rid}{tag}  {r.get('summary', '')}")
+        if subsystem == wa.SKILLS:
+            if budget > 0:
+                excerpt = _diff_excerpt(r)
+                budget -= len(excerpt)
+                for dl in excerpt.split("\n"):
+                    lines.append(f"    {dl}")
+            else:
+                lines.append(f"    (diff omitted — /skills diff {rid})")
+        # The command, spelled out with the id: the owner reviews from a phone
+        # and must never have to compose one or remember the syntax.
+        lines.append(
+            f"    approve: /{subsystem} approve {rid}"
+            f"   reject: /{subsystem} reject {rid}"
+        )
     if subsystem == wa.SKILLS:
-        lines.append("Review full diff: /skills diff <id>")
+        lines.append("")
+        lines.append("Full diff for one record: /skills diff <id>")
     return "\n".join(lines)
 
 

@@ -4867,6 +4867,51 @@ class TurnRunner:
             _deliver_bg_review_message(message)
 
         agent.background_review_callback = _bg_review_send
+
+        # Owner-only rail (2026-08-12). A staged self-improvement proposal
+        # names the bot's own skills and carries the command that writes them,
+        # so it belongs to the profile OWNER, not to whoever the bot happens to
+        # be talking to. Measured that day on the M1: profile ``kivi`` (Gogi,
+        # the Llucky sales bot) has skills.write_approval: true, no
+        # display.memory_notifications key (so notifications take the "on"
+        # default) and TELEGRAM_GROUP_ALLOWED_USERS=* — i.e. ctx._status_chat_id
+        # there is a chat with a CLIENT. Resolve the owner's DM instead; when it
+        # cannot be resolved, leave the callback None so
+        # ``deliver_review_summary`` suppresses the notice and logs it rather
+        # than falling back to this chat. Deliberately no thread metadata: the
+        # current chat's thread id does not exist in the owner's DM. Also NOT
+        # gated on _run_still_current(): the proposal is durable in the pending
+        # store, and the owner needs the pointer to it even if a newer turn has
+        # started.
+        def _schedule_owner_notice(coro) -> None:
+            safe_schedule_threadsafe(
+                coro,
+                ctx._loop_for_step,
+                logger=logger,
+                log_message="owner background_review scheduling error",
+            )
+
+        _owner_review_cb = None
+        try:
+            from gateway.pending_review_access import make_owner_notice_sender
+
+            _owner_review_cb = make_owner_notice_sender(
+                getattr(self._runner, "config", None),
+                ctx.source,
+                ctx._status_adapter,
+                _schedule_owner_notice,
+            )
+        except Exception:
+            logger.warning(
+                "Could not build the owner rail for staged-proposal notices; "
+                "they will be suppressed rather than posted to %s",
+                getattr(ctx, "_status_chat_id", "?"),
+                exc_info=True,
+            )
+        # Assigned unconditionally (None included): a cached agent reused
+        # across chats must never inherit the previous turn's owner rail.
+        agent.background_review_owner_callback = _owner_review_cb
+
         # Register the release hook on the adapter so base.py's finally
         # block can fire it after delivering the main response.
         if ctx._status_adapter and ctx.session_key:

@@ -3433,7 +3433,27 @@ class GatewaySlashCommandsMixin:
         the full pending/approve/reject/approval flow works on every platform.
         Gate changes persist to config.yaml and evict the cached agent so the
         new setting takes effect on the next message.
+
+        Owner-only (2026-08-12): approving a staged write is a policy decision,
+        so the whole surface is restricted to the profile owner in a DM. See
+        ``gateway.pending_review_access``.
         """
+        # Owner gate FIRST — before any pending record is read, diffed, or
+        # applied, and before the "approval is off" hint (which would itself
+        # tell a stranger the gate exists and how to flip it). Until 2026-08-12
+        # this surface had no identity check at all: SlashAccessPolicy only
+        # gates commands when allow_admin_from is configured, and no live
+        # profile configures it, so every allowed sender could approve. On
+        # profile kivi (Gogi, in chats with Llucky clients) the group allowlist
+        # is ``*``, which made that "every prospect in the chat".
+        from gateway.pending_review_access import check_pending_review_access
+
+        _refusal = check_pending_review_access(
+            getattr(self, "config", None), event.source
+        )
+        if _refusal:
+            return _refusal
+
         from gateway.run import _hermes_home
         from hermes_cli.write_approval_commands import handle_pending_subcommand
         from tools import write_approval as wa
@@ -3482,7 +3502,28 @@ class GatewaySlashCommandsMixin:
         the pending JSON file under ``~/.hermes/pending/skills/``. (Note this is
         the write-approval ``diff <id>``; the CLI also has an unrelated
         ``hermes skills diff <name>`` that diffs a bundled skill vs stock.)
+
+        Owner-only (2026-08-12): approving a staged write is a policy decision,
+        so the whole surface — list, diff, approve, reject, gate toggle — is
+        restricted to the profile owner in a DM. See
+        ``gateway.pending_review_access``.
         """
+        # Owner gate FIRST — before any pending record is read, diffed, or
+        # applied, and before the "approval is off" hint (which would itself
+        # tell a stranger the gate exists and how to flip it). Until 2026-08-12
+        # this surface had no identity check at all: SlashAccessPolicy only
+        # gates commands when allow_admin_from is configured, and no live
+        # profile configures it, so every allowed sender could approve. On
+        # profile kivi (Gogi, in chats with Llucky clients) the group allowlist
+        # is ``*``, which made that "every prospect in the chat".
+        from gateway.pending_review_access import check_pending_review_access
+
+        _refusal = check_pending_review_access(
+            getattr(self, "config", None), event.source
+        )
+        if _refusal:
+            return _refusal
+
         from gateway.run import _hermes_home
         from hermes_cli.write_approval_commands import handle_pending_subcommand
         from tools import write_approval as wa

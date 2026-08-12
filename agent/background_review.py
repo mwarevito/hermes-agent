@@ -458,6 +458,7 @@ def summarize_background_review_actions(
     review_messages: List[Dict],
     prior_snapshot: List[Dict],
     notification_mode: str = "on",
+    owner_only_sink: Optional[List[str]] = None,
 ) -> List[str]:
     """Build the human-facing action summary for a background review pass.
 
@@ -470,6 +471,15 @@ def summarize_background_review_actions(
     - ``off``: return no actions.
     - ``on``: generic "Memory updated"/tool messages.
     - ``verbose``: include compact content previews from tool-call arguments.
+
+    ``owner_only_sink``, when passed, receives the lines that must NOT go to
+    the chat the turn happened in — today that is the staged-proposal (⏸)
+    notice, which names the bot's own skills and carries the command that
+    applies them. On profile ``kivi`` (Gogi) the current chat is a chat with a
+    Llucky CLIENT, so this is a privacy boundary, not cosmetics. Callers that
+    pass no sink (the interactive CLI, where the reader IS the owner) keep the
+    old behaviour and get the line in the returned list — the notice degrades
+    to public, never to lost. See ``deliver_review_summary``.
     """
     mode = str(notification_mode or "on").lower()
     if mode == "off":
@@ -618,11 +628,31 @@ def summarize_background_review_actions(
         if data.get("staged"):
             gist = _clip(data.get("gist"), 120)
             suffix = f" — {gist}" if gist else ""
-            actions.append(
+            # Name the id, not just the surface. The old text ("`/skills
+            # pending` in the CLI") was a dead end for an owner who lives in
+            # Telegram, and even at a terminal it made him list before he could
+            # spend anything. Measured cost of that friction: SEVEN proposals
+            # sat unreviewed in ~/.hermes/profiles/kivi/pending/skills/ from
+            # 16-28 June 2026 — a visible backlog nobody could spend.
+            pid = str(data.get("pending_id") or "").strip()
+            subsystem = "skills" if is_skill else "memory"
+            if pid:
+                how = (f"`/{subsystem} approve {pid}` applies it, "
+                       f"`/{subsystem} reject {pid}` drops it")
+            else:
+                # No id in the tool result. Say that, rather than printing a
+                # command that cannot work: a copy-pasteable dead command is
+                # worse than an honest pointer.
+                how = (f"`/{subsystem} pending` to review "
+                       f"(this result carried no id)")
+            _staged_line = (
                 f"⏸ {_what or 'Write'} {_act} saved as a proposal "
-                f"awaiting your approval (`/skills pending` in the CLI)"
-                f"{suffix}"
+                f"awaiting your approval{suffix} · {how}"
             )
+            if owner_only_sink is not None:
+                owner_only_sink.append(_staged_line)
+            else:
+                actions.append(_staged_line)
             continue
 
         message_lower = message.lower()
@@ -733,6 +763,79 @@ def summarize_background_review_actions(
         ):
             actions.append(f"{label} updated")
     return actions
+
+
+def deliver_review_summary(
+    agent: Any, actions: List[str], owner_only: List[str]
+) -> None:
+    """Fan a finished review's summary out to the rails it is allowed to use.
+
+    Two rails, because two audiences:
+
+    * ``actions`` — ordinary "Memory updated" / "Skill created" lines. These
+      may go to the chat the turn happened in, via
+      ``agent.background_review_callback`` (the gateway points it there).
+    * ``owner_only`` — staged-proposal notices. These may NOT: they name the
+      bot's own skills and carry the command that writes them. The gateway
+      points ``agent.background_review_owner_callback`` at the OWNER's DM
+      (``gateway.pending_review_access.owner_notice_chat_id``) and leaves it
+      unset when the owner cannot be addressed. Unset means STAY SILENT and
+      log — never fall back to the public rail, because on profile ``kivi``
+      (Gogi) that rail ends in a chat with a Llucky client.
+
+    The local console always gets everything: ``_safe_print`` writes to the
+    host terminal / gateway log, which is the owner's own surface.
+
+    Delivery failures are logged, not swallowed. A dropped notice used to be
+    indistinguishable from "the review found nothing", which is how a 3.2-day
+    outage stayed invisible on the live personal bot (2026-08-11).
+    """
+    combined = list(dict.fromkeys(list(actions) + list(owner_only)))
+    if combined:
+        agent._safe_print(
+            f"  💾 Self-improvement review: {' · '.join(combined)}"
+        )
+
+    if actions:
+        public_cb = getattr(agent, "background_review_callback", None)
+        if public_cb:
+            try:
+                public_cb(
+                    "💾 Self-improvement review: "
+                    + " · ".join(dict.fromkeys(actions))
+                )
+            except Exception:
+                logger.warning(
+                    "Background review chat delivery failed; the actions "
+                    "already happened but the user was not told: %s",
+                    " · ".join(dict.fromkeys(actions)),
+                    exc_info=True,
+                )
+
+    if not owner_only:
+        return
+
+    owner_text = (
+        "💾 Self-improvement review: " + " · ".join(dict.fromkeys(owner_only))
+    )
+    owner_cb = getattr(agent, "background_review_owner_callback", None)
+    if owner_cb:
+        try:
+            owner_cb(owner_text)
+        except Exception:
+            logger.warning(
+                "Owner-only background review delivery failed; the proposal is "
+                "still in the pending store: %s", owner_text, exc_info=True,
+            )
+        return
+
+    logger.warning(
+        "Staged self-improvement proposal has no owner delivery rail, so it is "
+        "being kept OUT of the current chat (it may not be the owner's). The "
+        "proposal itself is safe in the pending store — review it as the "
+        "profile owner. Suppressed notice: %s",
+        owner_text,
+    )
 
 
 def build_memory_write_metadata(
@@ -1096,11 +1199,16 @@ def _run_review_in_thread(
         # action the fork DID complete before the crash. Coerce an
         # exception into an empty actions list so the partial valid
         # actions from earlier in the messages are returned instead.
+        # Filled by the summarizer with the lines that are the OWNER's alone
+        # (staged proposals). Declared out here so a partial result survives
+        # the except branch below, same reasoning as ``actions``.
+        owner_only: List[str] = []
         try:
             actions = summarize_background_review_actions(
                 review_messages,
                 messages_snapshot,
                 notification_mode=getattr(agent, "memory_notifications", "on"),
+                owner_only_sink=owner_only,
             )
         except Exception as e:
             logger.warning(
@@ -1111,19 +1219,7 @@ def _run_review_in_thread(
             )
             actions = []
 
-        if actions:
-            summary = " · ".join(dict.fromkeys(actions))
-            agent._safe_print(
-                f"  💾 Self-improvement review: {summary}"
-            )
-            _bg_cb = agent.background_review_callback
-            if _bg_cb:
-                try:
-                    _bg_cb(
-                        f"💾 Self-improvement review: {summary}"
-                    )
-                except Exception:
-                    pass
+        deliver_review_summary(agent, actions, owner_only)
 
     except Exception as e:
         logger.warning("Background memory/skill review failed: %s", e)

@@ -7707,6 +7707,17 @@ class TelegramAdapter(BasePlatformAdapter):
         self._telegram_typing_cooldown_until.pop(str(chat_id), None)
         return False
 
+    def dm_chat_id_for_user(self, user_id: str) -> Optional[str]:
+        """On Telegram a user id IS the id of the private chat with that user.
+
+        Bot API ``sendMessage`` accepts a user id as ``chat_id`` for a private
+        chat, so no open/handshake step is needed. The send still fails if the
+        user never started the bot; the caller logs that rather than retargeting
+        (see ``agent.background_review.deliver_review_summary``).
+        """
+        uid = str(user_id or "").strip()
+        return uid or None
+
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Send typing indicator."""
         if not self._bot or self._typing_in_cooldown(chat_id):

@@ -3871,6 +3871,24 @@ class BasePlatformAdapter(ABC):
             metadata=metadata,
         )
 
+    def dm_chat_id_for_user(self, user_id: str) -> Optional[str]:
+        """Chat id that reaches *user_id* privately, or None if unknown.
+
+        Added 2026-08-12 for owner-only notices (a staged self-improvement
+        proposal must reach the profile owner, never the chat the turn happened
+        in — see ``gateway.pending_review_access``). The default is None, i.e.
+        "this adapter cannot promise a private channel to an arbitrary user".
+        Callers must treat None as "stay silent", not as "use the current
+        chat": guessing would post the owner's private queue into whatever
+        group the bot is sitting in.
+
+        Override only where a user id genuinely addresses a 1:1 conversation
+        with no prior handshake (Telegram). Platforms that need a channel
+        opened first (Slack ``conversations.open``, Discord DM channels) should
+        leave this at None until they implement the open step.
+        """
+        return None
+
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """
         Send a typing indicator.

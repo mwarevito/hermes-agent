@@ -21,6 +21,19 @@ logger = logging.getLogger(__name__)
 
 _TELEGRAM_API_HOST = "api.telegram.org"
 
+# Key used for the primary (system-DNS) pool in the in-flight bookkeeping. A
+# fallback IP can never collide with it: "" is not a valid address.
+_PRIMARY_POOL_KEY = ""
+
+# Ceiling on draining ONE idle pool. This runs on the request path, and a pool
+# holding a wedged CLOSE_WAIT socket can make close() hang forever — the same
+# hazard that made TelegramAdapter._drain_polling_connections bound its own
+# shutdown (#66377). An idle pool closes in microseconds, so this is three
+# orders of magnitude of headroom; its real job is to cap what a pool that will
+# not close can cost the bot — half a second, once, and never again for that
+# pool.
+_IDLE_POOL_CLOSE_TIMEOUT = 0.5
+
 # DNS-over-HTTPS providers used to discover Telegram API IPs that may differ
 # from the (potentially unreachable) IP returned by the local system resolver.
 _DOH_TIMEOUT = 4.0  # seconds — bounded so connect() isn't noticeably delayed
@@ -76,6 +89,18 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
         self._fallback_lock = asyncio.Lock()
         self._sticky_ip: Optional[str] = None
         self._sticky_lock = asyncio.Lock()
+        # Pools with work still on them, keyed like _pool_key(). A pool is
+        # counted from the moment its attempt starts until the response body is
+        # closed, so the idle reaper below can never cut a streaming download.
+        self._pool_inflight: dict[str, int] = {}
+        # Pools whose drain failed or timed out. They are skipped by the idle
+        # reaper afterwards — retrying a close that hangs would put
+        # _IDLE_POOL_CLOSE_TIMEOUT on every subsequent request — and cleared
+        # again the moment the pool serves a request, i.e. proves it is healthy.
+        self._undrainable_pools: set[str] = set()
+        # Pool that served the previous request: the one the idle reaper spares,
+        # because it is almost certainly the one this request will use too.
+        self._last_active_key: Optional[str] = None
 
     async def _get_fallback(self, ip: str) -> httpx.AsyncHTTPTransport:
         async with self._fallback_lock:
@@ -100,7 +125,89 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
         try:
             await transport.aclose()
         except Exception as exc:  # closing a broken pool must never mask the real error
-            logger.debug("[Telegram] Error closing fallback transport %s: %s", ip, exc)
+            # The pool is already out of _fallbacks, so nothing will ever try to
+            # close it again: whatever sockets it still holds are leaked for the
+            # life of the process. That is a descriptor budget being spent, not
+            # a detail — it is reported, never whispered.
+            logger.warning(
+                "[Telegram] Fallback pool %s refused to close (%s: %s); its sockets "
+                "are leaked until the process exits",
+                ip, type(exc).__name__, exc,
+            )
+
+    @staticmethod
+    def _pool_key(ip: Optional[str]) -> str:
+        """Identity of the pool serving an attempt (``""`` = the primary pool)."""
+        return ip if ip is not None else _PRIMARY_POOL_KEY
+
+    def _acquire_pool(self, key: str) -> None:
+        self._pool_inflight[key] = self._pool_inflight.get(key, 0) + 1
+
+    def _release_pool(self, key: str) -> None:
+        remaining = self._pool_inflight.get(key, 0) - 1
+        if remaining > 0:
+            self._pool_inflight[key] = remaining
+        else:
+            self._pool_inflight.pop(key, None)
+
+    def _pools_by_key(self) -> list[tuple[str, httpx.AsyncHTTPTransport]]:
+        pools: list[tuple[str, httpx.AsyncHTTPTransport]] = [
+            (_PRIMARY_POOL_KEY, self._primary)
+        ]
+        pools.extend(self._fallbacks.items())
+        return pools
+
+    async def _drain_unused_pools(self, active_key: Optional[str]) -> None:
+        """Close every pool this transport owns except the one still in use.
+
+        This is the descriptor half of the fallback ladder, and it exists
+        because of a property of httpx that is easy to assume away: a pool
+        NEVER reaps a peer-closed keep-alive socket on its own.
+        ``keepalive_expiry`` is only enforced while a request is passing
+        *through* that pool. Measured on the M1 2026-08-12 against a stub that
+        FINs idle sockets: with ``keepalive_expiry=2.0`` ten sockets were still
+        in CLOSE_WAIT after six seconds of idling; only ``aclose()`` freed them.
+
+        This transport owns N+1 pools but routes each request to exactly ONE of
+        them, so the others are idle by construction. Once a sticky fallback IP
+        is established every request short-circuits on it and ``_primary`` is
+        never touched again — and the sockets it was holding at that moment are
+        held forever. That is the 2026-08-11 19:30 EMFILE incident: 101 sockets
+        in CLOSE_WAIT, 62 of them to 149.154.166.110, which on this host is both
+        the system-DNS answer for api.telegram.org and the seed fallback IP.
+        The fallback-IP failure branch already recycled its pool
+        (``_reset_fallback``, 66 firings in the incident window); the primary
+        branch reset nothing across 209 firings of its own.
+
+        Closing does NOT discard the transport object: ``AsyncHTTPTransport``
+        is reusable after ``aclose()`` (verified 2026-08-12 — the pool simply
+        empties), so no SSL context is rebuilt and the next attempt cannot fail
+        on rebuilding one under descriptor pressure.
+
+        A pool with work in flight is never touched: ``_pool_inflight`` counts
+        an attempt from its start until the response body is closed.
+        """
+        for key, transport in self._pools_by_key():
+            if key == active_key or self._pool_inflight.get(key):
+                continue
+            if key in self._undrainable_pools:
+                continue
+            try:
+                await asyncio.wait_for(
+                    transport.aclose(), timeout=_IDLE_POOL_CLOSE_TIMEOUT
+                )
+            except Exception as exc:
+                # Never mask the request's own outcome, but never hide this
+                # either: a pool that will not close is descriptors we cannot
+                # get back. Reported once, then skipped — a close that hangs
+                # must not be re-awaited on every future request.
+                self._undrainable_pools.add(key)
+                logger.warning(
+                    "[Telegram] Idle pool %s refused to close (%s: %s); its sockets "
+                    "stay open until this pool serves a request again or the "
+                    "process exits, and it will not be re-drained until then",
+                    key or "primary", type(exc).__name__, exc,
+                )
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         if request.url.host != _TELEGRAM_API_HOST or not self._fallback_ips:
@@ -114,22 +221,24 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
             if ip != sticky_ip:
                 attempt_order.append(ip)
 
+        # Drain the pools the PREVIOUS request left idle, before this one
+        # starts. Deliberately not afterwards: a drain sitting between "response
+        # ready" and "response returned" delays handing the body to the caller,
+        # and keeps the connection checked out of its pool across that delay —
+        # so a peer FIN that would have landed on a parked keep-alive socket
+        # lands mid-response instead. Same descriptors freed, none of that.
+        await self._drain_unused_pools(self._last_active_key)
+
         last_error: Exception | None = None
         for ip in attempt_order:
+            key = self._pool_key(ip)
             candidate = request if ip is None else _rewrite_request_for_ip(request, ip)
             transport = self._primary if ip is None else await self._get_fallback(ip)
+            self._acquire_pool(key)
             try:
                 response = await transport.handle_async_request(candidate)
-                if ip is not None and self._sticky_ip != ip:
-                    async with self._sticky_lock:
-                        if self._sticky_ip != ip:
-                            self._sticky_ip = ip
-                            logger.warning(
-                                "[Telegram] Primary api.telegram.org path unreachable; using sticky fallback IP %s",
-                                ip,
-                            )
-                return response
             except Exception as exc:
+                self._release_pool(key)
                 last_error = exc
                 if not _is_retryable_connect_error(exc):
                     raise
@@ -152,17 +261,75 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
                 await self._reset_fallback(ip)
                 continue
 
+            # The pool stays "in use" until the caller closes the body, so a
+            # concurrent request's drain cannot cut a response still arriving.
+            self._last_active_key = key
+            # It served a request, so whatever made its close fail before
+            # is no longer assumed: let the reaper try it again.
+            self._undrainable_pools.discard(key)
+            _attach_pool_release(response, self, key)
+            if ip is not None and self._sticky_ip != ip:
+                async with self._sticky_lock:
+                    if self._sticky_ip != ip:
+                        self._sticky_ip = ip
+                        logger.warning(
+                            "[Telegram] Primary api.telegram.org path unreachable; using sticky fallback IP %s",
+                            ip,
+                        )
+            return response
+
         if last_error is None:
             raise RuntimeError("All Telegram fallback IPs exhausted but no error was recorded")
         raise last_error
 
     async def aclose(self) -> None:
-        await self._primary.aclose()
+        """Close every pool this transport owns, isolating per-pool failures.
+
+        This transport owns N+1 independent httpx pools (``_primary`` plus one
+        per fallback IP), so the order and the failure isolation are the whole
+        contract, not style.
+
+        The previous body closed ``_primary`` first, unguarded, and then looped
+        over the fallbacks unguarded. Either an exception or a wedged close on
+        one pool stranded all the pools behind it — and a stranded fallback pool
+        stays referenced by ``self._fallbacks`` (PTB reuses this transport
+        object across ``HTTPXRequest.initialize()``), so its descriptors are not
+        even reclaimable by GC. Measured on the M1 2026-08-12 against a peer
+        that FINs an idle keep-alive socket: 4/4 fallback sockets stayed in
+        CLOSE_WAIT; with this body, 0/4. That is the shape of the 2026-08-11
+        19:37 BST EMFILE incident (101 CLOSE_WAIT sockets, 62 of them to the
+        sticky fallback IP 149.154.166.110).
+
+        ``_primary`` is closed LAST on purpose: when the network breaks it is
+        the pool most likely to be the wedged one (system DNS dead, traffic
+        pinned to a fallback IP), and the caller may bound this close —
+        ``TelegramAdapter._drain_polling_connections`` wraps it in
+        ``asyncio.wait_for(..., _DRAIN_TIMEOUT)``. Closing the fallbacks first
+        means a bounded caller still gets their descriptors back.
+
+        A pool that refuses to close means leaked descriptors, so failures are
+        logged at WARNING and the first one is re-raised — never swallowed.
+        """
         async with self._fallback_lock:
-            transports = list(self._fallbacks.values())
+            transports: list = list(self._fallbacks.values())
             self._fallbacks.clear()
+        transports.append(self._primary)
+
+        first_error: Exception | None = None
         for transport in transports:
-            await transport.aclose()
+            try:
+                await transport.aclose()
+            except Exception as exc:
+                logger.warning(
+                    "[Telegram] Failed to close an httpx pool (%s: %s); its sockets "
+                    "stay open until the process exits",
+                    type(exc).__name__,
+                    exc,
+                )
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
 
 
 def _normalize_fallback_ips(values: Iterable[str]) -> list[str]:
@@ -299,6 +466,48 @@ def _rewrite_request_for_ip(request: httpx.Request, ip: str) -> httpx.Request:
         stream=request.stream,
         extensions=extensions,
     )
+
+
+class _PoolReleasingStream(httpx.AsyncByteStream):
+    """Marks a pool busy until the response body it carries is closed.
+
+    ``handle_async_request`` returns as soon as the response HEADERS are in, but
+    the connection stays checked out of the pool until the body is drained. The
+    idle-pool reaper therefore cannot use "the transport call returned" as the
+    end of the attempt — a concurrent request finishing elsewhere would close
+    the pool underneath an in-progress download. Release happens on
+    ``aclose()``, which httpx guarantees for every response it hands out.
+    """
+
+    def __init__(self, inner, release) -> None:
+        self._inner = inner
+        self._release = release
+        self._released = False
+
+    async def __aiter__(self):
+        async for chunk in self._inner:
+            yield chunk
+
+    async def aclose(self) -> None:
+        try:
+            inner_aclose = getattr(self._inner, "aclose", None)
+            if inner_aclose is not None:
+                await inner_aclose()
+        finally:
+            if not self._released:
+                self._released = True
+                self._release()
+
+
+def _attach_pool_release(response: httpx.Response, transport, key: str) -> None:
+    """Keep ``key`` marked in-flight until ``response``'s body is closed."""
+    stream = getattr(response, "stream", None)
+    if stream is None or not hasattr(stream, "__aiter__"):
+        # Nothing to wait for (a fully-materialised response): the attempt is
+        # over the moment we get here.
+        transport._release_pool(key)
+        return
+    response.stream = _PoolReleasingStream(stream, lambda: transport._release_pool(key))
 
 
 def _is_retryable_connect_error(exc: Exception) -> bool:

@@ -107,11 +107,19 @@ async def test_failed_fallback_pool_is_discarded_and_closed(monkeypatch):
 
     # Each fallback pool that was built for a failing IP must have been
     # aclose()d exactly once (two fallback IPs → two discards).
-    assert len(closed_log) == 2, (
-        f"Expected 2 discarded/closed fallback pools, got {len(closed_log)} — "
+    #
+    # The primary pool is filtered out by identity rather than counted: since
+    # the idle-pool reaper (2026-08-12) the transport also drains whichever
+    # pools a request did not use, so ``len(closed_log)`` no longer measures
+    # the discard-on-failure path this test is about. Counting every aclose()
+    # in the process would make this assertion fail for a reason that has
+    # nothing to do with #71593.
+    fallback_closes = [t for t in closed_log if t is not transport._primary]
+    assert len(fallback_closes) == 2, (
+        f"Expected 2 discarded/closed fallback pools, got {len(fallback_closes)} — "
         "the discard-on-failure path did not aclose() the poisoned pools."
     )
-    assert all(t.closed for t in closed_log)
+    assert all(t.closed for t in fallback_closes)
 
 
 def test_caller_limits_win_over_pool_default(monkeypatch):

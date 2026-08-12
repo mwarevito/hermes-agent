@@ -2073,6 +2073,46 @@ class APIServerAdapter(BasePlatformAdapter):
             cache[key] = db
         return db
 
+    def _close_cached_session_dbs(self) -> None:
+        """Close every writable SessionDB this adapter opened and cached.
+
+        ``_open_and_cache_session_db`` parks one WRITABLE ``SessionDB`` per
+        profile home in ``_session_dbs``. The reconnect loop in ``gateway.run``
+        builds a FRESH adapter on every retry, so without this drain each
+        abandoned generation keeps a live writer on ``state.db`` for the rest
+        of the process: its db + WAL descriptors, a WAL writer slot, and an
+        entry in ``sqlite_safe_read._live_connections`` that disables the
+        byte-probe backup guard for that file. Exactly the leak
+        ``_response_store.close()`` fixes for the response store
+        (#37011 / #38803) -- the SessionDB cache is the half that fix missed.
+
+        Called only after the aiohttp site and runner are stopped, so no
+        request handler can still be mid-statement on one of these
+        connections; closing here can never pull a connection out from under
+        a live cursor.
+
+        ``self._session_db`` is deliberately left alone: that slot is the
+        explicit test/manual override, owned by whoever injected it.
+        """
+        cache = getattr(self, "_session_dbs", None)
+        if not cache:
+            return
+        for key, db in list(cache.items()):
+            try:
+                db.close()
+            except Exception:
+                # WARNING, not debug: a writer that refuses to close keeps its
+                # descriptor and its registry entry for the life of the
+                # process. Debug-level silence is what let the sibling
+                # response-store leak run for hours before EMFILE.
+                logger.warning(
+                    "[%s] Failed to close cached SessionDB for %s",
+                    self.name,
+                    key,
+                    exc_info=True,
+                )
+        cache.clear()
+
     def _ensure_session_db(self):
         """Lazily initialise and return the SessionDB for the active profile home.
 
@@ -7115,13 +7155,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.debug(
                     "Failed to close response store for %s", self.name, exc_info=True,
                 )
-        if self._site:
-            await self._site.stop()
-            self._site = None
-        if self._runner:
-            await self._runner.cleanup()
-            self._runner = None
-        self._app = None
+        try:
+            if self._site:
+                await self._site.stop()
+                self._site = None
+            if self._runner:
+                await self._runner.cleanup()
+                self._runner = None
+            self._app = None
+        finally:
+            # After the HTTP server is down, never before: see the method
+            # docstring. In ``finally`` so a failing site/runner teardown
+            # cannot skip the drain and silently reintroduce the leak.
+            self._close_cached_session_dbs()
         logger.info("[%s] API server stopped", self.name)
 
     async def send(

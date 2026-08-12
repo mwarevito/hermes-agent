@@ -1788,6 +1788,68 @@ def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
             handle.close()
 
 
+class _ThreadReadConnCloser:
+    """Closes one thread's read-only ``state.db`` connection when it dies.
+
+    :meth:`SessionDB._get_read_conn` opens a read-only connection *per
+    thread* and parks it in ``threading.local``.  Keeping a strong reference
+    in ``SessionDB._read_conns`` stops the GC from reclaiming that connection
+    **un-closed** (an un-closed free cancels this process's POSIX advisory
+    locks on the file — see ``hermes_cli.sqlite_safe_read``), but until
+    2026-08-12 nothing closed it when the owning thread ended: the set was
+    drained only by ``SessionDB.close()``, which for the gateway means
+    process exit.
+
+    So every throwaway worker thread that ran one recall/browse query burned
+    two descriptors (``state.db`` + its ``-wal``) for the life of the
+    process.  On 2026-08-11 19:37 BST that suffocated the personal gateway at
+    the launchd default of 256 fds: ``lsof`` counted 105 leaked state.db
+    handles (54 + 51 ``-wal``), fd numbers spread 10..252, and the bot
+    answered with a FALSE "Provider authentication failed" because
+    ``auth.json`` could no longer be opened.  A 15-hour sample after the
+    restart still grew ~1.3 handles/hour, i.e. the leak reproduced at the
+    same rate.
+
+    CPython drops a ``threading.local``'s per-thread values while the thread
+    is being torn down, so this holder's ``__del__`` runs **on that same
+    thread** — the one sqlite3 always permits to close the connection —
+    making the release deterministic at thread exit rather than dependent on
+    a GC cycle that a descriptor-starved process may never reach.
+    """
+
+    __slots__ = ("_conn", "_conns", "_lock")
+
+    def __init__(self, conn, conns, lock):
+        self._conn = conn
+        self._conns = conns
+        self._lock = lock
+
+    def __del__(self):
+        conn, self._conn = self._conn, None
+        if conn is None:
+            return
+        try:
+            with self._lock:
+                self._conns.discard(conn)
+            conn.close()
+        except Exception as exc:
+            # ``__del__`` may not propagate (Python would only print
+            # "Exception ignored"), but the failure must not be invisible:
+            # a read connection that refuses to close keeps its descriptor
+            # AND its live-connection registry entry for the rest of the
+            # process, which silently disables byte-probe protection for
+            # this database. Log it; the nested guard only covers the
+            # interpreter-shutdown case where logging itself is gone.
+            try:
+                logger.warning(
+                    "read connection for a finished thread failed to close: %s",
+                    exc,
+                    exc_info=True,
+                )
+            except Exception:
+                pass
+
+
 class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin):
     """
     SQLite-backed session storage with FTS5 search.
@@ -1915,7 +1977,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Strong set of all live read connections across all threads.  We
         # hold a reference so short-lived reader threads' connections are
         # not GC'd without close() — that would leak tracked fds in
-        # _live_connections.  close() drains this set.
+        # _live_connections.  Entries leave this set either when their
+        # owning thread dies (_ThreadReadConnCloser, the normal case in a
+        # long-lived gateway) or when close() drains what is left.
         self._read_conns: "set[sqlite3.Connection]" = set()
         self._read_conns_lock = threading.Lock()
         # Set when close() begins.  _get_read_conn checks this under the
@@ -2176,6 +2240,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 f"file:{self.db_path}?mode=ro",
                 tracking_path=self.db_path,
                 uri=True,
+                # The connection is only ever *used* by the thread that owns
+                # it (it is reachable through this threading.local alone), so
+                # sqlite3's same-thread guard protects nothing here — while
+                # it did break close(): draining _read_conns from another
+                # thread raised ProgrammingError, close() swallowed it, and
+                # the descriptor survived as GC-only garbage with its
+                # registry entry stuck forever (2026-08-11 EMFILE incident).
+                check_same_thread=False,
                 timeout=5.0,
                 isolation_level=None,
             )
@@ -2202,6 +2274,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             logger.debug("read-only connection open failed for %s", self.db_path, exc_info=True)
             return None
         self._read_local.conn = conn
+        # Bind the connection's lifetime to this thread's. Without the holder
+        # the connection outlives its thread inside _read_conns until
+        # SessionDB.close() — process exit for the gateway — which is the
+        # 2026-08-11 fd leak (~1.3 descriptors/hour, 256-fd ceiling).
+        self._read_local.closer = _ThreadReadConnCloser(
+            conn, self._read_conns, self._read_conns_lock
+        )
         return conn
 
     @contextmanager
@@ -2742,9 +2821,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         for conn in read_conns:
             try:
                 conn.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                # Never silent: a read connection that will not close keeps
+                # its descriptor and its live-connection registry entry for
+                # the rest of the process, which disables byte-probe
+                # protection for this database. Before 2026-08-12 this arm
+                # fired on EVERY cross-thread drain (ProgrammingError from
+                # sqlite3's same-thread guard) and said nothing.
+                logger.warning(
+                    "SessionDB.close: read connection for %s failed to close: %s",
+                    self.db_path,
+                    exc,
+                    exc_info=True,
+                )
         self._read_local.conn = None
+        # Drop this thread's holder too, so the calling thread does not keep
+        # a closed connection reachable until it happens to die.
+        self._read_local.closer = None
         with self._lock:
             if self._conn:
                 if not self.read_only:

@@ -25,6 +25,8 @@ Hard constraints, enforced by tests/tools/test_claude_code_core.py:
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -55,8 +57,6 @@ FAILURE_MARKERS = (
     "ModuleNotFoundError",
     "npm ERR!",
     "fatal: not a git repository",
-    "MODULE_NOT_FOUND",
-    "ENOENT",
 )
 
 #: How much of each output file's tail the verdict scan reads.
@@ -236,9 +236,11 @@ def build_argv(
             budget = float(max_budget_usd)
         except (TypeError, ValueError):
             raise ValueError("max_budget_usd must be a number")
-        if not (0 < budget <= 1000):
-            raise ValueError("max_budget_usd out of range (0, 1000]")
-        argv += ["--max-budget-usd", ("%.2f" % budget).rstrip("0").rstrip(".")]
+        # Floor 0.01: the 2-decimal wire format renders anything smaller as
+        # "0", and what claude does with a $0 budget is undefined.
+        if not (0.01 <= budget <= 1000):
+            raise ValueError("max_budget_usd out of range [0.01, 1000]")
+        argv += ["--max-budget-usd", "%.2f" % budget]
     argv += ["--", prompt]
     return argv
 
@@ -578,6 +580,10 @@ DEFAULT_POLICY = {
         "Read", "Glob", "Grep", "Edit", "Write", "MultiEdit", "NotebookEdit",
         "Bash", "WebSearch", "WebFetch",
     )),
+    # Bash is NOT a default: a job gets a host shell under Tony's credentials
+    # only when it asks for it EXPLICITLY (and, on the terminal lane, only when
+    # its payload is signed). The default set can read and edit files but not
+    # spawn arbitrary processes.
     "default_tools": ("Read", "Glob", "Grep", "Edit", "Write", "MultiEdit"),
     "max_prompt_bytes": 100_000,
     "timeout_bounds": (60, 7200),
@@ -684,8 +690,8 @@ def validate_job(job, policy):
         budget = job.get("max_budget_usd")
         if budget is not None:
             if not isinstance(budget, (int, float)) or isinstance(budget, bool) \
-                    or not (0 < float(budget) <= 1000):
-                return None, "max_budget_usd must be a number in (0, 1000]"
+                    or not (0.01 <= float(budget) <= 1000):
+                return None, "max_budget_usd must be a number in [0.01, 1000]"
             norm["max_budget_usd"] = float(budget)
 
     if pol["allow_resume"]:
@@ -843,3 +849,79 @@ def extract_payload(body_text):
     if not isinstance(payload, dict) or payload.get("schema") != PAYLOAD_SCHEMA:
         return None
     return payload
+
+
+# --------------------------------------------------------------------------
+# Payload authentication — WHO produced this job, not what it says
+# --------------------------------------------------------------------------
+#
+# The terminal lane executes cards under Tony's full host credentials (a
+# personal claude-hermes launch, outside the docker sandbox and outside every
+# Givi gate). But a card body is written by whoever files the card — and the
+# semi-trusted workbot (Givi) can file cards with assignee=terminal via
+# kanban_create on its own boards. Without authentication, a hand-assembled
+# CLAUDE-CODE-JOB-V1 block from Givi would run arbitrary host Bash as Tony.
+#
+# So a typed job is trusted ONLY if it carries a valid HMAC signature made with
+# a key that lives in the personal ~/.hermes/.env — readable by the tool (in
+# the personal gateway) and the claimer (launchd, Tony's uid), but NOT by Givi:
+# Givi's file tools run inside docker and its own profile .env is separate.
+# Absence of a key is fail-CLOSED at the consumer: an unsigned/forged payload is
+# refused, never run. (Legacy prose cards without a payload block are a separate,
+# pre-existing path constrained by ~/.claude/settings.json.)
+
+PAYLOAD_SIG_FIELD = "sig"
+_SIGNING_ENV_KEY = "HERMES_CLAUDE_CODE_SIGNING_KEY"
+
+
+def _canonical_payload_bytes(payload):
+    """Deterministic bytes over every field EXCEPT the signature itself."""
+    body = {k: v for k, v in payload.items() if k != PAYLOAD_SIG_FIELD}
+    return json.dumps(body, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False).encode("utf-8")
+
+
+def sign_payload(payload, key):
+    """Return the hex HMAC-SHA256 of the payload under *key*. Raises ValueError
+    if the key is missing — signing must never silently produce an empty sig."""
+    if not key:
+        raise ValueError("signing key is required")
+    k = key.encode("utf-8") if isinstance(key, str) else key
+    return hmac.new(k, _canonical_payload_bytes(payload), hashlib.sha256).hexdigest()
+
+
+def payload_signature_valid(payload, key):
+    """Constant-time check that payload[sig] matches an HMAC made with *key*.
+
+    False on: no key, no signature, malformed signature, or mismatch. Never
+    raises — a consumer must be able to treat any anomaly as "not authentic"."""
+    if not key or not isinstance(payload, dict):
+        return False
+    got = payload.get(PAYLOAD_SIG_FIELD)
+    if not isinstance(got, str) or not got:
+        return False
+    try:
+        want = sign_payload(payload, key)
+    except Exception:
+        return False
+    return hmac.compare_digest(got, want)
+
+
+def read_signing_key(env=None, dotenv_path=None):
+    """Resolve the signing key: process env first, then a KEY=VALUE line in the
+    personal ~/.hermes/.env (the claimer does not inherit that file's vars).
+    Returns the key string or None. Never raises."""
+    env = os.environ if env is None else env
+    val = env.get(_SIGNING_ENV_KEY)
+    if val:
+        return val.strip() or None
+    path = dotenv_path or os.path.join(os.path.expanduser("~"), ".hermes", ".env")
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(_SIGNING_ENV_KEY + "="):
+                    return line.split("=", 1)[1].strip().strip("'\"") or None
+    except OSError:
+        return None
+    return None

@@ -87,12 +87,35 @@ def state_db(tmp_path):
 
 
 @pytest.fixture()
-def env(monkeypatch, launcher, fake_kanban, kanban_root, state_db):
+def signing_env(tmp_path, monkeypatch):
+    dotenv = tmp_path / "hermes.env"
+    dotenv.write_text("HERMES_CLAUDE_CODE_SIGNING_KEY=test-signing-key\n")
+    monkeypatch.setenv("HERMES_CLAUDE_CODE_DOTENV", str(dotenv))
+    return str(dotenv)
+
+
+@pytest.fixture()
+def claimer_state(tmp_path):
+    """A healthy, schema-matching claimer state file (the handshake target)."""
+    import time as _t
+    p = tmp_path / "claimer.json"
+    p.write_text(json.dumps({
+        "updated_at": _t.time(), "lane": "terminal", "pid": 4321,
+        "payload_schema": cct.PAYLOAD_SCHEMA, "core": "1.0.0",
+    }))
+    return p
+
+
+@pytest.fixture()
+def env(monkeypatch, launcher, fake_kanban, kanban_root, state_db,
+        claimer_state, signing_env):
     monkeypatch.setenv("HERMES_CLAUDE_CODE_TOOL", "1")
     monkeypatch.setenv("HERMES_CLAUDE_CODE_LAUNCHER", launcher)
     monkeypatch.setenv("HERMES_CLAUDE_CODE_KANBAN_BIN", fake_kanban["bin"])
     monkeypatch.setenv("HERMES_CLAUDE_CODE_KANBAN_ROOT", kanban_root)
     monkeypatch.setenv("HERMES_CLAUDE_CODE_STATE_DB", state_db)
+    monkeypatch.setenv("HERMES_CLAUDE_CODE_CLAIMER_STATE", str(claimer_state))
+    # signing_env fixture already set HERMES_CLAUDE_CODE_DOTENV with the key.
     return fake_kanban
 
 
@@ -133,9 +156,19 @@ def test_hidden_without_launcher(monkeypatch, tmp_path):
     assert cct.check_claude_code_requirements() is False
 
 
+def test_hidden_when_hermes_home_is_not_personal(monkeypatch, launcher, tmp_path):
+    """Flag can leak down an inherited env line into a clinic gateway; binding
+    to the personal ~/.hermes stops the tool (with host Bash) appearing there."""
+    monkeypatch.setenv("HERMES_CLAUDE_CODE_TOOL", "1")
+    monkeypatch.setenv("HERMES_CLAUDE_CODE_LAUNCHER", launcher)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes" / "profiles" / "workbot"))
+    assert cct.check_claude_code_requirements() is False
+
+
 def test_exposed_with_flag_and_launcher(monkeypatch, launcher):
     monkeypatch.setenv("HERMES_CLAUDE_CODE_TOOL", "1")
     monkeypatch.setenv("HERMES_CLAUDE_CODE_LAUNCHER", launcher)
+    monkeypatch.delenv("HERMES_HOME", raising=False)
     assert cct.check_claude_code_requirements() is True
 
 
@@ -178,7 +211,8 @@ def test_run_files_card_and_wires_wakeup(env):
     out = json.loads(cct.handle_claude_code(args, session_id="sess-123"))
     assert out["filed"] is True and out["card"] == "t_deadbeef"
     assert out["lane"] == "terminal" and out["session_wake"] is True
-    assert out["chat_notify"] is True
+    assert out["chat_notify"] is True and out["wake_wired"] is True
+    assert "разбудит" in out["note"]
 
     calls = _calls(env)
     create = next(c for c in calls if "create" in c)
@@ -192,6 +226,8 @@ def test_run_files_card_and_wires_wakeup(env):
     assert payload["timeout_seconds"] == 900
     assert payload["max_budget_usd"] == 2.0
     assert payload["filed_by_session"] == "sess-123"
+    # payload is signed with the key the claimer will verify against
+    assert cct.core.payload_signature_valid(payload, "test-signing-key")
 
     sub = next(c for c in calls if "notify-subscribe" in c)
     assert "t_deadbeef" in sub
@@ -234,6 +270,63 @@ def test_run_denies_live_hermes_checkout(env, tmp_path, monkeypatch):
     out = json.loads(cct.handle_claude_code(
         {"action": "run", "prompt": "p", "repo": ghost}))
     assert "error" in out and "denied" in out["error"]
+
+
+@pytest.mark.parametrize("ghost_rel", [".hermes/x", "hermes-agent", "hermes-ops"])
+def test_run_denylist_matches_the_givi_runner(env, tmp_path, monkeypatch, ghost_rel):
+    """hermes-ops and hermes-agent are denied on the lane too — a job that could
+    Edit the policy source could rewrite the rule that admits it."""
+    monkeypatch.setenv("HERMES_CLAUDE_CODE_REPO_ROOTS", str(tmp_path) + os.sep)
+    out = json.loads(cct.handle_claude_code(
+        {"action": "run", "prompt": "p", "repo": str(tmp_path / ghost_rel)}))
+    assert "error" in out and "denied" in out["error"]
+
+
+def test_run_bash_is_not_a_default_tool(env):
+    """A job gets a host shell only when it asks; Bash is never silently added."""
+    cct.handle_claude_code({"action": "run", "prompt": "p"})
+    create = next(c for c in _calls(env) if "create" in c)
+    payload = cct.extract_payload(_flag(create, "--body"))
+    assert "Bash" not in payload["allowed_tools"]
+    assert "Read" in payload["allowed_tools"]
+
+
+def test_run_refuses_without_signing_key(env, monkeypatch, tmp_path):
+    """No key = the lane cannot authenticate the job; don't file an unrunnable card."""
+    monkeypatch.delenv("HERMES_CLAUDE_CODE_SIGNING_KEY", raising=False)
+    empty = tmp_path / "empty.env"
+    empty.write_text("FOO=bar\n")
+    monkeypatch.setenv("HERMES_CLAUDE_CODE_DOTENV", str(empty))
+    out = json.loads(cct.handle_claude_code({"action": "run", "prompt": "p"}))
+    assert "error" in out and "signing key" in out["error"]
+    assert not any("create" in c for c in _calls(env))  # nothing filed
+
+
+def test_run_refuses_when_no_live_claimer(env, monkeypatch, tmp_path):
+    """No live consumer that speaks our schema = the card would sit unrun."""
+    monkeypatch.setenv("HERMES_CLAUDE_CODE_CLAIMER_STATE", str(tmp_path / "gone.json"))
+    out = json.loads(cct.handle_claude_code({"action": "run", "prompt": "p"}))
+    assert "error" in out and "claimer" in out["error"].lower()
+
+
+def test_run_refuses_on_schema_skew(env, monkeypatch, claimer_state):
+    """A claimer speaking a different payload schema would mis-read the job."""
+    claimer_state.write_text(json.dumps({
+        "updated_at": __import__("time").time(), "payload_schema": "claude-code-job-v0",
+    }))
+    out = json.loads(cct.handle_claude_code({"action": "run", "prompt": "p"}))
+    assert "error" in out and "skew" in out["error"].lower()
+
+
+def test_run_honest_note_when_wake_half_wired(env, monkeypatch):
+    """session stamped but no subscription (origin unresolved) → do NOT promise
+    a wake-up; the notifier fires only inside the subscription loop."""
+    monkeypatch.setattr(cct, "_resolve_origin", lambda cfg, sid: None)
+    out = json.loads(cct.handle_claude_code(
+        {"action": "run", "prompt": "p"}, session_id="sess-123"))
+    assert out["session_wake"] is True and out["chat_notify"] is False
+    assert out["wake_wired"] is False
+    assert "разбудит" not in out["note"] and "сам" in out["note"]
 
 
 # ---------------------------------------------------------------------------

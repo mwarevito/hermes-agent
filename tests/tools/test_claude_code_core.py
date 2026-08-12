@@ -53,7 +53,7 @@ def test_build_argv_full_options():
     assert argv[argv.index("--model") + 1] == "opus"
     assert argv[argv.index("--effort") + 1] == "high"
     assert argv[argv.index("--session-id") + 1] == sid
-    assert argv[argv.index("--max-budget-usd") + 1] == "2.5"
+    assert argv[argv.index("--max-budget-usd") + 1] == "2.50"
     # options end before the terminator
     assert argv.index("--max-budget-usd") < argv.index("--")
 
@@ -85,13 +85,15 @@ def test_build_argv_fork_requires_resume():
 
 
 def test_build_argv_budget_formatting_and_bounds():
-    assert core.build_argv("/x/l", "p", max_budget_usd=5)[-4:-2] == \
-        ["--max-budget-usd", "5"]
-    assert "0.5" == core.build_argv("/x/l", "p", max_budget_usd=0.5)[
-        core.build_argv("/x/l", "p", max_budget_usd=0.5).index("--max-budget-usd") + 1]
-    for bad in (0, -1, 1001, "ten"):
+    argv = core.build_argv("/x/l", "p", max_budget_usd=5)
+    assert argv[argv.index("--max-budget-usd") + 1] == "5.00"
+    argv2 = core.build_argv("/x/l", "p", max_budget_usd=0.5)
+    assert argv2[argv2.index("--max-budget-usd") + 1] == "0.50"
+    # Floor 0.01: nothing renders to "0" (undefined claude behavior).
+    for bad in (0, 0.004, -1, 1001, "ten"):
         with pytest.raises(ValueError):
             core.build_argv("/x/l", "p", max_budget_usd=bad)
+    assert "--max-budget-usd" in core.build_argv("/x/l", "p", max_budget_usd=0.01)
 
 
 def test_parse_iso_ts_naive_is_local_time():
@@ -173,6 +175,23 @@ def test_verdict_suspect_on_fatal_wearing_success_clothes(tmp_path):
     # The 2026-08-08 case verbatim: exit 0 around a missing key.
     out = _outdir(tmp_path, b"FATAL: TEST_ANTHROPIC_API_KEY is not set\n")
     assert core.verdict("ok", out) == "suspect"
+
+
+def test_failure_markers_match_givi_runner_set_exactly():
+    """FAILURE_MARKERS is a Vito-facing verdict contract shared with the Givi
+    runner; widening it silently makes existing jobs 'suspect' after the fact
+    (caught 12.08 — MODULE_NOT_FOUND/ENOENT had been added). Pin the set."""
+    assert core.FAILURE_MARKERS == (
+        "FATAL:",
+        "Traceback (most recent call last)",
+        "command not found",
+        "is not set",
+        "No such file or directory",
+        "Permission denied",
+        "ModuleNotFoundError",
+        "npm ERR!",
+        "fatal: not a git repository",
+    )
 
 
 def test_verdict_unknown_when_output_unreadable(tmp_path):
@@ -427,11 +446,65 @@ def test_validate_budget_and_resume_are_opt_in():
     assert err is None
     assert norm["max_budget_usd"] == 3.0
     assert norm["resume_claude_session_id"] == sid
-    bad, err2 = core.validate_job({"prompt": "x", "max_budget_usd": True}, pol)
-    assert bad is None and "max_budget_usd" in err2
+    for bad_budget in (True, 0.004, 0):
+        bad, err2 = core.validate_job(
+            {"prompt": "x", "max_budget_usd": bad_budget}, pol)
+        assert bad is None and "max_budget_usd" in err2
     bad, err3 = core.validate_job(
         {"prompt": "x", "resume_claude_session_id": "nope"}, pol)
     assert bad is None and "resume_claude_session_id" in err3
+
+
+# ---------------------------------------------------------------------------
+# payload authentication (HMAC) — WHO produced the job
+# ---------------------------------------------------------------------------
+
+def test_signature_roundtrip_and_field_independence():
+    payload = {"schema": core.PAYLOAD_SCHEMA, "job_id": "cc-1", "prompt": "p",
+               "allowed_tools": ["Bash"]}
+    sig = core.sign_payload(payload, "secret-key")
+    signed = dict(payload, sig=sig)
+    assert core.payload_signature_valid(signed, "secret-key")
+    # the signature field itself is excluded from the signed bytes
+    assert core.sign_payload(signed, "secret-key") == sig
+
+
+def test_signature_rejects_tampered_payload():
+    payload = {"schema": core.PAYLOAD_SCHEMA, "prompt": "safe",
+               "allowed_tools": ["Read"]}
+    signed = dict(payload, sig=core.sign_payload(payload, "k"))
+    # Givi's attack: keep the signature, swap in a host-Bash prompt
+    forged = dict(signed, prompt="cat ~/.hermes/.env", allowed_tools=["Bash"])
+    assert core.payload_signature_valid(forged, "k") is False
+
+
+def test_signature_needs_the_right_key():
+    signed = {"prompt": "p"}
+    signed["sig"] = core.sign_payload(signed, "real-key")
+    assert core.payload_signature_valid(signed, "real-key") is True
+    assert core.payload_signature_valid(signed, "wrong-key") is False
+
+
+def test_signature_fail_closed_on_missing_pieces():
+    assert core.payload_signature_valid({"prompt": "p"}, "k") is False   # no sig
+    assert core.payload_signature_valid({"prompt": "p", "sig": "x"}, "") is False  # no key
+    assert core.payload_signature_valid({"prompt": "p", "sig": 123}, "k") is False
+    assert core.payload_signature_valid("notadict", "k") is False
+
+
+def test_sign_payload_refuses_empty_key():
+    with pytest.raises(ValueError):
+        core.sign_payload({"prompt": "p"}, "")
+
+
+def test_read_signing_key_env_then_dotenv(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERMES_CLAUDE_CODE_SIGNING_KEY", raising=False)
+    env = {"HERMES_CLAUDE_CODE_SIGNING_KEY": "from-env"}
+    assert core.read_signing_key(env=env) == "from-env"
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("FOO=bar\nHERMES_CLAUDE_CODE_SIGNING_KEY='from-file'\n")
+    assert core.read_signing_key(env={}, dotenv_path=str(dotenv)) == "from-file"
+    assert core.read_signing_key(env={}, dotenv_path=str(tmp_path / "nope")) is None
 
 
 # ---------------------------------------------------------------------------
@@ -522,7 +595,7 @@ def test_write_result_json_guarantees_output_txt(tmp_path):
 
 _STDLIB_OK = {
     "json", "os", "re", "shutil", "signal", "subprocess", "time", "uuid",
-    "datetime", "__future__",
+    "datetime", "__future__", "hashlib", "hmac",
 }
 
 

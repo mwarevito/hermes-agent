@@ -45,8 +45,13 @@ extract_payload = core.extract_payload
 _CARD_ID_RE = re.compile(r"\bt_[0-9a-f]{8}\b")
 _KANBAN_TIMEOUT = 120
 
-#: Margin added to the job timeout for the card's own runtime cap, so the
-#: kanban-side reaper never fires before the claimer's own kill ladder.
+#: Margin added to the job timeout for the card's own --max-runtime. NOTE: the
+#: kanban runtime reaper (enforce_max_runtime) filters worker_pid IS NOT NULL,
+#: and a terminal claim has a NULL worker_pid — so this cap does not actually
+#: gate the run today. It is set generously (and would still be too small for a
+#: resume, which can reach ~2x timeout) purely as a harmless upper bound; the
+#: real budget is the claimer's own timeout + claim TTL. Kept so a future reaper
+#: change does not suddenly clip a legitimate long run.
 CARD_RUNTIME_MARGIN_SECONDS = 900
 
 
@@ -70,11 +75,19 @@ def _cfg():
         "board": os.environ.get("HERMES_CLAUDE_CODE_BOARD", "hermes-infra"),
         "kanban_root": kanban_root,
         "runs_root": os.path.join(kanban_root, "terminal-runs"),
+        "claimer_state": os.environ.get(
+            "HERMES_CLAUDE_CODE_CLAIMER_STATE",
+            os.path.join(home, ".hermes", "state",
+                         "kanban-terminal-claimer.json")),
         "state_db": os.environ.get(
             "HERMES_CLAUDE_CODE_STATE_DB",
             os.path.join(os.environ.get("HERMES_HOME",
                                         os.path.join(home, ".hermes")),
                          "state.db")),
+        "dotenv": os.environ.get(
+            "HERMES_CLAUDE_CODE_DOTENV",
+            os.path.join(os.environ.get("HERMES_HOME",
+                                        os.path.join(home, ".hermes")), ".env")),
         "allowed_repo_roots": tuple(
             p for p in os.environ.get(
                 "HERMES_CLAUDE_CODE_REPO_ROOTS",
@@ -84,18 +97,52 @@ def _cfg():
     }
 
 
+def _claimer_health(cfg):
+    """Read the terminal-claimer's state file: is a consumer alive, and does it
+    speak our payload schema? Returns (ok, reason). A card filed when no live
+    claimer understands CLAUDE-CODE-JOB-V1 would sit unrun or be mis-read as
+    prose — the producer refuses rather than file a job into a void."""
+    try:
+        with open(cfg["claimer_state"], "r", encoding="utf-8") as f:
+            st = json.load(f)
+    except OSError:
+        return False, "no terminal-claimer state file — the lane daemon is not installed/running"
+    except Exception as e:
+        return False, "terminal-claimer state unreadable: %s" % e
+    age = None
+    try:
+        import time as _t
+        age = _t.time() - float(st.get("updated_at") or 0)
+    except Exception:
+        age = None
+    if age is None or age > 900:
+        return False, ("terminal-claimer state is stale (%s) — the lane daemon "
+                       "may be down; not filing a job that nothing will run"
+                       % ("%.0fs" % age if age is not None else "unknown age"))
+    if st.get("payload_schema") != PAYLOAD_SCHEMA:
+        return False, ("terminal-claimer speaks %r, tool speaks %r — version "
+                       "skew; a typed job would be mis-read"
+                       % (st.get("payload_schema"), PAYLOAD_SCHEMA))
+    return True, "ok"
+
+
 def _policy(cfg):
     return {
         "allowed_repo_roots": cfg["allowed_repo_roots"],
-        # The live hermes-agent checkout must never be a job repo (hot-editing
-        # the running bots' own code); dev clones and ~/coding are fine.
-        "denied_repo_substrings": ("/.hermes/",),
+        # Denied, in order of how the attack was found (adversarial review
+        # 12.08): the live hermes checkout AND the versioned policy source that
+        # the gates import at call time (hermes-ops) AND hermes-agent itself.
+        # A job that could Edit any of these could rewrite the rule that admits
+        # it. Kept identical to the Givi runner's DENIED_REPO_SUBSTRINGS.
+        "denied_repo_substrings": ("/.hermes/", "/hermes-agent/", "/hermes-ops/"),
         "roots_reason": "repo must live under ~/coding or ~/hermes-dev",
-        "denied_reason_fmt": ("repo path is denied (%s): jobs may not edit the "
-                              "live hermes checkout"),
-        # The personal bot is the trusted caller here: Bash included by default.
-        "default_tools": ("Read", "Glob", "Grep", "Edit", "Write", "MultiEdit",
-                          "Bash"),
+        "denied_reason_fmt": ("repo path is denied (%s): it holds live Hermes "
+                              "code or the policy source the gates import"),
+        # Bash is NOT default even for the personal tool: a host shell is
+        # requested explicitly (allowed_tools=["...","Bash"]), never handed out
+        # silently. The claimer additionally requires a signed payload before it
+        # will run anything with Bash.
+        "default_tools": ("Read", "Glob", "Grep", "Edit", "Write", "MultiEdit"),
         "effort_levels": ("low", "medium", "high", "xhigh", "max"),
         "allow_budget": True,
         "allow_resume": False,  # resume is the claimer's recovery move, not an input
@@ -104,8 +151,18 @@ def _policy(cfg):
 
 def check_claude_code_requirements():
     """Expose the tool only where a profile explicitly opted in AND the
-    launcher actually exists. Checked live (registry caches ~30s)."""
+    launcher actually exists. Checked live (registry caches ~30s).
+
+    Also require HERMES_HOME to be the personal ~/.hermes: the flag lives in the
+    personal .env, but env can leak down an inherited process line into a clinic
+    gateway (observed 23.07). Binding to the personal home stops the tool from
+    silently appearing — with host Bash — in another bot's schema."""
     if os.environ.get("HERMES_CLAUDE_CODE_TOOL") != "1":
+        return False
+    home = os.path.expanduser("~")
+    hermes_home = os.path.realpath(
+        os.environ.get("HERMES_HOME", os.path.join(home, ".hermes")))
+    if hermes_home != os.path.realpath(os.path.join(home, ".hermes")):
         return False
     return os.access(_cfg()["launcher"], os.X_OK)
 
@@ -193,6 +250,22 @@ def _run(args, session_id):
     cfg = _cfg()
     board = args.get("board") or cfg["board"]
 
+    # The job runs under Tony's full host credentials, so the claimer will only
+    # execute a payload it can authenticate. Refuse to file one we cannot sign —
+    # an unsigned payload would just be blocked downstream, wasting a card.
+    signing_key = core.read_signing_key(dotenv_path=cfg["dotenv"])
+    if not signing_key:
+        return tool_error(
+            "claude_code signing key is not configured (HERMES_CLAUDE_CODE_"
+            "SIGNING_KEY in ~/.hermes/.env); the terminal lane will not run an "
+            "unauthenticated job",
+            error_type="claude_code_unconfigured")
+
+    # Producer↔consumer handshake: don't file into a void or a schema-skewed lane.
+    ok, why = _claimer_health(cfg)
+    if not ok:
+        return tool_error(why, error_type="claude_code_no_consumer")
+
     job_input = {
         "mode": "worktree" if args.get("repo") else "scratch",
         "prompt": args.get("prompt"),
@@ -210,6 +283,7 @@ def _run(args, session_id):
     payload["schema"] = PAYLOAD_SCHEMA
     payload["job_id"] = job_id
     payload["filed_by_session"] = session_id or None
+    payload[core.PAYLOAD_SIG_FIELD] = core.sign_payload(payload, signing_key)
 
     head = (norm.get("note") or norm["prompt"]).strip().splitlines()[0]
     title = "Claude Code: " + (head[:70] + ("…" if len(head) > 70 else ""))
@@ -250,6 +324,22 @@ def _run(args, session_id):
             except Exception:
                 subscribed = False
 
+    # The wake path fires ONLY inside the notifier's loop over SUBSCRIPTIONS, so
+    # a stamped session_id without a subscription wakes no one (adversarial
+    # review 12.08). Promise "don't poll" only when BOTH are in place; otherwise
+    # tell the model to check status itself — never write "you'll be woken" when
+    # the mechanism won't.
+    wired = bool(woken and subscribed)
+    if wired:
+        note = ("Не опрашивай карточку: завершение само разбудит эту сессию "
+                "через kanban-нотификатор.")
+    elif not session_id:
+        note = "session_id недоступен — пробуждения не будет, проверяй status вручную."
+    else:
+        note = ("Подписка на пробуждение НЕ встала (session_wake=%s, chat_notify=%s) "
+                "— автопробуждения не будет, проверяй claude_code(action=status) сам."
+                % (woken, subscribed))
+
     return json.dumps({
         "filed": True,
         "card": card,
@@ -260,12 +350,10 @@ def _run(args, session_id):
         "timeout_seconds": norm["timeout_seconds"],
         "session_wake": woken,
         "chat_notify": subscribed,
+        "wake_wired": wired,
         "artifacts_dir": os.path.join(cfg["runs_root"], card),
         "how_to_check": "claude_code(action=status, card_id=%r)" % card,
-        "note": ("Не опрашивай карточку: завершение само разбудит эту сессию "
-                 "через kanban-нотификатор." if woken else
-                 "session_id недоступен — пробуждения не будет, проверяй "
-                 "status вручную."),
+        "note": note,
     }, ensure_ascii=False)
 
 
@@ -364,9 +452,11 @@ CLAUDE_CODE_SCHEMA = {
                        "enum": ["low", "medium", "high", "xhigh", "max"],
                        "description": "Effort override; omit for default"},
             "max_budget_usd": {"type": "number",
-                               "description": "Dollar cap on the run's API "
-                                              "spend (second fuse after the "
-                                              "timeout)"},
+                               "description": "Dollar cap PER RUN (>=0.01), a "
+                                              "second fuse after the timeout. A "
+                                              "timed-out job resumes once with a "
+                                              "fresh cap, so worst-case card "
+                                              "spend is up to 2x this."},
             "note": {"type": "string",
                      "description": "Short human label for the card title"},
             "board": {"type": "string",

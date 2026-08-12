@@ -5288,6 +5288,7 @@ def release_stale_claims(
 
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+            conn=conn, run_id=row["current_run_id"],
         )
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
@@ -5369,7 +5370,8 @@ def reclaim_task(
     # worker_pid comes from the run, not the task row: see release_stale_claims
     # for why the task-row copy and the claim_lock pid are both wrong targets.
     row = conn.execute(
-        "SELECT t.status, t.claim_lock, r.worker_pid AS worker_pid "
+        "SELECT t.status, t.claim_lock, t.current_run_id, "
+        "       r.worker_pid AS worker_pid "
         "FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.id = ?",
         (task_id,),
@@ -5382,6 +5384,7 @@ def reclaim_task(
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
+        conn=conn, run_id=row["current_run_id"],
     )
     with write_txn(conn):
         cur = conn.execute(
@@ -8131,11 +8134,834 @@ def _pid_alive(pid: Optional[int]) -> bool:
     return True
 
 
+#: SIGTERM→SIGKILL window for a dead worker's orphaned descendants: ten polls
+#: of 0.3 s. An orphan has nothing to shut down beyond flushing its own output,
+#: and a reclaim tick must not stall on it. Measured on the M1 2026-08-12: a
+#: detached grandchild was already gone on the FIRST poll (<0.3 s), so the full
+#: 3 s window is only ever reached by a process actively ignoring SIGTERM —
+#: unlike the worker itself, which gets 5 s because it may be mid-commit.
+ORPHAN_TERM_POLLS = 10
+ORPHAN_TERM_POLL_SECONDS = 0.3
+
+#: Hard ceiling on how many session ids one run's lineage may contribute. A
+#: healthy worker run has a handful (one per compaction). Anything larger means
+#: the parent_session_id graph is wrong, and a huge id set would widen the
+#: registry match far beyond this run — so we stop and say so instead.
+MAX_RUN_SESSION_LINEAGE = 200
+
+#: How many individual refusals travel into the task_events payload. The count
+#: is always reported in full; only the per-pid detail is truncated.
+MAX_REPORTED_ORPHAN_REFUSALS = 20
+
+#: The phrase a kanban worker carries in its own argv. ``_default_spawn`` runs
+#: ``hermes -p <profile> … chat -q "work kanban task <id>"``, so this string is
+#: how a live process can be identified as the worker of a specific card
+#: without trusting the number ``task_runs.worker_pid`` happens to hold.
+#: Keep it in sync with the prompt built in :func:`_default_spawn` — the env
+#: var ``HERMES_KANBAN_TASK`` is the second, spawner-independent proof.
+WORKER_ARGV_TASK_MARKER = "work kanban task {task_id}"
+
+
+def _orphan_registry_path(home: Optional[Path] = None) -> Path:
+    """Path of the background-process registry (``processes.json``).
+
+    ``home`` is the HERMES_HOME the WORKER ran under — not the dispatcher's.
+    2026-08-12: resolving this from the reaping process's own
+    ``get_hermes_home()`` pointed at the wrong file for any cross-profile card.
+    ``tools.process_registry`` binds ``CHECKPOINT_PATH = get_hermes_home() /
+    "processes.json"`` at import time *inside the worker process*, and a worker
+    is spawned with ``HERMES_HOME=resolve_profile_env(assignee)``
+    (:func:`_default_spawn`) — so its rows are in the assignee's profile home.
+    The hermes-infra board carries 37 ``default`` cards and 1 ``workbot`` card,
+    and ``~/.hermes/profiles/workbot/processes.json`` is a separate file: for
+    that card the dispatcher-resolved path is a different file, and reading the
+    wrong file looks exactly like "this run had no orphans".
+
+    Import-time binding is still avoided: the path is resolved per call, so an
+    in-gateway reclaim (or a test) is never stuck with whatever HERMES_HOME was
+    active when ``process_registry`` first loaded.
+    """
+    if home is not None:
+        return Path(home) / "processes.json"
+    from hermes_constants import get_hermes_home
+    return get_hermes_home() / "processes.json"
+
+
+def _run_task_context(
+    conn,
+    *,
+    run_id=None,
+    task_id: Optional[str] = None,
+) -> tuple:
+    """``(task_id, worker_hermes_home)`` — the two things the orphan reap needs.
+
+    The task id is the worker's identity proof (it is in the worker's argv:
+    ``chat -q "work kanban task <id>"``, see :func:`_default_spawn`), and the
+    home is where that worker's ``processes.json`` / ``state.db`` actually are.
+
+    The home is derived exactly the way the spawn derived it —
+    ``normalize_profile_name`` then ``resolve_profile_env`` on the run's
+    profile (falling back to the task's current assignee) — because any other
+    derivation is a guess, and a guess reads an empty file and reports "no
+    orphans found". Returns ``None`` for the home when it cannot be resolved;
+    the caller then falls back to this process's own HERMES_HOME, which is
+    right for the default profile and the only thing left for anything else.
+    """
+    if conn is None:
+        return task_id, None
+    profile = None
+    try:
+        if run_id is not None:
+            row = conn.execute(
+                "SELECT task_id, profile FROM task_runs WHERE id = ?",
+                (int(run_id),),
+            ).fetchone()
+            if row is not None:
+                task_id = task_id or row["task_id"]
+                profile = row["profile"]
+        if task_id and not profile:
+            row = conn.execute(
+                "SELECT assignee FROM tasks WHERE id = ?", (str(task_id),),
+            ).fetchone()
+            profile = (row["assignee"] if row else None) or None
+    except (sqlite3.Error, TypeError, ValueError) as exc:
+        _log.warning(
+            "orphan reap: cannot read the profile of task %s / run %s (%s) — "
+            "falling back to this process's HERMES_HOME, which is the wrong "
+            "file for a card assigned to another profile", task_id, run_id, exc,
+        )
+        return task_id, None
+    if not profile:
+        return task_id, None
+    try:
+        from hermes_cli.profiles import (
+            normalize_profile_name,
+            resolve_profile_env,
+        )
+        home = Path(resolve_profile_env(normalize_profile_name(str(profile))))
+    except Exception as exc:
+        _log.info(
+            "orphan reap: profile %r of task %s does not resolve to a home "
+            "(%s) — using this process's HERMES_HOME instead",
+            profile, task_id, exc,
+        )
+        return task_id, None
+    return task_id, home
+
+
+def _host_start_time(pid: int) -> Optional[int]:
+    """Kernel start ticks for a live pid, or None when unavailable.
+
+    Same encoding ``process_registry`` records in ``host_start_time``, so the
+    two are directly comparable — that comparison is what makes a recycled pid
+    unkillable (``tools/process_registry.py::_host_pid_is_ours``).
+    """
+    try:
+        from gateway.status import get_process_start_time
+        return get_process_start_time(int(pid))
+    except Exception as exc:  # pragma: no cover - psutil is a hard dep
+        _log.warning(
+            "orphan reap: cannot read the start time of pid %s (%s) — its "
+            "identity cannot be confirmed", pid, exc,
+        )
+        return None
+
+
+def _self_pid_and_ancestors() -> set:
+    """This process plus every ancestor — pids that must never be signalled.
+
+    The reclaim runs inside the gateway when the dispatcher is in-process, so
+    "our ancestors" includes the very supervisor a bad kill would take down.
+    """
+    pids = {os.getpid()}
+    try:
+        pids.add(os.getppid())
+    except Exception as exc:  # pragma: no cover
+        _log.warning("orphan reap: cannot read own parent pid (%s)", exc)
+    try:
+        import psutil
+        for parent in psutil.Process().parents():
+            pids.add(int(parent.pid))
+    except Exception as exc:
+        # Loud, not silent: with only getppid the self-protection guard covers
+        # a single level of ancestry instead of the whole chain.
+        _log.warning(
+            "orphan reap: ancestor walk unavailable (%s) — self-protection is "
+            "limited to pid %s and its immediate parent", exc, os.getpid(),
+        )
+    return pids
+
+
+def _process_command_line(pid: int) -> str:
+    """Live command line of ``pid``, or "" when it cannot be read."""
+    try:
+        from gateway.status import _read_process_cmdline
+        return _read_process_cmdline(int(pid)) or ""
+    except Exception as exc:
+        _log.warning(
+            "orphan reap: cannot read the command line of pid %s (%s)", pid, exc,
+        )
+        return ""
+
+
+def _signal_refusal_reason(
+    pid,
+    *,
+    expected_start: Optional[int] = None,
+    self_pids: Optional[set] = None,
+    strict: bool = False,
+    require_recorded_start: bool = False,
+) -> Optional[str]:
+    """Why ``pid`` must not be signalled, or None when signalling it is allowed.
+
+    These refusals are worth more than the reap they guard. ``tasks.claim_lock``
+    carries the DISPATCHER's pid, and with the dispatcher running in-gateway
+    that is the gateway process itself — the live value on 2026-08-11 was
+    ``MacBookPro.mynet:81235``, the supervisor of all seven bots plus the
+    terminal-claimer. Any killer that ever aims one number wide takes down the
+    whole host, so the same predicate gates every signal this module sends.
+
+    Refused unconditionally: pid ≤ 1 (0 means "our own process group", 1 is
+    init/launchd, negatives are killpg semantics), this process, any ancestor of
+    it, and anything whose command line contains ``gateway run``.
+
+    ``strict`` additionally refuses a live pid whose command line cannot be
+    read. It is set for the orphan reap — kills this module did not make before
+    — because there we would rather leak a process than guess. It is NOT set for
+    the worker kill, which predates this guard: failing closed there would
+    release the claim beside a live worker and spawn a duplicate.
+
+    ``expected_start`` is the kernel start time recorded when the process was
+    registered/snapshotted; a mismatch means the number was recycled onto an
+    unrelated process and must never be touched.
+
+    ``require_recorded_start`` turns a MISSING ``expected_start`` into a
+    refusal (2026-08-12). Without it the recycled-pid guard silently covered
+    only the rows that happen to carry a start time: a legacy registry row, or
+    one whose ``psutil`` probe failed at snapshot time, arrived here with
+    ``expected_start=None`` and every check passed for an arbitrary live
+    process. That is the failure ``tools/process_registry.py::_host_pid_is_ours``
+    already names — "a recycled number landed on a desktop browser's session
+    leader → Firefox dying" — except on a cron tick instead of a user action.
+    Set for the orphan reap, where a leaked process costs money and a wrong
+    kill costs someone's session. Not set for the worker kill, which has no
+    recorded start time anywhere (``task_runs`` has no such column) and whose
+    failing closed would hold the claim forever.
+    """
+    try:
+        pid_i = int(pid)
+    except (TypeError, ValueError):
+        return "pid_not_an_int"
+    if pid_i <= 1:
+        return "pid_not_signalable"
+    forbidden = self_pids if self_pids is not None else _self_pid_and_ancestors()
+    if pid_i in forbidden:
+        return "self_or_ancestor"
+    if not _pid_alive(pid_i):
+        # Nothing to signal. Not a refusal — the caller decides what a dead
+        # candidate means (for the reap it means "prunable").
+        return None
+    cmd = _process_command_line(pid_i)
+    if not cmd:
+        if strict:
+            return "cmdline_unreadable"
+    elif "gateway run" in cmd:
+        return "gateway_process"
+    if expected_start is None:
+        if require_recorded_start:
+            return "start_time_unknown"
+    else:
+        live_start = _host_start_time(pid_i)
+        if live_start != expected_start:
+            return (
+                f"start_time_mismatch(recorded={expected_start},live={live_start})"
+            )
+    return None
+
+
+def _process_env_value(pid, key: str) -> Optional[str]:
+    """One environment variable of a live process, or None when unreadable.
+
+    Second opinion for :func:`_worker_identity_refusal`. ``psutil`` reads the
+    environment block for same-uid processes on both Linux and macOS (verified
+    on the M1 2026-08-12); every failure mode — a different uid, a platform
+    without the API, a process that just exited — is "unknown", never "match".
+    """
+    try:
+        import psutil
+        return psutil.Process(int(pid)).environ().get(key)
+    except Exception:
+        return None
+
+
+def _worker_identity_refusal(
+    pid,
+    task_id: Optional[str],
+    *,
+    self_pids: Optional[set] = None,
+) -> Optional[str]:
+    """Why ``pid`` cannot be PROVEN to be this task's worker, or None if it can.
+
+    2026-08-12, the one place the orphan reap was worse than the code it
+    replaced. The worker pid arrives from ``task_runs.worker_pid`` and nothing
+    ever confirmed it: ``task_runs`` has no start-time column, so
+    :func:`_signal_refusal_reason` has no ``expected_start`` to check and
+    returns None for any unrelated live process. The old reclaim then signalled
+    one process group; the new one additionally walks that stranger's whole
+    descendant tree and hands every child to the reaper. A pid recycled onto a
+    terminal, an editor or a browser turns a stale board row into a killing
+    spree.
+
+    So the tree walk demands POSITIVE identification instead of the absence of
+    an objection. A kanban worker is spawned as
+    ``hermes -p <profile> … chat -q "work kanban task <task_id>"`` with
+    ``HERMES_KANBAN_TASK=<task_id>`` in its environment
+    (:func:`_default_spawn`), so the task id is in the process's own argv and
+    env. Either one matching is proof; neither matching means we do not know
+    what this process is, and we do not touch its tree.
+
+    Strict generic refusals apply first (pid ≤ 1, self/ancestor, ``gateway
+    run``, unreadable command line) — an unreadable command line is exactly the
+    case where identity cannot be established.
+
+    The worker's OWN termination is deliberately NOT gated on this: that kill
+    predates the guard, aims at one process group, and failing it closed would
+    hold the claim forever behind a pid nobody can identify. This gate governs
+    the NEW capability only — the tree walk.
+    """
+    reason = _signal_refusal_reason(pid, self_pids=self_pids, strict=True)
+    if reason is not None:
+        return reason
+    try:
+        pid_i = int(pid)
+    except (TypeError, ValueError):
+        return "pid_not_an_int"
+    if not _pid_alive(pid_i):
+        # Nothing to walk: the children were reparented to init the moment it
+        # died. Normal on the crash path, so it is not an alarm — but the
+        # caller must still say the tree source produced nothing.
+        return "worker_not_alive"
+    tid = str(task_id or "").strip()
+    if not tid:
+        return "task_id_unknown"
+    # The exact phrase ``_default_spawn`` puts in argv, not a bare id
+    # substring: a task id is ten characters, and "a command line that mentions
+    # this card" is not "the worker of this card" — a worker told to inspect
+    # t_x, a grep, an editor with the file open would all match a substring
+    # test and get their process trees walked.
+    if WORKER_ARGV_TASK_MARKER.format(task_id=tid) in (
+        _process_command_line(pid_i) or ""
+    ):
+        return None
+    # The canonical signal: the worker reads this variable to know which card
+    # it is working, so any spawner must set it, however it builds its argv.
+    if _process_env_value(pid_i, "HERMES_KANBAN_TASK") == tid:
+        return None
+    return "not_this_tasks_worker"
+
+
+def _snapshot_worker_descendants(pid, task_id: Optional[str] = None) -> list:
+    """Live descendants of the worker, captured BEFORE it is signalled.
+
+    This snapshot cannot be taken afterwards: the moment the worker dies its
+    children are reparented to init and the PPID links that make them findable
+    are gone. That is precisely why a post-mortem tree walk finds nothing and
+    the leak went unnoticed.
+
+    The worker pid must be PROVABLY this task's worker first
+    (:func:`_worker_identity_refusal`): walking the tree of a pid we cannot
+    identify enumerates a stranger's children and hands them to the reaper —
+    and if ``task_runs.worker_pid`` ever named the gateway, that is every bot
+    on the host. When identity cannot be established the walk is skipped and
+    the registry (matched by ``session_key``, not by pid) stays as the only
+    source; that degradation is a leak, and a leak is the cheaper mistake.
+    """
+    out: list = []
+    refusal = _worker_identity_refusal(pid, task_id)
+    if refusal == "worker_not_alive":
+        _log.info(
+            "orphan reap: worker pid %s (task %s) is already gone — no process "
+            "tree to snapshot; registry rows are the only orphan source",
+            pid, task_id,
+        )
+        return out
+    if refusal is not None:
+        _log.error(
+            "orphan reap: refusing to walk the process tree of alleged worker "
+            "pid %s of task %s (%s) — its identity as this task's worker "
+            "cannot be established; no descendants collected. Any process this "
+            "run leaked outside the registry stays alive on purpose.",
+            pid, task_id, refusal,
+        )
+        return out
+    try:
+        import psutil
+        children = psutil.Process(int(pid)).children(recursive=True)
+    except Exception as exc:
+        # A dead worker is the normal case on the crash-detection path, so this
+        # is informational there — but it must still be visible, because it
+        # means the registry is the only remaining source.
+        _log.info(
+            "orphan reap: no process tree for worker %s (%s) — registry rows "
+            "are the only orphan source for this run", pid, exc,
+        )
+        return out
+    for child in children:
+        try:
+            cmdline = " ".join(child.cmdline() or []) or (child.name() or "")
+            out.append({
+                "pid": int(child.pid),
+                "host_start_time": _host_start_time(child.pid),
+                "command": cmdline,
+                "source": "process_tree",
+            })
+        except Exception as exc:
+            _log.info(
+                "orphan reap: descendant of worker %s vanished mid-walk (%s)",
+                pid, exc,
+            )
+    return out
+
+
+def _session_compaction_lineage(
+    session_id: str,
+    home: Optional[Path] = None,
+) -> set:
+    """Every session id in ``session_id``'s parent/child chain in state.db.
+
+    Read through a separate read-only connection instead of ``SessionDB`` so a
+    reclaim tick never runs schema init / FTS probes against a busy state.db,
+    and can never write to it.
+
+    Deliberately permissive — it walks both directions and does not filter
+    branch/delegate children the way ``SessionDB.get_compression_lineage``
+    does. Over-collecting a subagent's session is harmless here (its processes
+    belong to the same run); under-collecting leaves a live orphan unfound.
+    """
+    ids = {session_id}
+    # The worker's state.db, not the dispatcher's: a worker runs under
+    # ``HERMES_HOME=resolve_profile_env(assignee)``, so a cross-profile card's
+    # sessions were written to that profile's file (see _orphan_registry_path).
+    if home is not None:
+        path = Path(home) / "state.db"
+    else:
+        from hermes_constants import get_hermes_home
+        path = get_hermes_home() / "state.db"
+    if not path.exists():
+        _log.info(
+            "orphan reap: %s does not exist — session lineage of %s cannot be "
+            "expanded; only processes registered under that exact id match",
+            path, session_id,
+        )
+        return ids
+    try:
+        sconn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
+    except sqlite3.Error as exc:
+        _log.warning(
+            "orphan reap: cannot open %s read-only (%s) — session lineage of "
+            "%s not expanded", path, exc, session_id,
+        )
+        return ids
+    try:
+        rows = sconn.execute(
+            """
+            WITH RECURSIVE up(id, parent) AS (
+                SELECT id, parent_session_id FROM sessions WHERE id = ?
+                UNION
+                SELECT s.id, s.parent_session_id
+                FROM sessions s JOIN up ON s.id = up.parent
+            ),
+            chain(id) AS (
+                SELECT id FROM up
+                UNION
+                SELECT s.id FROM sessions s JOIN chain ON s.parent_session_id = chain.id
+            )
+            SELECT id FROM chain
+            """,
+            (session_id,),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        _log.warning(
+            "orphan reap: session lineage query failed on %s (%s) — lineage of "
+            "%s not expanded", path, exc, session_id,
+        )
+        return ids
+    finally:
+        try:
+            sconn.close()
+        except sqlite3.Error as exc:
+            _log.warning("orphan reap: read-only state.db close failed (%s)", exc)
+    found = {str(r[0]) for r in rows if r and r[0]}
+    if len(found) > MAX_RUN_SESSION_LINEAGE:
+        _log.error(
+            "orphan reap: session %s reports a lineage of %d ids (cap %d) — the "
+            "parent_session_id graph is not a chain; refusing to widen the "
+            "registry match beyond the run's own session",
+            session_id, len(found), MAX_RUN_SESSION_LINEAGE,
+        )
+        return ids
+    ids |= found
+    return ids
+
+
+def _run_worker_session_ids(conn, run_id, home: Optional[Path] = None) -> set:
+    """Every agent session id this run's worker has owned.
+
+    ``task_runs.owner_session_id`` holds only the CURRENT one: it is re-stamped
+    on every context compaction (``carry_run_owner_session``), while a
+    ``processes.json`` row keeps whichever id was current when that process was
+    spawned. Matching on the current value alone therefore returns a silent zero
+    for everything the worker started before it compacted — for a long run,
+    most of it. The compaction chain lives in ``sessions.parent_session_id``.
+    """
+    ids: set = set()
+    if conn is None or run_id is None:
+        _log.info(
+            "orphan reap: no run context (conn=%s run_id=%s) — the process "
+            "registry cannot be searched for this worker's orphans",
+            conn is not None, run_id,
+        )
+        return ids
+    try:
+        row = conn.execute(
+            "SELECT owner_session_id FROM task_runs WHERE id = ?", (int(run_id),)
+        ).fetchone()
+    except (sqlite3.Error, TypeError, ValueError) as exc:
+        _log.warning(
+            "orphan reap: cannot read owner_session_id of run %s (%s) — "
+            "registry rows cannot be attributed to it", run_id, exc,
+        )
+        return ids
+    owner = (row["owner_session_id"] if row else None) or ""
+    if not owner:
+        _log.info(
+            "orphan reap: run %s has no owner_session_id — only the "
+            "process-tree snapshot can find its orphans", run_id,
+        )
+        return ids
+    return _session_compaction_lineage(str(owner), home=home)
+
+
+def _registry_orphan_candidates(
+    session_ids,
+    home: Optional[Path] = None,
+) -> tuple:
+    """``(rows, source_status)`` for ``processes.json`` rows of this run.
+
+    ``session_key`` is the only usable link: the registry's ``task_id`` column
+    is dead in production — every row in the live file carries the literal
+    string ``"default"`` (2026-08-11), so filtering on it matches everything or
+    nothing. Sandbox-scoped rows are skipped: their pids are meaningless on the
+    host and signalling them would hit an unrelated host process.
+
+    The second element exists because "no rows" and "never read the file" are
+    different facts that used to be reported identically (2026-08-12): a
+    missing ``processes.json`` returned ``[]`` without a single log line, and
+    the reap summary then announced what it found and killed as though the
+    source had been consulted. ``read`` / ``no_sessions`` / ``absent`` /
+    ``unreadable`` / ``not_a_list`` are carried into the log line and into the
+    task event, so "found 0" can always be told apart from "looked nowhere".
+    """
+    out: list = []
+    if not session_ids:
+        return out, "no_sessions"
+    path = _orphan_registry_path(home)
+    if not path.exists():
+        _log.info(
+            "orphan reap: %s does not exist — the process registry was NOT "
+            "consulted for this run; anything it registered is unreachable "
+            "from here", path,
+        )
+        return out, "absent"
+    try:
+        rows = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        _log.warning(
+            "orphan reap: cannot read %s (%s) — registry orphans of this run "
+            "cannot be found", path, exc,
+        )
+        return out, "unreadable"
+    if not isinstance(rows, list):
+        _log.warning(
+            "orphan reap: %s holds %s, not a list — skipping the registry "
+            "source", path, type(rows).__name__,
+        )
+        return out, "not_a_list"
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("session_key") or "") not in session_ids:
+            continue
+        if str(row.get("pid_scope") or "host") != "host":
+            continue
+        out.append({
+            "pid": row.get("pid"),
+            "host_start_time": row.get("host_start_time"),
+            "command": str(row.get("command") or ""),
+            "source": "registry",
+        })
+    return out, "read"
+
+
+def _prune_dead_registry_rows(
+    session_ids,
+    dead_pids,
+    home: Optional[Path] = None,
+) -> int:
+    """Drop ``processes.json`` rows of this run whose pid is confirmed dead.
+
+    ⚑ Removing rows WITHOUT killing the process (tried and reverted 2026-08-11)
+    is strictly worse than doing nothing: the survivor keeps running but also
+    disappears from ``process(kill)``, so the last handle on it is gone. Hence
+    the ``dead_pids`` argument — only pids this reap has just confirmed dead.
+
+    ``processes.json`` has several writers (each registry instance rewrites it
+    whole from its own memory), so a concurrent gateway checkpoint can restore
+    a row we removed. That is cosmetic: the process behind it is dead either
+    way, and the row for a dead session is dropped by the next checkpoint.
+    """
+    if not session_ids or not dead_pids:
+        return 0
+    path = _orphan_registry_path(home)
+    if not path.exists():
+        return 0
+    try:
+        rows = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        _log.warning(
+            "orphan reap: cannot re-read %s to prune %d dead row(s) (%s)",
+            path, len(dead_pids), exc,
+        )
+        return 0
+    if not isinstance(rows, list):
+        return 0
+    keep = []
+    removed = 0
+    for row in rows:
+        if (
+            isinstance(row, dict)
+            and str(row.get("session_key") or "") in session_ids
+            and str(row.get("pid_scope") or "host") == "host"
+            and row.get("pid") in dead_pids
+        ):
+            removed += 1
+            continue
+        keep.append(row)
+    if not removed:
+        return 0
+    try:
+        from utils import atomic_json_write
+        atomic_json_write(path, keep)
+    except Exception as exc:
+        _log.warning(
+            "orphan reap: killed %d orphan(s) but could not rewrite %s (%s) — "
+            "the rows stay behind as stale entries", removed, path, exc,
+        )
+        return 0
+    return removed
+
+
+def _reap_worker_orphans(
+    worker_pid,
+    session_ids,
+    *,
+    snapshot=None,
+    kill=None,
+    run_id=None,
+    home: Optional[Path] = None,
+) -> dict:
+    """Terminate what a now-dead worker left running, then prune its registry rows.
+
+    A worker's children are spawned with ``start_new_session=True``
+    (``tools/process_registry.py``), so each leads its OWN process group and the
+    ``killpg(worker_pgid)`` in :func:`_terminate_reclaimed_worker` provably never
+    reaches them. On 2026-08-11 that left ``pid 53706 claude-hermes -c --model
+    opus`` (registry ``session_key`` ``20260811_161505_13208e`` = run 34's owner
+    session) running after run 34 was killed by the runtime cap: a live Claude
+    with no handle on it, still spending money.
+
+    Two candidate sources, because each is blind where the other sees:
+
+    * ``snapshot`` — the process tree taken before the worker was signalled.
+      The only source that finds children the worker never registered, and
+      useless afterwards (init adopts them).
+    * ``processes.json`` rows whose ``session_key`` is in the run's session
+      lineage. The only source that survives the worker's death.
+
+    Every kill is gated by :func:`_signal_refusal_reason` in strict mode, a
+    candidate leaves the registry only once its pid is confirmed dead, and the
+    counts are logged on every call — this function is never allowed to be
+    silent about what it found and what it left behind.
+    """
+    import signal
+
+    info: dict[str, Any] = {
+        "orphans_found": 0,
+        "orphans_terminated": 0,
+        "orphans_remaining": 0,
+        "orphan_rows_pruned": 0,
+        "orphan_refusals": [],
+    }
+    session_ids = set(session_ids or ())
+
+    candidates = list(snapshot or [])
+    registry_rows, registry_source = _registry_orphan_candidates(
+        session_ids, home=home,
+    )
+    candidates.extend(registry_rows)
+    # Reported unconditionally: a count of what was found means nothing until
+    # you know whether the sources were actually read (2026-08-12).
+    info["orphan_registry_source"] = registry_source
+    info["orphan_registry_path"] = str(_orphan_registry_path(home))
+    info["orphan_tree_source"] = "snapshot" if snapshot else "none"
+
+    # Dedupe by pid. When both sources name the same pid, keep the entry that
+    # carries a recorded start time — the identity check matters more than
+    # which source found it.
+    by_pid: dict = {}
+    for cand in candidates:
+        try:
+            pid_i = int(cand.get("pid"))
+        except (TypeError, ValueError):
+            info["orphan_refusals"].append(f"{cand.get('pid')!r}:pid_not_an_int")
+            continue
+        prev = by_pid.get(pid_i)
+        if prev is None or (
+            prev.get("host_start_time") is None
+            and cand.get("host_start_time") is not None
+        ):
+            by_pid[pid_i] = dict(cand, pid=pid_i)
+    info["orphans_found"] = len(by_pid)
+
+    self_pids = _self_pid_and_ancestors()
+    worker_pid_i = None
+    try:
+        worker_pid_i = int(worker_pid) if worker_pid else None
+    except (TypeError, ValueError):
+        worker_pid_i = None
+
+    targets: list = []
+    confirmed_dead: list = []
+    for pid_i in sorted(by_pid):
+        cand = by_pid[pid_i]
+        if worker_pid_i is not None and pid_i == worker_pid_i:
+            info["orphan_refusals"].append(f"{pid_i}:worker_itself")
+            continue
+        reason = _signal_refusal_reason(
+            pid_i,
+            expected_start=cand.get("host_start_time"),
+            self_pids=self_pids,
+            strict=True,
+            # No recorded start time = no way to tell this pid from a recycled
+            # number pointing at someone's browser. Refuse and say so.
+            require_recorded_start=True,
+        )
+        if reason is not None:
+            info["orphan_refusals"].append(f"{pid_i}:{reason}")
+            continue
+        if not _pid_alive(pid_i):
+            confirmed_dead.append(pid_i)
+            continue
+        targets.append(pid_i)
+
+    signal_fn = kill if kill is not None else (
+        os.kill if hasattr(os, "kill") else None
+    )
+    if targets and signal_fn is None:
+        _log.error(
+            "orphan reap: no signal primitive on this platform — %d live "
+            "orphan(s) left running: %s", len(targets), targets,
+        )
+        info["orphans_remaining"] = len(targets)
+        targets = []
+
+    if targets:
+        _orphan_signal_round(signal_fn, targets, signal.SIGTERM)
+        survivors = _wait_for_orphan_exit(targets)
+        if survivors:
+            _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+            _orphan_signal_round(signal_fn, survivors, _sigkill)
+            _wait_for_orphan_exit(survivors)
+        for pid_i in targets:
+            if _pid_alive(pid_i):
+                info["orphans_remaining"] += 1
+            else:
+                info["orphans_terminated"] += 1
+                confirmed_dead.append(pid_i)
+
+    info["orphan_rows_pruned"] = _prune_dead_registry_rows(
+        session_ids, set(confirmed_dead), home=home,
+    )
+
+    # This dict is merged into a task_events payload, so the refusal list is
+    # bounded: a corrupted registry with thousands of rows on one session must
+    # not write an unbounded blob into the board. The COUNT is always exact —
+    # truncating the detail is fine, hiding that it happened is not.
+    refusals = info["orphan_refusals"]
+    info["orphan_refusal_count"] = len(refusals)
+    if len(refusals) > MAX_REPORTED_ORPHAN_REFUSALS:
+        info["orphan_refusals"] = refusals[:MAX_REPORTED_ORPHAN_REFUSALS] + [
+            f"…{len(refusals) - MAX_REPORTED_ORPHAN_REFUSALS} more"
+        ]
+
+    level = (
+        logging.WARNING
+        if (
+            info["orphans_remaining"]
+            or info["orphan_refusals"]
+            or registry_source in ("unreadable", "not_a_list")
+        )
+        else logging.INFO
+    )
+    _log.log(
+        level,
+        "kanban orphan reap (run=%s worker=%s): found %d, terminated %d, "
+        "remaining %d; registry rows pruned %d; refused %s; sessions %s; "
+        "registry source %s (%s); process-tree source %s",
+        run_id, worker_pid, info["orphans_found"], info["orphans_terminated"],
+        info["orphans_remaining"], info["orphan_rows_pruned"],
+        info["orphan_refusals"] or "none", sorted(session_ids) or "none",
+        registry_source, info["orphan_registry_path"],
+        info["orphan_tree_source"],
+    )
+    return info
+
+
+def _orphan_signal_round(signal_fn, pids, sig) -> None:
+    """Send ``sig`` to each pid, reporting (not swallowing) every failure."""
+    for pid_i in pids:
+        try:
+            signal_fn(pid_i, sig)
+        except ProcessLookupError:
+            _log.info(
+                "orphan reap: pid %s was already gone when signal %s was sent",
+                pid_i, int(sig),
+            )
+        except OSError as exc:
+            _log.warning(
+                "orphan reap: signal %s to pid %s failed (%s) — it may survive",
+                int(sig), pid_i, exc,
+            )
+
+
+def _wait_for_orphan_exit(pids) -> list:
+    """Poll ``pids`` for the bounded grace window; return those still alive."""
+    survivors = list(pids)
+    for _ in range(ORPHAN_TERM_POLLS):
+        survivors = [p for p in survivors if _pid_alive(p)]
+        if not survivors:
+            return []
+        time.sleep(ORPHAN_TERM_POLL_SECONDS)
+    return [p for p in survivors if _pid_alive(p)]
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
     *,
     signal_fn=None,
+    conn: Optional[sqlite3.Connection] = None,
+    run_id: Optional[int] = None,
 ) -> dict[str, Any]:
     """Best-effort host-local worker termination for reclaim paths.
 
@@ -8160,6 +8986,21 @@ def _terminate_reclaimed_worker(
     handle a survivor has left — live at the time of the revert, pid 53706
     ``claude-hermes … --model opus``, session_key ``20260811_161505_13208e`` =
     run 34's owner session, still running after run 34 was killed.
+
+    2026-08-12 completes that thought instead of reversing it: the killpg still
+    never reaches those children, so we now KILL them and only then drop their
+    rows. ``_snapshot_worker_descendants`` runs BEFORE the worker is signalled
+    (afterwards init has adopted them and the PPID links are gone) and
+    :func:`_reap_worker_orphans` runs only once the worker is confirmed dead,
+    removing a registry row solely after that pid is confirmed dead too. Pass
+    ``conn``/``run_id`` so the registry can be searched by the run's session
+    lineage; without them only the process-tree snapshot is available and the
+    log says so.
+
+    The worker pid itself is now gated by :func:`_signal_refusal_reason`. It
+    used to be signalled on trust, and the number it comes from is one JOIN away
+    from ``claim_lock`` — the DISPATCHER's pid, which in-gateway is the
+    supervisor of all seven bots.
     """
     import signal
 
@@ -8171,13 +9012,48 @@ def _terminate_reclaimed_worker(
         "sigkill": False,
     }
 
-    if not pid or pid <= 0 or not claim_lock:
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    if not pid or pid <= 0:
+        # A host-local claim with no run pid is an anomaly worth seeing: there
+        # is no handle to kill, so anything that run started stays alive and
+        # the orphan reap cannot even be attempted (the reap must not run
+        # blind — without a pid we cannot establish that the worker is dead,
+        # and killing a live worker's Claude run would be worse than leaking
+        # it). Not silent, because "nothing happened" is a finding here.
+        if claim_lock and str(claim_lock).startswith(host_prefix):
+            _log.warning(
+                "kanban reclaim: host-local claim %s (run=%s) has no worker "
+                "pid — nothing can be terminated and this run's orphans, if "
+                "any, are unreachable", claim_lock, run_id,
+            )
+        return info
+    if not claim_lock:
         return info
 
-    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     if not str(claim_lock).startswith(host_prefix):
         return info
     info["host_local"] = True
+
+    refusal = _signal_refusal_reason(pid)
+    if refusal is not None:
+        # Not our worker: pid ≤ 1, ourselves, an ancestor, or something whose
+        # command line says ``gateway run``. ``termination_attempted`` stays
+        # False so ``_worker_survived_termination`` lets the normal release path
+        # run — a pid we refuse to manage must not hold a claim forever.
+        info["refused"] = refusal
+        _log.error(
+            "kanban reclaim: refusing to signal alleged worker pid %s (%s) — "
+            "claim_lock=%s. Nothing was signalled; the claim is released "
+            "without a kill.", pid, refusal, claim_lock,
+        )
+        return info
+
+    # Must happen BEFORE the kill: once the worker dies its children are
+    # reparented to init and become untraceable by any tree walk. The task id
+    # is what proves the pid is this run's worker at all, and the home is where
+    # that worker's registry/state actually live — see _run_task_context.
+    task_id, worker_home = _run_task_context(conn, run_id=run_id)
+    descendants = _snapshot_worker_descendants(pid, task_id=task_id)
 
     kill = signal_fn if signal_fn is not None else (
         os.kill if hasattr(os, "kill") else None
@@ -8198,17 +9074,30 @@ def _terminate_reclaimed_worker(
     for _ in range(10):
         if not _pid_alive(pid):
             info["terminated"] = True
-            return info
+            break
         time.sleep(0.5)
 
-    if _pid_alive(pid):
-        # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM
-        # (which maps to TerminateProcess via the stdlib shim).
-        _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-        _signal_worker_tree(int(pid), _sigkill, kill=kill, killpg=killpg)
-        info["sigkill"] = True
+    if not info["terminated"]:
+        if _pid_alive(pid):
+            # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM
+            # (which maps to TerminateProcess via the stdlib shim).
+            _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+            _signal_worker_tree(int(pid), _sigkill, kill=kill, killpg=killpg)
+            info["sigkill"] = True
+        info["terminated"] = not _pid_alive(pid)
 
-    info["terminated"] = not _pid_alive(pid)
+    if info["terminated"]:
+        info.update(_reap_worker_orphans(
+            pid, _run_worker_session_ids(conn, run_id, home=worker_home),
+            snapshot=descendants, kill=kill, run_id=run_id, home=worker_home,
+        ))
+    else:
+        # Deferring is correct (the reclaim is deferred too), but it must be
+        # visible: these descendants are still running and still costing money.
+        _log.warning(
+            "kanban reclaim: worker %s survived SIGKILL — %d snapshotted "
+            "descendant(s) NOT reaped this tick", pid, len(descendants),
+        )
     return info
 
 
@@ -8736,10 +9625,31 @@ def enforce_max_runtime(
         # want a cleaner shutdown can install their own SIGTERM handler
         # before the grace expires.
         killed = False
+        orphans: dict = {}
         kill = signal_fn if signal_fn is not None else (
             os.kill if hasattr(os, "kill") else None
         )
         if kill is not None:
+            refusal = _signal_refusal_reason(pid)
+            if refusal is not None:
+                # ``tasks.worker_pid`` naming the gateway (or us) must never be
+                # signalled here either — this is the only reaper that reads
+                # the task-row copy of the pid rather than the run's.
+                _log.error(
+                    "kanban runtime cap: refusing to signal alleged worker pid "
+                    "%s of task %s (%s) — nothing signalled", pid, tid, refusal,
+                )
+                kill = None
+        if kill is not None:
+            # Must precede the kill: afterwards the worker's children are
+            # reparented to init and no tree walk can find them. ``tid`` is the
+            # identity proof for the tree walk (the worker's argv carries it);
+            # ``worker_home`` points the registry search at the assignee's
+            # profile rather than the dispatcher's.
+            _tid, worker_home = _run_task_context(
+                conn, run_id=row["current_run_id"], task_id=tid,
+            )
+            descendants = _snapshot_worker_descendants(pid, task_id=tid)
             # Whole group, not just the wrapper — see _signal_worker_tree.
             _signal_worker_tree(pid, signal.SIGTERM, kill=kill)
             # Short polling wait — no time.sleep on the write txn.
@@ -8752,6 +9662,24 @@ def enforce_max_runtime(
                 _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
                 _signal_worker_tree(pid, _sigkill, kill=kill)
                 killed = True
+            # 2026-08-11: this is the path that capped run 34 of t_a6c52bb1 and
+            # left ``pid 53706 claude-hermes -c --model opus`` running — the
+            # worker's children lead their own process groups, so the killpg
+            # above never reached them.
+            if not _pid_alive(pid):
+                orphans = _reap_worker_orphans(
+                    pid,
+                    _run_worker_session_ids(
+                        conn, row["current_run_id"], home=worker_home,
+                    ),
+                    snapshot=descendants, kill=kill,
+                    run_id=row["current_run_id"], home=worker_home,
+                )
+            else:
+                _log.warning(
+                    "kanban runtime cap: worker %s survived SIGKILL — %d "
+                    "snapshotted descendant(s) NOT reaped", pid, len(descendants),
+                )
 
         with write_txn(conn):
             cur = conn.execute(
@@ -8771,6 +9699,7 @@ def enforce_max_runtime(
                     "outcome": outcome,
                     "progress": bool(progressed),
                 }
+                payload.update(orphans)
                 run_id = _end_run(
                     conn, tid,
                     outcome=outcome, status=outcome,
@@ -8880,7 +9809,7 @@ def detect_stale_running(
     reclaimed: list[str] = []
 
     rows = conn.execute(
-        "SELECT t.id, t.last_heartbeat_at, t.claim_lock, "
+        "SELECT t.id, t.last_heartbeat_at, t.claim_lock, t.current_run_id, "
         "       r.worker_pid AS worker_pid, "
         "       COALESCE(r.max_runtime_seconds, t.max_runtime_seconds) AS budget, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
@@ -8918,6 +9847,7 @@ def detect_stale_running(
         # Terminate the worker if it's still host-local.
         termination = _terminate_reclaimed_worker(
             pid, lock, signal_fn=signal_fn,
+            conn=conn, run_id=row["current_run_id"],
         )
 
         # Never release a claim while our own worker is still alive: that would
@@ -9204,6 +10134,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # counter (see the post-txn loop below).
     crash_details: list[tuple[str, int, str, bool, str]] = []
     # (task_id, pid, claimer, protocol_violation, error_text)
+    # (task_id, worker_pid, run_id) for the orphan reap that runs after this
+    # txn closes. The run id must be captured HERE: ``_end_run`` clears
+    # ``tasks.current_run_id``, and without it there is nothing left to tie a
+    # ``processes.json`` row to the run that spawned it.
+    reap_targets: list[tuple[str, int, Optional[int]]] = []
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
@@ -9313,6 +10248,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload,
                     run_id=run_id,
                 )
+                # Every branch below is a run that ENDED — the reap applies to
+                # all of them, so it is recorded before they diverge.
+                reap_targets.append((row["id"], pid, run_id))
                 if rate_limited_exit:
                     # Stamp the failure-error column so ``check_respawn_guard``
                     # recognizes this as a quota blocker and defers the
@@ -9342,6 +10280,58 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         (row["id"], pid, row["claim_lock"],
                          protocol_violation, error_text)
                     )
+    # 2026-08-12 — the other half of the leak, and the more common half.
+    #
+    # ``enforce_max_runtime`` was fixed first because that is where the live
+    # evidence was (pid 53706, ``claude-hermes -c --model opus``, still
+    # spending money after run 34 was capped). But a run far more often ends
+    # by the worker itself going away — nonzero exit, killed by a signal, the
+    # rate-limit sentinel, a clean exit with no terminal kanban call — and
+    # every one of those endings came through here, which closed the run and
+    # nulled ``worker_pid``/``claim_lock`` without ever looking for what the
+    # worker left behind. After ``_end_run`` there is no ``current_run_id`` to
+    # attribute a registry row to, so the leak became permanently unattributable
+    # one tick later.
+    #
+    # There is no process tree to walk on this path — a dead worker is the
+    # entry condition, and its children were reparented to init the moment it
+    # died — so the registry matched by session lineage is the only source, and
+    # ``snapshot=None`` says so rather than pretending otherwise.
+    #
+    # Runs OUTSIDE the write txn on purpose: the reap polls pids, may sleep
+    # through the SIGTERM→SIGKILL window and rewrites ``processes.json``. None
+    # of that may happen while the dispatcher holds the DB write lock.
+    for _reap_tid, _reap_pid, _reap_run in reap_targets:
+        try:
+            _, _reap_home = _run_task_context(
+                conn, run_id=_reap_run, task_id=_reap_tid,
+            )
+            _orphans = _reap_worker_orphans(
+                _reap_pid,
+                _run_worker_session_ids(conn, _reap_run, home=_reap_home),
+                snapshot=None, kill=None,
+                run_id=_reap_run, home=_reap_home,
+            )
+        except Exception as exc:
+            # Never let the reap break crash accounting: a task that is not
+            # released is worse than an orphan that is not killed.
+            _log.warning(
+                "orphan reap after the crash of task %s (run %s, worker %s) "
+                "failed (%s) — anything that run left running is still running",
+                _reap_tid, _reap_run, _reap_pid, exc,
+            )
+            continue
+        if (
+            _orphans.get("orphans_found")
+            or _orphans.get("orphans_remaining")
+            or _orphans.get("orphan_refusal_count")
+        ):
+            with write_txn(conn):
+                _append_event(
+                    conn, _reap_tid, "orphans_reaped", _orphans,
+                    run_id=_reap_run,
+                )
+
     # Outside the main txn: account each crashed task and maybe trip the
     # breaker (the task transitions ready → blocked with a ``gave_up`` event
     # on top of the event we already emitted).
@@ -10758,7 +11748,11 @@ def _default_spawn(
 
     profile_arg = normalize_profile_name(task.assignee)
 
-    prompt = f"work kanban task {task.id}"
+    # One string, two readers: this is the worker's prompt AND the phrase
+    # _worker_identity_refusal looks for in the live process' argv before it
+    # will walk that process's tree. Drift between them silently disables the
+    # orphan reap's only pid-side identity proof, so they share a constant.
+    prompt = WORKER_ARGV_TASK_MARKER.format(task_id=task.id)
     env = dict(os.environ)
     # The dispatcher is detached from every conversation. Its worker must never
     # inherit routing mirrored by a previous gateway turn, even before the first

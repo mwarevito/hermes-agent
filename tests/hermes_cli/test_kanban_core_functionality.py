@@ -279,7 +279,14 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
             )
             # Spawn by hand: claim + set pid + set active run start to the past.
             kb.claim_task(conn, tid)
-            kb._set_worker_pid(conn, tid, os.getpid())   # any live pid works
+            # NOT os.getpid(): since 2026-08-12 the reapers refuse to signal
+            # themselves or any ancestor (_signal_refusal_reason), because
+            # `claim_lock` carries the dispatcher's pid and in-gateway that IS
+            # the supervisor of all seven bots. A pid that is merely "not us" is
+            # all this test needs — `_pid_alive` is stubbed False just below, so
+            # no real process has to exist behind it.
+            worker_pid = 999_001
+            kb._set_worker_pid(conn, tid, worker_pid)
             # Backdate both the task-level first-start timestamp and the active
             # run timestamp so elapsed > limit under the per-run runtime model.
             old_started = int(time.time()) - 30
@@ -296,7 +303,7 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
 
             timed_out = kb.enforce_max_runtime(conn, signal_fn=_signal_fn)
             assert tid in timed_out
-            assert killed and killed[0][0] == os.getpid()
+            assert killed and killed[0][0] == worker_pid
 
             task = kb.get_task(conn, tid)
             assert task.status == "ready",                 f"timed-out task should reset to ready, got {task.status}"

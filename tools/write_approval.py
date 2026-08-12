@@ -201,6 +201,106 @@ def pending_count(subsystem: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Decision log — who spent the approval
+# ---------------------------------------------------------------------------
+
+# Append-only JSONL beside the queue it describes, so it is per-profile like
+# everything else under HERMES_HOME. ``.jsonl`` keeps it out of the ``*.json``
+# glob that enumerates pending records, and it sits one level above the
+# per-subsystem directories so a single file covers memory and skills.
+DECISION_LOG_NAME = "decisions.jsonl"
+
+
+def decision_log_path() -> Path:
+    return get_hermes_home() / "pending" / DECISION_LOG_NAME
+
+
+def record_decision(
+    subsystem: str,
+    pending_id: str,
+    decision: str,
+    *,
+    actor: Optional[str] = None,
+    actor_channel: str = "",
+    summary: str = "",
+    origin: str = "",
+    applied: Optional[bool] = None,
+    error: str = "",
+) -> str:
+    """Append one approve / reject / gate-flip to the decision log.
+
+    Why this exists (2026-08-12): until today exactly one person could approve
+    a staged memory/skill write, so "who approved it" was answered by the
+    profile itself. Now ``kivi`` has two approvers and ``workbot`` has four
+    (Vito's decision), and an unattributed decision to rewrite the bot's own
+    skills is not reviewable after the fact.
+
+    Returns "" on success, or the reason it failed. Callers must SURFACE a
+    non-empty return rather than ignore it: the write it describes has already
+    happened, and "it landed but nobody knows who" has to be visible in the
+    same reply, not just in a log file.
+
+    ``actor`` is recorded as ``unknown`` when the caller has no identity to
+    give. That is a real state (an old caller that was never plumbed), and it
+    is written down instead of being papered over.
+    """
+    actor_text = str(actor).strip() if actor is not None else ""
+    entry: Dict[str, Any] = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
+        "subsystem": subsystem,
+        "decision": decision,
+        "pending_id": pending_id or "",
+        "actor": actor_text or "unknown",
+        "actor_channel": str(actor_channel or "").strip(),
+        "summary": (summary or "").strip()[:300],
+        "origin": origin or "",
+    }
+    if applied is not None:
+        entry["applied"] = bool(applied)
+    if error:
+        entry["error"] = str(error)[:500]
+    try:
+        path = decision_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        return ""
+    except Exception as e:
+        logger.error(
+            "Could not record the %s decision for %s/%s by %s: %s",
+            decision, subsystem, pending_id or "-", entry["actor"], e,
+            exc_info=True,
+        )
+        return str(e) or e.__class__.__name__
+
+
+def read_decisions(limit: int = 0) -> List[Dict[str, Any]]:
+    """Return decision-log entries oldest first (``limit`` = last N, 0 = all).
+
+    Unparseable lines are reported as ``{"_unparsed": ...}`` rather than
+    dropped — a decision log with silent holes is worse than none.
+    """
+    path = decision_log_path()
+    if not path.exists():
+        return []
+    out: List[Dict[str, Any]] = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    out.append({"_unparsed": line[:500]})
+    except Exception as e:
+        logger.error("Could not read the decision log: %s", e, exc_info=True)
+        return out
+    return out[-limit:] if limit and limit > 0 else out
+
+
+# ---------------------------------------------------------------------------
 # Write origin
 # ---------------------------------------------------------------------------
 

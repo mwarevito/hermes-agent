@@ -40,6 +40,17 @@ from hermes_cli.browser_connect import (
 )
 
 
+def _cli_actor() -> str:
+    """Who is approving from the host terminal, for the decision log.
+
+    The CLI has no platform user id, but "someone at the host shell" is still
+    an attribution and is not interchangeable with a Telegram approver
+    (2026-08-12). Falls back to ``host`` rather than to an empty string, so a
+    machine without USER set still produces a readable entry.
+    """
+    return (os.getenv("USER") or os.getenv("LOGNAME") or "host").strip() or "host"
+
+
 class CLICommandsMixin:
     """Mixin holding the interactive-CLI slash-command handlers.
 
@@ -1778,6 +1789,7 @@ class CLICommandsMixin:
             out = handle_pending_subcommand(
                 wa.SKILLS, args,
                 set_mode_fn=lambda enabled: self._save_write_approval("skills", enabled),
+                actor=_cli_actor(), actor_channel="cli",
             )
             if out is not None:
                 print(out)
@@ -1859,6 +1871,7 @@ class CLICommandsMixin:
             wa.MEMORY, args,
             memory_store=store,
             set_mode_fn=lambda enabled: self._save_write_approval("memory", enabled),
+            actor=_cli_actor(), actor_channel="cli",
         )
         if out is None:
             out = ("Unknown /memory subcommand. "

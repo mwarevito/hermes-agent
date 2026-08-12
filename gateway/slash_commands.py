@@ -98,6 +98,24 @@ def _model_switch_skew_guard() -> Optional[str]:
     )
 
 
+def _actor_id(source) -> str:
+    """Platform user id of whoever is spending a staged-write decision.
+
+    Passed to the write-approval handler so the decision log names a person
+    (2026-08-12): ``kivi`` now has two approvers and ``workbot`` four, so
+    "the profile owner did it" stopped being an answer. Empty string when the
+    adapter gave us no id — recorded as ``unknown`` downstream rather than
+    quietly omitted.
+    """
+    return str(getattr(source, "user_id", "") or "").strip()
+
+
+def _actor_channel(source) -> str:
+    """Platform the actor id belongs to — a bare numeric id is ambiguous."""
+    platform = getattr(source, "platform", None)
+    return str(getattr(platform, "value", platform) or "").strip()
+
+
 class GatewaySlashCommandsMixin:
     """In-session slash-command handlers for GatewayRunner."""
 
@@ -3481,6 +3499,8 @@ class GatewaySlashCommandsMixin:
 
         out = handle_pending_subcommand(
             wa.MEMORY, args, memory_store=store, set_mode_fn=_set_approval,
+            actor=_actor_id(event.source),
+            actor_channel=_actor_channel(event.source),
         )
         if out is None:
             out = ("Unknown /memory subcommand. Use: pending, approve <id>, "
@@ -3552,6 +3572,8 @@ class GatewaySlashCommandsMixin:
 
         out = handle_pending_subcommand(
             wa.SKILLS, args, set_mode_fn=_set_approval,
+            actor=_actor_id(event.source),
+            actor_channel=_actor_channel(event.source),
         )
         if out is None:
             return ("Unknown /skills subcommand on this platform. Use: pending, "

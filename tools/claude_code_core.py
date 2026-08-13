@@ -37,7 +37,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-CORE_VERSION = "1.0.0"
+CORE_VERSION = "1.1.0"
 
 # --------------------------------------------------------------------------
 # Shared constants (formerly module globals of the Givi runner)
@@ -75,6 +75,55 @@ LANE_BUSY_MARKERS = (
 
 #: Exit code the launcher uses for "lane busy, retry later".
 LANE_BUSY_EXIT_CODE = 75
+
+#: Every way a run has said "I hit my ``--max-budget-usd`` cap", newest first.
+#: The first is claude's own text-mode wording, measured live 2026-08-12 and
+#: again 2026-08-13 (``output.txt`` was *exactly* ``Error: Exceeded USD budget
+#: (8)`` — 30 bytes, the whole file); the second is the wording carried inside
+#: the JSON result envelope (``errors: ["Reached maximum budget ($8)"]``). Kept
+#: as a tuple because the wording is claude's, not ours, and has already changed
+#: shape once.
+BUDGET_EXHAUSTED_MARKERS = (
+    "Exceeded USD budget",
+    "Reached maximum budget",
+)
+
+#: ⚑ ANCHORED, not a substring scan of the tail. A free scan reads a *mention*
+#: of the wording as the wording itself, and the trigger is not hypothetical:
+#: the terminal lane's allowed repo roots include ``~/coding/worktrees/*``, i.e.
+#: exactly the trees that hold this source file and its tests, and 13.08-class
+#: cards are ABOUT this code. A run that fails for a real reason while printing
+#: the marker somewhere in 256 KB of tail would otherwise be escalated as a cap
+#: kill: 3 runs, $8 → $16 → $32, and a fabricated $32 spend figure (reproduced
+#: by review 2026-08-13). So the claim must be made the way claude makes it —
+#: as the last thing the process says, at the start of its own line.
+BUDGET_EXHAUSTED_LINE_RE = re.compile(
+    r"^\s*Error:\s*(?:Exceeded USD budget|Reached maximum budget)\b")
+
+#: How many trailing non-empty lines may carry that final line. 1 is what the
+#: live artefact showed; 3 is slack for a launcher epilogue, and still anchored.
+BUDGET_EXHAUSTED_TAIL_LINES = 3
+
+#: Machine-readable equivalents on the ``--output-format json`` result envelope.
+#: Preferred over the wordings above whenever the envelope is present: they are
+#: fields, not prose.
+BUDGET_EXHAUSTED_SUBTYPE = "error_max_budget_usd"
+BUDGET_EXHAUSTED_TERMINAL_REASON = "budget_exhausted"
+
+#: The run status that means "the session is healthy, the allowance ran out".
+#: Deliberately NOT ``error``: 2026-08-13 three cards were killed by the cap and
+#: thrown away because ``error`` is (correctly) never resumed — the last of them
+#: had written 876 lines and 38 tests in 810 s. A cap is a budget decision, not
+#: a broken session, and it is the one failure whose recovery is "same session,
+#: bigger allowance".
+BUDGET_EXHAUSTED_STATUS = "budget_exhausted"
+
+#: Ceiling and continuation cap for budget escalation. Two continuations, not
+#: unlimited: a task that cannot finish inside cap → 2×cap → 4×cap is not a
+#: budgeting problem, and silently quadrupling spend on a wedged run is exactly
+#: the failure the cap exists to prevent.
+DEFAULT_BUDGET_CEILING_USD = 50.0
+DEFAULT_MAX_BUDGET_RESUMES = 2
 
 #: Untracked files a repo needs to actually RUN but never commits; a fresh
 #: worktree gets tracked content only, so these are carried in by copy.
@@ -245,25 +294,56 @@ def build_argv(
     return argv
 
 
-def resume_decision(prev_result, workspace_exists):
+def resume_decision(prev_result, workspace_exists,
+                    max_budget_resumes=DEFAULT_MAX_BUDGET_RESUMES):
     """Whether the NEXT run for the same task should resume the previous
     Claude session instead of starting over.
 
     Rules (deliberately narrow — resume is a recovery move, not a lifestyle):
     * the previous run must have minted+recorded a ``claude_session_id``;
-    * it must have ended ``timeout`` (ran out of time mid-work) — an ``error``
-      run is not resumed: its session state is what produced the error;
+    * it must have ended ``timeout`` (ran out of time mid-work) or
+      ``budget_exhausted`` (ran out of allowance mid-work) — an ``error`` run is
+      not resumed: its session state is what produced the error;
     * its workspace must still exist (the session's files are its memory);
-    * at most ONE resume per chain: a run that was itself a resume never
-      chains another (``resumed_from`` present ⇒ start fresh).
+    * at most ONE resume per chain for a timeout: a run that was itself a resume
+      never chains another (``resumed_from`` present ⇒ start fresh);
+    * at most ``max_budget_resumes`` continuations for a cap, counted in
+      ``budget_resume_count`` on the previous result. The cap gets its own
+      counter rather than reusing the timeout rule because the two answer
+      different questions: a timeout resume is "the wall clock beat us once",
+      a budget resume is "the allowance was set too low", and the second is
+      allowed to happen twice before we admit the estimate is wrong.
 
-    Returns {"resume": bool, "claude_session_id": str|None, "reason": str}.
+    Returns {"resume": bool, "claude_session_id": str|None, "reason": str},
+    plus ``budget_resume_count`` (the count the NEXT run should record) on the
+    budget branch only.
     """
     prev = prev_result if isinstance(prev_result, dict) else {}
     sid = prev.get("claude_session_id")
     if not is_claude_session_id(sid or ""):
         return {"resume": False, "claude_session_id": None,
                 "reason": "no claude_session_id recorded by the previous run"}
+    if prev.get("status") == BUDGET_EXHAUSTED_STATUS:
+        # A cap is not a fault: the session is healthy and its workspace holds
+        # the work already done. Resuming it costs the (already-paid) context
+        # re-entry once instead of paying for the whole task again from zero.
+        done = prev.get("budget_resume_count")
+        try:
+            done = int(done or 0)
+        except (TypeError, ValueError):
+            done = 0
+        if done >= max_budget_resumes:
+            return {"resume": False, "claude_session_id": None,
+                    "reason": "budget already raised %d time(s); the estimate is "
+                              "wrong, not the allowance" % done}
+        if not workspace_exists:
+            return {"resume": False, "claude_session_id": None,
+                    "reason": "workspace is gone; session files are its memory"}
+        return {"resume": True, "claude_session_id": sid,
+                "budget_resume_count": done + 1,
+                "reason": "previous run exhausted its USD budget mid-work with a "
+                          "live workspace (continuation %d of %d)"
+                          % (done + 1, max_budget_resumes)}
     if prev.get("resumed_from"):
         return {"resume": False, "claude_session_id": None,
                 "reason": "previous run was already a resume (max 1 per chain)"}
@@ -343,6 +423,441 @@ def launcher_was_busy(rc, out_dir):
         if any(marker in tail for marker in LANE_BUSY_MARKERS):
             return True
     return False
+
+
+# --------------------------------------------------------------------------
+# Budget: telling "the allowance ran out" apart from "the run broke"
+# --------------------------------------------------------------------------
+
+def budget_exhausted_in_text(*stream_texts):
+    """True when the run stopped because it hit ``--max-budget-usd``.
+
+    Deliberately NOT gated on an exit code. claude exits 1 for a cap, the same
+    as for a genuine failure, which is precisely why 2026-08-13 lost three
+    cards' work: the exit code cannot tell the two apart, only the output can.
+
+    But the output has to be read the way claude writes it, not scanned for a
+    substring: the claim is claude's LAST word, on its own line, prefixed
+    ``Error:``. A run that merely *mentions* the wording (a card about this very
+    code — the terminal lane runs inside ``~/coding/worktrees/*``) is a real
+    failure and must stay one; escalating it doubles the cap up to three times
+    and reports a spend figure nobody spent.
+
+    The caller must additionally know a cap was actually passed: a legacy card
+    carries no ``--max-budget-usd`` at all, so "the cap ran out" is a diagnosis
+    that cannot be true for it. That check lives with the caller, which is where
+    the cap is known — see ``kanban_terminal_claimer.handle``.
+    """
+    for text in stream_texts:
+        if not text:
+            continue
+        lines = [ln for ln in str(text).splitlines() if ln.strip()]
+        for line in lines[-BUDGET_EXHAUSTED_TAIL_LINES:]:
+            if BUDGET_EXHAUSTED_LINE_RE.search(line):
+                return True
+    return False
+
+
+def budget_exhausted(out_dir):
+    """As above, reading the run's captured streams. Never raises.
+
+    Both streams are read: which one carries the wording depends on the output
+    format, and a consumer that captured only one of them must still see it.
+    """
+    if not out_dir:
+        return False
+    for name in ("output.txt", "stderr.txt"):
+        try:
+            with open(os.path.join(out_dir, name), "rb") as f:
+                try:
+                    size = os.fstat(f.fileno()).st_size
+                    if size > VERDICT_SCAN_BYTES:
+                        f.seek(size - VERDICT_SCAN_BYTES)
+                except OSError:
+                    pass
+                blob = f.read(VERDICT_SCAN_BYTES + 4096).decode("utf-8", "replace")
+        except OSError:
+            continue
+        if budget_exhausted_in_text(blob):
+            return True
+        envelope = parse_result_envelope(blob)
+        if envelope and (envelope.get("subtype") == BUDGET_EXHAUSTED_SUBTYPE
+                         or envelope.get("terminal_reason")
+                         == BUDGET_EXHAUSTED_TERMINAL_REASON):
+            return True
+    return False
+
+
+def next_budget_usd(previous, ceiling=DEFAULT_BUDGET_CEILING_USD):
+    """The cap the NEXT run should carry: ``min(previous * 2, ceiling)``.
+
+    Returns None when there is nothing to escalate to — no previous cap, a
+    nonsense previous cap, or a previous cap already at/above the ceiling. None
+    means "block honestly", never "run uncapped": a run whose allowance cannot
+    grow must stop, not quietly become unbounded.
+
+    Doubling rather than adding a fixed step because the observed shortfall is
+    multiplicative — 2026-08-13 the same task was killed at $2, then at $8, and
+    a $2 step would have needed a dozen continuations to find that out.
+    """
+    try:
+        prev = float(previous)
+    except (TypeError, ValueError):
+        return None
+    try:
+        cap = float(ceiling)
+    except (TypeError, ValueError):
+        cap = DEFAULT_BUDGET_CEILING_USD
+    # build_argv's own range is the hard outer bound; a ceiling above it would
+    # produce an argv that build_argv then refuses, turning a budget decision
+    # into a crash at launch.
+    cap = min(cap, 1000.0)
+    if not (prev > 0) or cap < 0.01 or prev >= cap:
+        return None
+    return round(min(prev * 2.0, cap), 2)
+
+
+# --------------------------------------------------------------------------
+# Spend: what the run actually cost
+# --------------------------------------------------------------------------
+#
+# ⚑ Measured 2026-08-13, and it contradicts the assumption this was built on:
+# the session transcript (``~/.claude/projects/<slug>/<session-id>.jsonl``,
+# claude 2.1.223) carries **no cost field of any kind**. Its assistant records
+# carry ``message.model`` and ``message.usage`` token counters and nothing else.
+# The only place claude publishes a dollar figure it stands behind is the
+# ``result`` envelope of ``--output-format json`` / ``stream-json``
+# (``total_cost_usd``), which plain ``text`` output never prints.
+#
+# So spend is reported from whichever of three sources is available, best
+# first, and the source is always named in the output — a number whose
+# provenance is unstated is how a cap gets set on a guess a second time:
+#
+#   1. ``result-envelope``  — claude's own total. Authoritative.
+#   2. ``budget-cap-floor`` — the run died on its cap, so spend ≈ the cap.
+#      Needs no price table and cannot drift with pricing.
+#   3. ``token-price-estimate`` — tokens × the table below. An UPPER BOUND, not
+#      a measurement. Backtested 2026-08-13 against the three runs whose real
+#      spend is known exactly (they were killed ON their cap, so spend == cap):
+#      $2 cap → $3.34 estimated (1.67×), $8 → $16.11 (2.01×), $8 → $15.71
+#      (1.96×). So it reads roughly TWICE what claude's own budget accounting
+#      charges — unsurprising on a subscription, where list price is not the
+#      price being consumed. Never make a policy decision on it; it exists so a
+#      successful run is not reported as having cost nothing.
+#
+# ⚑ Scope: a resumed run appends to the SAME transcript (verified — t_3b5a66a6's
+# two runs share one session id and one file), so a transcript-derived figure is
+# the SESSION total, not this run's. ``cost_scope`` says which.
+
+#: Public list price, USD per million tokens. Source: the ``claude-api`` skill's
+#: model table (cached 2026-06-24). Claude Code here is authorised by
+#: SUBSCRIPTION, so these are the prices of the quota being consumed, not a sum
+#: billed to a card — and claude's own accounting evidently applies something
+#: cheaper, hence the upper-bound warning above.
+PRICE_TABLE_USD_PER_MTOK = {
+    "claude-opus-5": (5.0, 25.0),
+    "claude-opus-4-8": (5.0, 25.0),
+    "claude-opus-4-7": (5.0, 25.0),
+    "claude-opus-4-6": (5.0, 25.0),
+    "claude-sonnet-5": (3.0, 15.0),
+    "claude-sonnet-4-6": (3.0, 15.0),
+    "claude-haiku-4-5": (1.0, 5.0),
+}
+PRICE_TABLE_SOURCE = "claude-api skill model table, cached 2026-06-24"
+#: Cache multipliers against the model's base INPUT price.
+CACHE_READ_MULTIPLIER = 0.1
+CACHE_WRITE_MULTIPLIER_5M = 1.25
+CACHE_WRITE_MULTIPLIER_1H = 2.0
+#: Model assumed when a transcript record carries no usable model id.
+FALLBACK_PRICED_MODEL = "claude-opus-5"
+
+
+def parse_result_envelope(text):
+    """The ``result`` object from ``--output-format json``/``stream-json``, or
+    None. Never raises.
+
+    Accepts either shape: one JSON object (``json``) or a stream of JSON lines
+    (``stream-json``), in which case the LAST result record wins. Anything else
+    — plain text, truncated output, a crash message — returns None, so a caller
+    can layer this on top of a text-mode pipeline without changing it.
+    """
+    if not text or "result" not in text:
+        return None
+    stripped = text.strip()
+    if not stripped:
+        return None
+    try:
+        whole = json.loads(stripped)
+    except (ValueError, TypeError):
+        whole = None
+    if isinstance(whole, dict) and whole.get("type") == "result":
+        return whole
+    found = None
+    for line in stripped.splitlines():
+        line = line.strip()
+        if not line.startswith("{") or '"result"' not in line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(obj, dict) and obj.get("type") == "result":
+            found = obj
+    return found
+
+
+def transcript_slug(cwd):
+    """claude's on-disk project-directory name for a working directory.
+
+    Every character outside ``[A-Za-z0-9-]`` becomes ``-``; case is kept. Yes,
+    that collapses ``/`` and ``.`` to the same character, which is why
+    ``/Users/tony/.hermes/…`` becomes ``-Users-tony--hermes-…``. Verified
+    against the live directory listing on the M1, 2026-08-13.
+    """
+    return re.sub(r"[^A-Za-z0-9-]", "-", os.path.abspath(cwd or os.getcwd()))
+
+
+def transcript_path(claude_session_id, cwd=None, projects_root=None):
+    """Path of a session's transcript, or None. Never raises.
+
+    The slug is only a fast path; a glob over the project directories is the
+    authority, because the id is a UUID we minted and is unique across them.
+    That matters for a resumed run, whose transcript stays under the directory
+    the session STARTED in even if the workspace later moves.
+    """
+    if not is_claude_session_id(claude_session_id or ""):
+        return None
+    root = projects_root or os.path.join(os.path.expanduser("~"),
+                                         ".claude", "projects")
+    name = "%s.jsonl" % claude_session_id.strip().lower()
+    if cwd:
+        direct = os.path.join(root, transcript_slug(cwd), name)
+        if os.path.isfile(direct):
+            return direct
+    try:
+        for entry in sorted(os.listdir(root)):
+            candidate = os.path.join(root, entry, name)
+            if os.path.isfile(candidate):
+                return candidate
+    except OSError:
+        return None
+    return None
+
+
+def transcript_usage(claude_session_id, cwd=None, projects_root=None, path=None):
+    """Token totals for a session, read from its transcript. Never raises.
+
+    Returns None when the transcript cannot be read at all — absence is
+    reported as absence, not as a run that used nothing. Otherwise a dict with
+    ``turns``, ``by_model`` (per-model counters) and ``totals``.
+
+    Counters are summed from each assistant record's top-level ``message.usage``
+    (verified 2026-08-13 to equal the sum of its own ``iterations``, so this
+    does not double-count).
+    """
+    if path is None:
+        path = transcript_path(claude_session_id, cwd=cwd,
+                               projects_root=projects_root)
+    if not path:
+        return None
+    fields = ("input_tokens", "output_tokens",
+              "cache_creation_input_tokens", "cache_read_input_tokens")
+    by_model = {}
+    turns = 0
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(rec, dict) or rec.get("type") != "assistant":
+                    continue
+                message = rec.get("message")
+                if not isinstance(message, dict):
+                    continue
+                usage = message.get("usage")
+                if not isinstance(usage, dict):
+                    continue
+                turns += 1
+                model = message.get("model") or FALLBACK_PRICED_MODEL
+                bucket = by_model.setdefault(
+                    str(model), dict.fromkeys(fields, 0))
+                for field in fields:
+                    try:
+                        bucket[field] += int(usage.get(field) or 0)
+                    except (TypeError, ValueError):
+                        pass
+                creation = usage.get("cache_creation")
+                if isinstance(creation, dict):
+                    for key in ("ephemeral_1h_input_tokens",
+                                "ephemeral_5m_input_tokens"):
+                        try:
+                            bucket[key] = bucket.get(key, 0) + int(
+                                creation.get(key) or 0)
+                        except (TypeError, ValueError):
+                            pass
+    except OSError:
+        return None
+    totals = dict.fromkeys(fields, 0)
+    for bucket in by_model.values():
+        for field in fields:
+            totals[field] += bucket.get(field, 0)
+    return {"turns": turns, "by_model": by_model, "totals": totals,
+            "transcript": path}
+
+
+def estimate_cost_usd(usage):
+    """Upper-bound USD estimate for a ``transcript_usage`` result, or None.
+
+    Cache writes are priced at the 1-hour multiplier for whatever share of them
+    the transcript attributes to the 1-hour tier and at the 5-minute multiplier
+    for the rest; when the split is absent the whole write is priced at the
+    1-hour rate — an estimate that exists to prevent under-budgeting must round
+    against us, not for us.
+    """
+    if not isinstance(usage, dict):
+        return None
+    by_model = usage.get("by_model")
+    if not isinstance(by_model, dict) or not by_model:
+        return None
+    total = 0.0
+    for model, bucket in by_model.items():
+        price_in, price_out = PRICE_TABLE_USD_PER_MTOK.get(
+            model, PRICE_TABLE_USD_PER_MTOK[FALLBACK_PRICED_MODEL])
+        write = bucket.get("cache_creation_input_tokens", 0) or 0
+        write_1h = bucket.get("ephemeral_1h_input_tokens")
+        write_5m = bucket.get("ephemeral_5m_input_tokens")
+        if write_1h is None and write_5m is None:
+            write_1h, write_5m = write, 0
+        else:
+            write_1h = write_1h or 0
+            write_5m = write_5m or 0
+            drift = write - (write_1h + write_5m)
+            if drift > 0:
+                write_1h += drift
+        total += (bucket.get("input_tokens", 0) or 0) * price_in / 1e6
+        total += (bucket.get("output_tokens", 0) or 0) * price_out / 1e6
+        total += ((bucket.get("cache_read_input_tokens", 0) or 0)
+                  * price_in * CACHE_READ_MULTIPLIER / 1e6)
+        total += write_1h * price_in * CACHE_WRITE_MULTIPLIER_1H / 1e6
+        total += write_5m * price_in * CACHE_WRITE_MULTIPLIER_5M / 1e6
+    return round(total, 4)
+
+
+def budget_cap_floor(budget_usd, budget_history=None):
+    """Lower bound on what a cap-killed CHAIN burned, and its breakdown.
+
+    Returns ``(floor_usd|None, [caps that were exhausted])``.
+
+    ⚑ The floor is the SUM of every cap the chain exhausted, not the last one.
+    An escalated chain 8 → 16 → 32 that died on each cap burned at least $56;
+    reporting $32 (the current cap) under-states it by 44%, and the audience for
+    this figure is the human setting the NEXT card's cap — the exact
+    mis-calibration this whole readout exists to remove (review 2026-08-13).
+    """
+    history = budget_history if isinstance(budget_history, (list, tuple)) else ()
+    caps = []
+    for entry in history:
+        if not isinstance(entry, dict) or entry.get("outcome") != "exhausted":
+            continue
+        try:
+            cap = float(entry.get("budget_usd"))
+        except (TypeError, ValueError):
+            continue
+        if cap > 0:
+            caps.append(cap)
+    if caps:
+        return round(sum(caps), 4), caps
+    try:
+        cap = float(budget_usd)
+    except (TypeError, ValueError):
+        return None, []
+    return (round(cap, 4), [cap]) if cap > 0 else (None, [])
+
+
+def read_spend(out_dir, claude_session_id=None, cwd=None, projects_root=None,
+               budget_usd=None, exhausted=False, budget_history=None):
+    """What this run cost, with its provenance. Never raises.
+
+    Returns a dict that is always safe to drop into ``result.json``::
+
+        {"cost_usd": float|None, "cost_source": str, "cost_is_upper_bound": bool,
+         "usage": {...}|None, "num_turns": int|None,
+         "budget_usd": float|None, "budget_exhausted": bool,
+         "cost_breakdown_usd": [float, ...]|None}
+
+    ``cost_source`` is one of ``result-envelope`` (claude's own figure),
+    ``budget-cap-floor`` (killed on the cap ⇒ spend ≥ the caps it burned),
+    ``token-price-estimate`` (upper bound) or ``unknown`` (say so; never
+    report 0).
+
+    ⚑ ``result-envelope`` is the only authoritative source and it is UNREACHABLE
+    in the live lane as configured: it exists only under ``--output-format
+    json``/``stream-json``, ``build_argv`` defaults to ``text``, and neither
+    ``kanban_terminal_claimer`` nor ``givi_claude_code_runner`` passes anything
+    else (the card protocol also parses a plain-text ``TASK-RESULT`` line, so
+    switching formats is not free). In production the figure is therefore always
+    either the cap floor (on a cap kill) or the token estimate. The envelope
+    branch is kept because it costs nothing and becomes live the day the lane
+    moves to json — but do not read its presence here as "spend is measured".
+    """
+    usage = None
+    if claude_session_id:
+        usage = transcript_usage(claude_session_id, cwd=cwd,
+                                 projects_root=projects_root)
+    envelope = None
+    if out_dir:
+        try:
+            with open(os.path.join(out_dir, "output.txt"), "rb") as f:
+                try:
+                    size = os.fstat(f.fileno()).st_size
+                    if size > VERDICT_SCAN_BYTES:
+                        f.seek(size - VERDICT_SCAN_BYTES)
+                except OSError:
+                    pass
+                envelope = parse_result_envelope(
+                    f.read(VERDICT_SCAN_BYTES + 4096).decode("utf-8", "replace"))
+        except OSError:
+            envelope = None
+    try:
+        budget = float(budget_usd) if budget_usd is not None else None
+    except (TypeError, ValueError):
+        budget = None
+    out = {"cost_usd": None, "cost_source": "unknown", "cost_scope": None,
+           "cost_is_upper_bound": False, "usage": usage,
+           "num_turns": (usage or {}).get("turns"),
+           "budget_usd": budget, "budget_exhausted": bool(exhausted),
+           "cost_breakdown_usd": None}
+    if isinstance(envelope, dict) and isinstance(
+            envelope.get("total_cost_usd"), (int, float)):
+        out["cost_usd"] = round(float(envelope["total_cost_usd"]), 4)
+        out["cost_source"] = "result-envelope"
+        out["cost_scope"] = "run-reported"
+        if isinstance(envelope.get("num_turns"), int):
+            out["num_turns"] = envelope["num_turns"]
+        return out
+    if exhausted:
+        floor, caps = budget_cap_floor(budget, budget_history)
+        if floor:
+            out["cost_usd"] = floor
+            out["cost_source"] = "budget-cap-floor"
+            # "run" only when a single cap was burned; an escalated chain spent
+            # every cap in it, and calling that a run's cost is the under-report
+            # this readout exists to prevent.
+            out["cost_scope"] = "chain" if len(caps) > 1 else "run"
+            out["cost_breakdown_usd"] = caps
+            return out
+    estimate = estimate_cost_usd(usage)
+    if estimate is not None:
+        out["cost_usd"] = estimate
+        out["cost_source"] = "token-price-estimate"
+        out["cost_scope"] = "session"
+        out["cost_is_upper_bound"] = True
+    return out
 
 
 # --------------------------------------------------------------------------

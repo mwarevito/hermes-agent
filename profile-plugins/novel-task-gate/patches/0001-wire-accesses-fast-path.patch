@@ -1,0 +1,216 @@
+diff --git a/__init__.py b/__init__.py
+index 01cb212..dc444d1 100644
+--- a/__init__.py
++++ b/__init__.py
+@@ -539,6 +539,113 @@ def _lease_authorizes_process(session_id: str, args: Dict[str, Any]) -> bool:
+     return _get_lease(session_id, handle) is not None
+ 
+ 
++# ---------------------------------------------------------------------------
++# Accesses credential fast path (P0, 2026-08-13)
++# ---------------------------------------------------------------------------
++# "вот логин/пароль от X, положи в <repo>/accesses/x.md" is a ONE-WRITE request
++# the user spelled out verbatim, yet `write_file` is in HARD_DENY_TRIVIAL, so it
++# used to pay the full classify -> plan -> nonce-critic -> resolve ceremony —
++# five extra API requests, a delegated critic, and the plaintext credential kept
++# alive in context far longer than necessary.
++#
++# `accesses_fast_path` mints a lease from the USER'S OWN message and authorizes
++# EXACTLY ONE `write_file` to the ONE `<repo>/accesses/<name>.md` path that
++# message named. The post hook then mechanically chmods 0700/0600, guarantees the
++# exact `/accesses/` line in the repo's root .gitignore, verifies the path is
++# ignored AND untracked, and appends a deterministic NON-SECRET readback.
++# Everything else stays gated; every failure removes the file this path created.
++#
++# This is the ONLY text-derived authority in the plugin, and it is narrow by
++# construction: the lease grants no classification, no second tool, no second
++# path, no commit/push/send — just the write the user typed out. Real
++# write-guards (gate-prod-writes.sh / gate-self-edit.sh) still run.
++try:  # pragma: no cover - import shape depends on how the plugin is loaded
++    from . import accesses_fast_path as _AFP  # type: ignore
++except Exception:
++    try:
++        import accesses_fast_path as _AFP  # type: ignore
++    except Exception:
++        _AFP = None  # type: ignore
++        logging.getLogger(__name__).info(
++            "novel-task-gate: accesses_fast_path unavailable; fast path disabled"
++        )
++
++# (session_id, turn_id) -> AccessesLease. Bounded; dropped with the turn.
++_ACCESS_LEASES: "OrderedDict[Tuple[str, str], Any]" = OrderedDict()
++MAX_ACCESS_LEASES = 128
++
++
++def _mint_access_lease(session_id: str, turn_id: str, user_message: Any) -> None:
++    """Mint at most one accesses lease per turn from the user's own message."""
++    if _AFP is None or not turn_id or not isinstance(user_message, str):
++        return
++    lease = _AFP.mint_lease(user_message)
++    if lease is None:
++        return
++    key = (session_id or "", turn_id)
++    with _LOCK:
++        _ACCESS_LEASES[key] = lease
++        _ACCESS_LEASES.move_to_end(key)
++        while len(_ACCESS_LEASES) > MAX_ACCESS_LEASES:
++            _ACCESS_LEASES.popitem(last=False)
++    # Path only — never the message, never the credential.
++    logger.info("novel-task-gate: accesses fast-path armed for %s", lease.rel_path)
++
++
++def _get_access_lease(session_id: str, turn_id: str):
++    if _AFP is None or not turn_id:
++        return None
++    with _LOCK:
++        return _ACCESS_LEASES.get((session_id or "", turn_id))
++
++
++def _drop_access_leases(session_id: str, turn_id: str = "") -> None:
++    with _LOCK:
++        dead = [
++            k for k in _ACCESS_LEASES
++            if k[0] == (session_id or "") and (not turn_id or k[1] == turn_id)
++        ]
++        for k in dead:
++            _ACCESS_LEASES.pop(k, None)
++
++
++def _accesses_fast_path_allows(session_id: str, turn_id: str, tool_name: str, args) -> bool:
++    """True iff this call is the single write the user's own message authorized."""
++    if _AFP is None:
++        return False
++    try:
++        lease = _get_access_lease(session_id, turn_id)
++        if not _AFP.authorizes(lease, tool_name, args):
++            return False
++        # Remember whether WE created the file: fail-closed cleanup must never
++        # delete a drop that already existed before this turn.
++        if lease.preexisting is None:
++            lease.preexisting = os.path.exists(lease.target_path)
++        return True
++    except Exception as exc:
++        logger.warning("accesses fast-path pre error: %s", exc)
++        return False
++
++
++def _accesses_fast_path_finalize(
++    session_id: str, turn_id: str, tool_name: str, args, result, status,
++) -> None:
++    """Harden + verify the drop. Runs OUTSIDE _LOCK (filesystem + read-only git)."""
++    if _AFP is None or tool_name != _AFP.WRITE_TOOL:
++        return
++    try:
++        lease = _get_access_lease(session_id, turn_id)
++        # `preexisting is None` means this turn never admitted a fast-path write,
++        # so an unrelated write_file can never trigger the hardening.
++        if lease is None or lease.finalized or lease.preexisting is None:
++            return
++        if not _tool_succeeded(result, status):
++            return
++        _AFP.finalize(lease)
++    except Exception as exc:
++        logger.warning("accesses fast-path finalize error: %s", exc)
++
++
+ EXEMPT_PLATFORMS = frozenset({"subagent", "cron"})
+ 
+ # Kanban task-lifecycle mutations a delegated subagent (e.g. the mandatory
+@@ -800,20 +907,28 @@ def _on_pre_llm_call(
+     task_id: str = "",
+     turn_id: str = "",
+     platform: str = "",
++    user_message: Any = "",
+     **_: Any,
+ ) -> None:
+-    # Establishes the fresh turn's gate state and records the active turn. There
+-    # is deliberately NO text-based lease seeding here: the ``user_message`` is
+-    # never inspected, because a continuation is recognised ONLY by an exact
+-    # process-handle match at the ``process`` tool call (see the lease header) —
+-    # a handle the model cannot forge. Seeding fixed_flow off message text would
+-    # let a user copy an internal callback frame and inherit full-turn authority.
++    # Establishes the fresh turn's gate state and records the active turn.
++    #
++    # The CONTINUATION lease is still deliberately NOT seeded from text: it is
++    # recognised ONLY by an exact process-handle match at the ``process`` tool
++    # call (see the lease header) — a handle the model cannot forge. Seeding
++    # fixed_flow off message text would let a user copy an internal callback
++    # frame and inherit full-turn authority.
++    #
++    # The ACCESSES lease below is the one text-derived authority, and it is a
++    # different shape: it grants no classification and no full-turn authority —
++    # only a single ``write_file`` to the single ``<repo>/accesses/<name>.md``
++    # path the user typed, which is then mechanically hardened and verified.
+     try:
+         if not turn_id:
+             return
+         with _LOCK:
+             _get_or_create_state(session_id or "", turn_id, platform=platform or "")
+             _record_active_turn(session_id or "", task_id or "", turn_id)
++        _mint_access_lease(session_id or "", turn_id, user_message)
+     except Exception as exc:
+         logger.warning("pre_llm_call gate hook error: %s", exc)
+     return None
+@@ -958,6 +1073,10 @@ def _on_pre_tool_call(
+         # То же для локальной переиндексации qmd (см. блок выше).
+         if tool_name in _SHELL_TOOLS and _invokes_qmd_maintenance(args):
+             return None
++        # Accesses credential fast path: exactly one `write_file` to the one
++        # `<repo>/accesses/<name>.md` the user named. Anything else stays gated.
++        if _accesses_fast_path_allows(session_id or "", turn_id or "", tool_name, args):
++            return None
+         with _LOCK:
+             st = _get_state(session_id or "", turn_id or "")
+             exempt_runtime = _is_exempt_runtime(session_id or "", st)
+@@ -1502,6 +1621,12 @@ def _on_post_tool_call(
+             return
+         args = args if isinstance(args, dict) else {}
+         req = _req_index(api_request_id)
++        # Harden + verify an accesses drop BEFORE taking the lock: it touches the
++        # filesystem and shells out to read-only git, which must not block the
++        # gate's state lock.
++        _accesses_fast_path_finalize(
++            session_id or "", turn_id or "", tool_name, args, result, status,
++        )
+         with _LOCK:
+             st = _get_state(session_id or "", turn_id or "")
+             if st is not None and _is_exempt_runtime(session_id or "", st):
+@@ -1694,6 +1819,7 @@ def _on_session_end(session_id: str = "", turn_id: str = "", task_id: str = "",
+                     if not sess:
+                         _STATE.pop(_sid, None)
+                 _drop_turn_admissions(_sid, turn_id or "")
++                _drop_access_leases(_sid, turn_id or "")
+                 _ACTIVE_TURN.pop((_sid, task_id or ""), None)
+     except Exception as exc:
+         logger.warning("on_session_end gate hook error: %s", exc)
+@@ -1730,6 +1856,7 @@ def _drop_session(session_id: str) -> None:
+                 _ADMISSIONS.pop(k, None)
+             for k in [kk for kk in _ACTIVE_TURN if kk[0] == sid]:
+                 _ACTIVE_TURN.pop(k, None)
++            _drop_access_leases(sid)
+ 
+ 
+ def _on_session_finalize(session_id: str = "", **_: Any) -> None:
+@@ -2010,8 +2137,21 @@ def _on_transform_tool_result(
+     turn_id: str = "",
+     **_,
+ ):
+-    """Дописать к результату skill_view уведомление о присвоенном авто-fixed_flow."""
++    """Readback for the accesses fast path + авто-fixed_flow уведомление."""
+     try:
++        # Accesses fast path: ride the deterministic NON-SECRET readback (or the
++        # fail-closed report) back on the authorized write's own result, once.
++        if _AFP is not None and tool_name == _AFP.WRITE_TOOL:
++            lease = _get_access_lease(session_id or "", turn_id or "")
++            if lease is not None and lease.finalized and not lease.announced:
++                note = _AFP.result_note(lease)
++                if note:
++                    lease.announced = True
++                    if isinstance(result, str):
++                        return result + note
++                    if isinstance(result, dict):
++                        return {**result, "accesses_fast_path": note.strip()}
++            return None
+         if tool_name != "skill_view" or not isinstance(result, str) or not result:
+             return None
+         with _LOCK:

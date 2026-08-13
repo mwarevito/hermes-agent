@@ -4,6 +4,12 @@ Pins the exposure gate (hidden without an explicit opt-in — the live repo is
 shared by all seven gateways), the card wire format, the honest session_wake
 flag (an UPDATE that matched nothing must not read as a stamped wake-up), and
 the status view over file-backed run artifacts.
+
+Since 13.08.2026 it also pins the WAKE LADDER: where the completion address
+comes from when the filing session has no gateway_routing row (a kanban worker
+never does), that the dispatcher's HERMES_KANBAN_DB pin decides which board the
+tool's own writes land on, and that a job nobody can be notified about says so
+in the log and on the card instead of in a quiet response field.
 """
 import json
 import os
@@ -59,9 +65,14 @@ def kanban_root(tmp_path):
     board_dir = root / "boards" / "hermes-infra"
     board_dir.mkdir(parents=True)
     db = board_dir / "kanban.db"
-    conn = sqlite3.connect(str(db))
-    conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, session_id TEXT)")
-    conn.execute("INSERT INTO tasks (id) VALUES ('t_deadbeef')")
+    # The REAL schema, not a hand-rolled subset: the tool reaches this db
+    # through hermes_cli.kanban_db.connect(), whose additive migration pass
+    # dies on a `tasks` that exists without the live columns (measured
+    # 2026-08-13: "no such column: assignee").
+    from hermes_cli import kanban_db as _kb
+    conn = _kb.connect(db_path=db)
+    conn.execute("INSERT INTO tasks (id, title, status, created_at) "
+                 "VALUES ('t_deadbeef', 't', 'ready', 0)")
     conn.commit()
     conn.close()
     return str(root)
@@ -116,6 +127,16 @@ def env(monkeypatch, launcher, fake_kanban, kanban_root, state_db,
     monkeypatch.setenv("HERMES_CLAUDE_CODE_STATE_DB", state_db)
     monkeypatch.setenv("HERMES_CLAUDE_CODE_CLAIMER_STATE", str(claimer_state))
     # signing_env fixture already set HERMES_CLAUDE_CODE_DOTENV with the key.
+    # The wake ladder reads the ambient session/worker environment, so a test
+    # inherited from a real gateway or worker shell would otherwise resolve a
+    # LIVE chat address and both pass for the wrong reason and (worse) write a
+    # subscription pointing at Vito's DM from a unit test.
+    for _leak in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD",
+                  "HERMES_KANBAN_TASK", "HERMES_SESSION_PLATFORM",
+                  "HERMES_SESSION_CHAT_ID", "HERMES_SESSION_CHAT_TYPE",
+                  "HERMES_SESSION_THREAD_ID", "HERMES_SESSION_USER_ID",
+                  "HERMES_SESSION_KEY", "HERMES_SESSION_MESSAGE_ID"):
+        monkeypatch.delenv(_leak, raising=False)
     return fake_kanban
 
 
@@ -131,6 +152,29 @@ def _calls(fake_kanban):
 def _flag(argv, name):
     """Value following a flag in a recorded argv."""
     return argv[argv.index(name) + 1]
+
+
+def _subs(card, board="hermes-infra"):
+    """(platform, chat_id) of every notification subscription on ``card``.
+
+    Read from the board DB rather than from a recorded CLI call: since the
+    address comes from the shared kanban ladder, the durable row is the only
+    thing that decides whether anyone is woken."""
+    pinned = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    db = pinned or os.path.join(
+        os.environ["HERMES_CLAUDE_CODE_KANBAN_ROOT"], "boards", board,
+        "kanban.db")
+    if not os.path.exists(db):
+        return []
+    conn = sqlite3.connect(db)
+    try:
+        return [tuple(r) for r in conn.execute(
+            "SELECT platform, chat_id FROM kanban_notify_subs "
+            "WHERE task_id = ? ORDER BY created_at", (card,))]
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +256,7 @@ def test_run_files_card_and_wires_wakeup(env):
     assert out["filed"] is True and out["card"] == "t_deadbeef"
     assert out["lane"] == "terminal" and out["session_wake"] is True
     assert out["chat_notify"] is True and out["wake_wired"] is True
-    assert "разбудит" in out["note"]
+    assert "придёт в этот разговор" in out["note"]
 
     calls = _calls(env)
     create = next(c for c in calls if "create" in c)
@@ -229,9 +273,12 @@ def test_run_files_card_and_wires_wakeup(env):
     # payload is signed with the key the claimer will verify against
     assert cct.core.payload_signature_valid(payload, "test-signing-key")
 
-    sub = next(c for c in calls if "notify-subscribe" in c)
-    assert "t_deadbeef" in sub
-    assert _flag(sub, "--chat-id") == "405154434"
+    # The subscription is a ROW, not a CLI call: the address now comes from the
+    # shared kanban ladder (kanban_tools._maybe_auto_subscribe) with the
+    # gateway_routing lookup as its last rung, and both write through
+    # kanban_db.add_notify_sub. Assert the durable fact, not the transport.
+    assert out["notify_via"] == "telegram:405154434"
+    assert _subs("t_deadbeef") == [("telegram", "405154434")]
 
     # session really stamped on the task row
     db = os.path.join(os.environ["HERMES_CLAUDE_CODE_KANBAN_ROOT"],
@@ -247,7 +294,107 @@ def test_run_without_session_is_honest_about_no_wakeup(env):
     out = json.loads(cct.handle_claude_code({"action": "run", "prompt": "p"}))
     assert out["filed"] is True
     assert out["session_wake"] is False and out["chat_notify"] is False
-    assert not any("notify-subscribe" in c for c in _calls(env))
+    assert _subs("t_deadbeef") == []
+
+
+def test_run_worker_inherits_the_address_of_its_own_card(env, monkeypatch):
+    """A kanban worker has no gateway_routing row at all — 13.08.2026 that made
+    every one of eight filed cards land with nobody subscribed. Its own card
+    knows the conversation, and that is the rung the tool now uses."""
+    db = os.path.join(os.environ["HERMES_CLAUDE_CODE_KANBAN_ROOT"],
+                      "boards", "hermes-infra", "kanban.db")
+    from hermes_cli import kanban_db as _kb
+    conn = _kb.connect(db_path=__import__("pathlib").Path(db))
+    try:
+        _kb.add_notify_sub(conn, task_id="t_parent01", platform="telegram",
+                           chat_id="405154434", chat_type="dm",
+                           notifier_profile="default")
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_parent01")
+    # no session in gateway_routing: exactly a worker's situation
+    out = json.loads(cct.handle_claude_code(
+        {"action": "run", "prompt": "p"}, session_id="20260813_144528_e6f3a1"))
+    assert out["chat_notify"] is True and out["wake_wired"] is True
+    assert _subs("t_deadbeef") == [("telegram", "405154434")]
+
+
+def test_run_subscribed_card_is_not_declared_undeliverable(env, monkeypatch,
+                                                           caplog):
+    """A subscription without a stamped session_id still DELIVERS.
+
+    The notifier loop (gateway/kanban_watchers.py) walks ``kanban_notify_subs``
+    and never reads ``tasks.session_id``, so conflating the two claims stamped a
+    permanent "⚠ БЕЗ ПРОБУЖДЕНИЯ … проверять руками" onto a card whose
+    completion would in fact arrive — and sent the model back to polling."""
+    import logging
+    db = os.path.join(os.environ["HERMES_CLAUDE_CODE_KANBAN_ROOT"],
+                      "boards", "hermes-infra", "kanban.db")
+    from hermes_cli import kanban_db as _kb
+    conn = _kb.connect(db_path=__import__("pathlib").Path(db))
+    try:
+        _kb.add_notify_sub(conn, task_id="t_parent01", platform="telegram",
+                           chat_id="405154434", chat_type="dm",
+                           notifier_profile="default")
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_parent01")
+    with caplog.at_level(logging.WARNING):
+        out = json.loads(cct.handle_claude_code({"action": "run", "prompt": "p"}))
+    assert out["chat_notify"] is True
+    assert out["session_wake"] is False
+    assert out["wake_wired"] is True
+    assert "warning" not in out
+    assert not out["note"].startswith("⚠")
+    assert not any("NOT wired" in r.getMessage() for r in caplog.records)
+    assert not any("comment" in c for c in _calls(env))
+
+
+def test_run_unwired_job_is_loud(env, caplog, monkeypatch):
+    """Silence was the whole defect: the only 13.08 signal was a false-valued
+    field inside a success payload. A job nobody can hear about must shout."""
+    import logging
+    monkeypatch.setattr(cct, "_resolve_origin", lambda cfg, sid: None)
+    with caplog.at_level(logging.WARNING):
+        out = json.loads(cct.handle_claude_code(
+            {"action": "run", "prompt": "p"}, session_id="sess-123"))
+    assert out["wake_wired"] is False
+    assert out["warning"].startswith("ЗАВЕРШЕНИЕ ЭТОЙ ЗАДАЧИ НИКОМУ НЕ ПРИДЁТ")
+    assert out["note"].startswith("⚠")
+    assert any(cct.WAKE_LOG_PREFIX in r.getMessage() and
+               "NOT wired" in r.getMessage() for r in caplog.records)
+    # …and the card itself carries the mark, via the existing `comment` verb
+    comment = next(c for c in _calls(env) if "comment" in c)
+    assert "t_deadbeef" in comment and "БЕЗ ПРОБУЖДЕНИЯ" in " ".join(comment)
+
+
+def test_run_follows_the_dispatcher_board_pin(env, monkeypatch, tmp_path):
+    """`kanban_db_path` honours HERMES_KANBAN_DB BEFORE the board argument
+    (kanban_db.py:1033) and the dispatcher pins it into every worker, so inside
+    a worker `--board` does not choose the file. The tool's own writes must
+    follow the same pin or they hit an empty database: on 13.08 three cards
+    filed from a worker pinned to `hermes` while asking for `hermes-infra`
+    ended up with a NULL session_id and no subscription."""
+    pinned_dir = tmp_path / "kanban" / "boards" / "hermes"
+    pinned_dir.mkdir(parents=True, exist_ok=True)
+    pinned = pinned_dir / "kanban.db"
+    from hermes_cli import kanban_db as _kb
+    conn = _kb.connect(db_path=pinned)
+    conn.execute("INSERT INTO tasks (id, title, status, created_at) "
+                 "VALUES ('t_deadbeef', 't', 'ready', 0)")
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned))
+
+    out = json.loads(cct.handle_claude_code(
+        {"action": "run", "prompt": "p"}, session_id="sess-123"))
+    assert out["session_wake"] is True
+    assert out["board"] == "hermes" and out["board_requested"] == "hermes-infra"
+    conn = sqlite3.connect(str(pinned))
+    sid = conn.execute(
+        "SELECT session_id FROM tasks WHERE id='t_deadbeef'").fetchone()[0]
+    conn.close()
+    assert sid == "sess-123"
 
 
 def test_run_wake_flag_false_when_stamp_matches_nothing(env, monkeypatch):

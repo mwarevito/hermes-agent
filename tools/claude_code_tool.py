@@ -26,6 +26,7 @@ as a deploy side effect.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -34,6 +35,16 @@ import uuid
 
 from tools.registry import registry, tool_error
 from tools import claude_code_core as core
+
+logger = logging.getLogger(__name__)
+
+#: Single greppable token for every way a filed job can end up unable to wake
+#: anyone. 13.08.2026: eight cards were filed, zero subscriptions were written,
+#: and both the successes and the failures arrived in silence — the only signal
+#: was a ``chat_notify: false`` field inside a success JSON that nothing reads.
+#: Anything that costs a wake-up now logs at WARNING under this prefix and
+#: leaves a comment on the card itself.
+WAKE_LOG_PREFIX = "claude_code WAKE"
 
 # Wire format lives in the core (the claimer consumes it under system python
 # and must not import this module, which pulls in the gateway registry).
@@ -179,9 +190,48 @@ def _kanban(cfg, board, *args):
 
 
 def _board_db(cfg, board):
+    """The kanban DB that ``hermes kanban --board <board>`` actually writes to.
+
+    ⚑ This used to hand-build ``<root>/boards/<board>/kanban.db`` and so could
+    name a DIFFERENT file than the CLI one line above it. ``kanban_db_path``
+    honours ``HERMES_KANBAN_DB`` **before** the ``board`` argument (kanban_db.py
+    :1033, "the dispatcher injects this into worker env"), and the dispatcher
+    pins that var in every worker it spawns (kanban_db.py :11839). So inside a
+    kanban worker the CLI ignores ``--board`` and writes to the pinned board,
+    while the hand-built path pointed at the requested one.
+
+    Measured 13.08.2026: a worker pinned to board ``hermes`` filed three typed
+    jobs with the default board ``hermes-infra``. All three cards were created
+    on ``hermes``; the follow-up UPDATE ran against ``hermes-infra``, matched no
+    row, and ``tasks.session_id`` stayed NULL on all three — silently, because
+    the caller only recorded a boolean. On ``hermes-infra`` (where the pin and
+    the requested board agreed) all five cards of the same day stamped fine.
+
+    Only the pin is adopted here, not the whole of ``kanban_db_path``: that
+    function anchors on ``kanban_home()``, while this tool deliberately keeps
+    its own ``HERMES_CLAUDE_CODE_KANBAN_ROOT`` seam so a test can never reach
+    the real board. The pin is the entire disagreement."""
+    pinned = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    if pinned:
+        return os.path.expanduser(pinned)
     if board == "default":
         return os.path.join(cfg["kanban_root"], "kanban.db")
     return os.path.join(cfg["kanban_root"], "boards", board, "kanban.db")
+
+
+def _effective_board(db_path, cfg):
+    """Name the board the card really landed on, derived from the DB file.
+
+    The response used to echo back the *requested* board even when the env pin
+    sent the card elsewhere — a field that reads like a fact and is not one."""
+    try:
+        parent = os.path.basename(os.path.dirname(db_path))
+        root = os.path.realpath(cfg["kanban_root"])
+        if os.path.realpath(os.path.dirname(db_path)) == root:
+            return "default"
+        return parent or "default"
+    except Exception:
+        return None
 
 
 def _stamp_session_id(cfg, board, card, session_id):
@@ -189,17 +239,32 @@ def _stamp_session_id(cfg, board, card, session_id):
     a session ONLY when the task carries it. Stamped directly, same move the
     Givi runner makes for its receipt cards.
 
-    Returns True only when exactly one row changed: an UPDATE that matched
-    nothing "succeeds" in sqlite, and reporting that as a stamped wake-up would
-    be one more transport signal lying about work."""
-    conn = sqlite3.connect(_board_db(cfg, board), timeout=10)
+    Returns ``(ok, reason)``. ``ok`` is True only when exactly one row changed:
+    an UPDATE that matched nothing "succeeds" in sqlite, and reporting that as a
+    stamped wake-up would be one more transport signal lying about work. The
+    reason exists because the previous shape (bare bool, caller swallowing every
+    exception) is what made the 13.08 miss undiagnosable."""
+    db_path = _board_db(cfg, board)
+    conn = sqlite3.connect(db_path, timeout=10)
     try:
         cur = conn.execute("UPDATE tasks SET session_id = ? WHERE id = ?",
                            (str(session_id), card))
         conn.commit()
-        return cur.rowcount == 1
+        if cur.rowcount == 1:
+            return True, "ok"
+        return False, ("UPDATE matched %d rows in %s — the card is not in this "
+                       "DB" % (cur.rowcount, db_path))
     finally:
         conn.close()
+
+
+#: Scan bound for the gateway_routing fallback. The old value (500) was a
+#: silent truncation: the table is keyed by session_key and grows with every
+#: chat/thread ever seen (272 rows on 13.08.2026), so a busy install would have
+#: started missing addresses with no signal at all. The exact json_extract
+#: lookup below is tried first and needs no bound; this only guards the
+#: compatibility scan used when JSON1 is unavailable.
+_ROUTING_SCAN_LIMIT = 20000
 
 
 def _resolve_origin(cfg, session_id):
@@ -207,21 +272,54 @@ def _resolve_origin(cfg, session_id):
 
     Exact-key lookup — NOT the Givi runner's recency inference, which exists
     only because the file-queue there erases the caller's identity. Returns
-    {chat_id, chat_type, thread_id} or None. Best-effort, read-only URI."""
+    {chat_id, chat_type, thread_id} or None. Best-effort, read-only URI.
+
+    ⚑ This answers for FAR fewer callers than it looks. ``gateway_routing`` is
+    written only by the gateway session store (gateway/session.py :1656 and the
+    full rewrite in ``_save_entries``) and its primary key is the *session_key*
+    — ``agent:main:<platform>:<chat_type>:<chat_id>:<thread>`` — not the session
+    id. So it holds exactly ONE row per chat/thread: the session that is current
+    there. Two whole classes of caller get nothing back:
+
+      * a kanban worker (``sessions.source='kanban'``) is a CLI subprocess and
+        never had a row at all;
+      * a gateway session that has since been superseded in its own chat had its
+        row overwritten by the newer session, even though the chat address it
+        wants is sitting in that very row.
+
+    Both were live on 13.08.2026 and between them accounted for all eight cards
+    of that day arriving with nobody subscribed. This function is therefore no
+    longer the only rung — see :func:`_wire_wake`."""
     if not session_id:
         return None
+    entries = []
     try:
         conn = sqlite3.connect("file:%s?mode=ro" % cfg["state_db"], uri=True,
                                timeout=10)
         try:
-            rows = conn.execute(
-                "SELECT entry_json FROM gateway_routing "
-                "ORDER BY updated_at DESC LIMIT 500").fetchall()
+            try:
+                rows = conn.execute(
+                    "SELECT entry_json FROM gateway_routing "
+                    "WHERE json_extract(entry_json, '$.session_id') = ? "
+                    "ORDER BY updated_at DESC LIMIT 1", (session_id,)).fetchall()
+            except sqlite3.Error:
+                # JSON1 missing — fall back to the scan, but with a bound big
+                # enough that hitting it is a real anomaly worth logging.
+                rows = conn.execute(
+                    "SELECT entry_json FROM gateway_routing "
+                    "ORDER BY updated_at DESC LIMIT ?",
+                    (_ROUTING_SCAN_LIMIT,)).fetchall()
+                if len(rows) >= _ROUTING_SCAN_LIMIT:
+                    logger.warning(
+                        "%s: gateway_routing scan hit its %d-row bound; an "
+                        "address may be missed", WAKE_LOG_PREFIX,
+                        _ROUTING_SCAN_LIMIT)
+            entries = rows
         finally:
             conn.close()
     except Exception:
         return None
-    for (raw,) in rows:
+    for (raw,) in entries:
         try:
             entry = json.loads(raw)
         except Exception:
@@ -237,6 +335,161 @@ def _resolve_origin(cfg, session_id):
             "thread_id": origin.get("thread_id"),
         }
     return None
+
+
+def _wire_wake(cfg, board, card, session_id):
+    """Register who hears about this job's completion. Returns (ok, how, tried).
+
+    The ladder is not invented here — it is the one ``kanban_create`` has always
+    used for its own cards, ``tools.kanban_tools._maybe_auto_subscribe``:
+
+      1. gateway ContextVars (``HERMES_SESSION_PLATFORM``/``_CHAT_ID``) — the
+         address the messaging gateway sets before dispatch;
+      2. ``HERMES_SESSION_KEY`` decoded — a gateway-born key literally carries
+         platform/chat_type/chat_id/thread/user, so it survives the session
+         rotation that empties this session's ``gateway_routing`` row;
+      3. the worker's OWN card (``HERMES_KANBAN_TASK`` → that card's
+         ``kanban_notify_subs`` row) — "a card a worker spawns belongs to the
+         same conversation". This is the rung that was missing here, and it is
+         precisely the one a kanban worker needs.
+
+    Calling it rather than re-deriving an address also inherits the parts this
+    tool never had: the telegram DM-topic reply anchor in ``delivery_metadata``,
+    the never-NULL ``notifier_profile`` floor (a NULL owner is the 2026-07-27
+    silent-loss class), and the caught-up ``last_event_id`` snapshot.
+
+    Rung 4 keeps today's behaviour: the exact ``gateway_routing`` lookup by
+    session id, used only if the shared ladder came up empty."""
+    tried = []
+    try:
+        from hermes_cli import kanban_db as _kb
+        from tools import kanban_tools as _kt
+    except Exception as exc:
+        tried.append("kanban_tools import failed: %r" % (exc,))
+        return False, None, tried
+
+    db_path = _board_db(cfg, board)
+    conn = None
+    try:
+        conn = _kb.connect(db_path=_pathlike(db_path))
+        if _kt._maybe_auto_subscribe(conn, card):
+            # Read the row back rather than trusting the return value: a
+            # subscription that "succeeded" without landing a deliverable row is
+            # the same lying transport signal this whole tool exists to kill.
+            got = _readback_sub(conn, card)
+            if got:
+                return True, got, tried
+            tried.append("kanban auto-subscribe reported success but wrote no "
+                         "deliverable row")
+        else:
+            tried.append(
+                "kanban auto-subscribe found no address "
+                "(session_platform=%r session_key=%r kanban_task=%r)"
+                % (_session_env("HERMES_SESSION_PLATFORM"),
+                   bool(_session_env("HERMES_SESSION_KEY")),
+                   os.environ.get("HERMES_KANBAN_TASK") or None))
+
+        origin = _resolve_origin(cfg, session_id)
+        if not origin:
+            tried.append("gateway_routing has no row for session %r"
+                         % (session_id or None,))
+            return False, None, tried
+        _kb.add_notify_sub(
+            conn, task_id=card, platform="telegram",
+            chat_id=origin["chat_id"], chat_type=origin["chat_type"],
+            thread_id=origin.get("thread_id"),
+            notifier_profile=_kb.resolve_notifier_profile(),
+            delivery_metadata={k: v for k, v in (
+                ("thread_id", origin.get("thread_id")),
+                ("chat_type", origin.get("chat_type"))) if v} or None)
+        got = _readback_sub(conn, card)
+        if got:
+            return True, got, tried
+        tried.append("gateway_routing address written but no row read back")
+        return False, None, tried
+    except Exception as exc:
+        tried.append("subscribe raised: %r" % (exc,))
+        return False, None, tried
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _readback_sub(conn, card):
+    """``<platform>:<chat_id>`` of a deliverable subscription on ``card``, else
+    None.
+
+    ⚑ ``tui`` rows are RETURNED, not dropped. They were dropped on the theory
+    that the TUI poller is "a different consumer", but it is a real one: the TUI
+    gateway polls ``kanban_notify_subs`` every ``_KANBAN_POLL_SECONDS``
+    (``tui_gateway/server.py`` :8999). Dropping them produced the mirror-image
+    of the lie this patch exists to kill — a card whose completion WILL be
+    delivered, stamped "⚠ БЕЗ ПРОБУЖДЕНИЯ … проверять руками" forever — and, worse,
+    sent the caller on to rung 4, which wrote a SECOND subscription row and
+    would have delivered the same completion twice.
+
+    A chat row still wins when both exist; the caller says "it lands in the TUI,
+    not in Telegram" rather than "nobody will hear about this".
+    """
+    try:
+        row = conn.execute(
+            "SELECT platform, chat_id FROM kanban_notify_subs "
+            "WHERE task_id = ? AND COALESCE(chat_id, '') != '' "
+            "ORDER BY (platform = 'tui'), created_at DESC LIMIT 1",
+            (card,)).fetchone()
+    except Exception:
+        return None
+    if not row:
+        return None
+    return "%s:%s" % (row[0], row[1])
+
+
+def _pathlike(p):
+    """``kanban_db.connect(db_path=...)`` expects a Path; keep the import local
+    so this module still imports where pathlib is all we need."""
+    from pathlib import Path
+    return Path(p)
+
+
+def _session_env(name):
+    """Best-effort read of a gateway session ContextVar, for diagnostics only."""
+    try:
+        from gateway.session_context import get_session_env
+        return get_session_env(name, "") or None
+    except Exception:
+        return None
+
+
+def _mark_card_unwired(cfg, board, card, reason):
+    """Leave the failure ON THE CARD, not only in a response field.
+
+    ``comment`` is the existing verb for this (hermes_cli/kanban.py :578) and
+    shows up in ``kanban show`` / ``kanban tail``. Deliberately NOT the title:
+    the claimer feeds the title into the run prompt and (since 13.08) into the
+    commit/PR title, so a banner there would leak into published work."""
+    text = ("⚠ БЕЗ ПРОБУЖДЕНИЯ: завершение этой карточки никого не разбудит "
+            "и никуда не придёт — проверять руками "
+            "(claude_code(action=status, card_id=%r)). Причина: %s" % (card, reason))
+    try:
+        res = _kanban(cfg, board, "comment", card, text, "--author", "claude_code")
+    except Exception as exc:
+        logger.warning("%s: could not comment the no-wake mark onto %s: %r",
+                       WAKE_LOG_PREFIX, card, exc)
+        return False
+    if res.returncode != 0:
+        # The loudest of the three channels was the only one that failed
+        # silently: an exception was logged, a non-zero exit code was not. This
+        # patch's own rule is "confirm by the fact, not by the return code", and
+        # a locked kanban.db / a missing kanban_bin / the 120 s timeout all land
+        # here.
+        logger.warning("%s: kanban comment rc=%s — the no-wake mark is NOT on "
+                       "card %s: %s", WAKE_LOG_PREFIX, res.returncode, card,
+                       ((res.stderr or "") + (res.stdout or "")).strip()[:300])
+        return False
+    return True
 
 
 _payload_block = core.format_payload_block
@@ -305,56 +558,96 @@ def _run(args, session_id):
             error_type="claude_code_file_failed")
     card = m.group(0)
 
+    db_path = _board_db(cfg, board)
+    board_effective = _effective_board(db_path, cfg) or board
+    if board_effective != board:
+        # Not cosmetic: the env pin decides where the card really is, and until
+        # now the response named the board the caller asked for regardless.
+        logger.warning(
+            "%s: card %s was filed on board %r, not the requested %r "
+            "(HERMES_KANBAN_DB pins %s)",
+            WAKE_LOG_PREFIX, card, board_effective, board, db_path)
+
     woken = False
-    subscribed = False
+    stamp_reason = "no session_id on the calling turn"
     if session_id:
         try:
-            woken = _stamp_session_id(cfg, board, card, session_id)
-        except Exception:
-            woken = False
-        origin = _resolve_origin(cfg, session_id)
-        if origin:
-            sub = ["notify-subscribe", card, "--platform", "telegram",
-                   "--chat-id", origin["chat_id"],
-                   "--chat-type", origin["chat_type"]]
-            if origin.get("thread_id"):
-                sub += ["--thread-id", str(origin["thread_id"])]
-            try:
-                subscribed = _kanban(cfg, board, *sub).returncode == 0
-            except Exception:
-                subscribed = False
+            woken, stamp_reason = _stamp_session_id(cfg, board, card, session_id)
+        except Exception as exc:
+            woken, stamp_reason = False, "UPDATE raised: %r" % (exc,)
+        if not woken:
+            logger.warning("%s: session_id NOT stamped on %s (session=%s): %s",
+                           WAKE_LOG_PREFIX, card, session_id, stamp_reason)
 
-    # The wake path fires ONLY inside the notifier's loop over SUBSCRIPTIONS, so
-    # a stamped session_id without a subscription wakes no one (adversarial
-    # review 12.08). Promise "don't poll" only when BOTH are in place; otherwise
-    # tell the model to check status itself — never write "you'll be woken" when
-    # the mechanism won't.
-    wired = bool(woken and subscribed)
-    if wired:
-        note = ("Не опрашивай карточку: завершение само разбудит эту сессию "
-                "через kanban-нотификатор.")
-    elif not session_id:
-        note = "session_id недоступен — пробуждения не будет, проверяй status вручную."
+    # The address ladder is independent of session_id: a kanban worker has no
+    # usable session identity but does have the card it is running, and that
+    # card knows where its conversation lives.
+    subscribed, sub_how, sub_tried = _wire_wake(cfg, board, card, session_id)
+
+    # ⚑ Two DIFFERENT claims, and conflating them cries wolf on a card that will
+    # in fact be delivered. Delivery runs entirely off the SUBSCRIPTION: the
+    # notifier loop (gateway/kanban_watchers.py :225-240) walks
+    # ``kanban_notify_subs`` and never reads ``tasks.session_id``. So:
+    #   * no subscription  → nobody hears about this at all. That is the 13.08
+    #     failure, and it stays loud: WARNING + a comment on the card + a
+    #     top-level "warning" the model cannot read past.
+    #   * subscription but no stamped session_id → the result WILL arrive in the
+    #     chat; only re-entering THIS session is impossible. That is a soft note,
+    #     not a ⚠ banner and not a permanent comment on the card. Any transient
+    #     failure of _stamp_session_id (locked DB, board skew) used to land here
+    #     and told the model to go back to polling — exactly the polling the
+    #     typed tool was built to remove.
+    wired = bool(subscribed)
+    via_tui = bool(subscribed and str(sub_how or "").startswith("tui:"))
+    warning = None
+    if subscribed:
+        if via_tui:
+            note = ("Не опрашивай карточку: завершение придёт в TUI (адрес: %s), "
+                    "не в Telegram." % sub_how)
+        else:
+            note = ("Не опрашивай карточку: завершение придёт в этот разговор "
+                    "через kanban-нотификатор (адрес: %s)." % sub_how)
+        if not woken:
+            note += (" Разбудить именно эту сессию не выйдет (%s) — результат "
+                     "всё равно доставится." % stamp_reason)
     else:
-        note = ("Подписка на пробуждение НЕ встала (session_wake=%s, chat_notify=%s) "
-                "— автопробуждения не будет, проверяй claude_code(action=status) сам."
-                % (woken, subscribed))
+        # 13.08.2026: this state was reachable eight times in one day and its
+        # only trace was a false-valued field inside a success payload. It is
+        # now a WARNING in the log AND a comment on the card AND a top-level
+        # "warning" key the model cannot read past.
+        why = "chat_notify=false (%s)" % (
+            "; ".join(sub_tried) or "no address found")
+        if not woken:
+            why += "; session_wake=false (%s)" % stamp_reason
+        warning = ("ЗАВЕРШЕНИЕ ЭТОЙ ЗАДАЧИ НИКОМУ НЕ ПРИДЁТ. " + why)
+        logger.warning("%s: card %s on board %s is NOT wired for wake-up: %s",
+                       WAKE_LOG_PREFIX, card, board_effective, why)
+        _mark_card_unwired(cfg, board, card, why)
+        note = ("⚠ Автопробуждения НЕ будет — сам проверяй "
+                "claude_code(action=status, card_id=%r) и сам сообщи результат "
+                "человеку." % card)
 
-    return json.dumps({
+    out = {
         "filed": True,
         "card": card,
-        "board": board,
+        "board": board_effective,
+        "board_requested": board,
         "job_id": job_id,
         "lane": "terminal",
         "mode": norm["mode"],
         "timeout_seconds": norm["timeout_seconds"],
         "session_wake": woken,
         "chat_notify": subscribed,
+        "notify_via": sub_how,
+        "notify_is_tui": via_tui,
         "wake_wired": wired,
         "artifacts_dir": os.path.join(cfg["runs_root"], card),
         "how_to_check": "claude_code(action=status, card_id=%r)" % card,
         "note": note,
-    }, ensure_ascii=False)
+    }
+    if warning:
+        out["warning"] = warning
+    return json.dumps(out, ensure_ascii=False)
 
 
 def _status(args):

@@ -36,8 +36,9 @@ import subprocess
 import time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
-CORE_VERSION = "1.1.0"
+CORE_VERSION = "1.2.0"
 
 # --------------------------------------------------------------------------
 # Shared constants (formerly module globals of the Givi runner)
@@ -1233,6 +1234,7 @@ def run_claude(
     max_file_bytes=None,
     term_grace_seconds=DEFAULT_TERM_GRACE_SECONDS,
     kill_grace_seconds=DEFAULT_KILL_GRACE_SECONDS,
+    should_abort=None,
 ):
     """Run an already-built launcher argv with file-backed capture.
 
@@ -1247,10 +1249,20 @@ def run_claude(
       supervisor;
     * a short poll loop (never one blocking wait) so ``poll_cb(elapsed_s)``
       can refresh liveness/status while Claude works;
+    * ``should_abort`` (optional callable) is asked on every poll tick, BEFORE
+      ``poll_cb``: a falsy return means "keep going", a truthy return (by
+      convention a human-readable reason string, e.g. the ``reason`` of an
+      active stop flag) means "kill this run NOW" — through the very same
+      process-group ladder the deadline uses. The result then carries
+      ``aborted=True`` and ``abort_reason``. An exception from the probe is
+      swallowed like ``poll_cb``'s: a broken stop probe must never kill a
+      healthy run (fail-closed reading of the FLAGS is the probe's own job —
+      see :func:`read_stop_flags`). Omitting the kwarg keeps the previous
+      behavior exactly;
     * ``max_file_bytes`` (RLIMIT_FSIZE) caps runaway output at the OS level.
 
-    Returns a dict: rc, timed_out, kill_failed, started_at, duration_seconds,
-    out_path, err_path.
+    Returns a dict: rc, timed_out, aborted, abort_reason, kill_failed,
+    started_at, duration_seconds, out_path, err_path.
     """
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "output.txt")
@@ -1269,11 +1281,34 @@ def run_claude(
     started = utcnow_iso()
     t0 = time.time()
     timed_out = False
+    aborted = False
+    abort_reason = None
     kill_failed = False
     with open(out_path, "wb") as out_f, open(err_path, "wb") as err_f:
         proc = subprocess.Popen(argv, cwd=cwd, stdout=out_f, stderr=err_f,
                                 start_new_session=True, preexec_fn=preexec)
         deadline = t0 + timeout_seconds
+
+        def _kill_process_group():
+            """The one kill ladder (deadline and abort share it):
+            SIGTERM → wait term_grace → SIGKILL → wait kill_grace."""
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except OSError:
+                pass
+            try:
+                return proc.wait(timeout=term_grace_seconds), False
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                try:
+                    return proc.wait(timeout=kill_grace_seconds), False
+                except subprocess.TimeoutExpired:
+                    # Unkillable (D-state?): give up rather than hang forever.
+                    return -1, True
+
         try:
             while True:
                 try:
@@ -1282,6 +1317,21 @@ def run_claude(
                 except subprocess.TimeoutExpired:
                     if time.time() >= deadline:
                         raise
+                    if should_abort is not None:
+                        why = None
+                        try:
+                            why = should_abort()
+                        except Exception:
+                            # A broken probe is not a stop order. The flags
+                            # themselves fail closed at read time; the probe
+                            # crashing is a bug in the probe.
+                            why = None
+                        if why:
+                            aborted = True
+                            abort_reason = (why if isinstance(why, str)
+                                            else "aborted by should_abort")
+                            rc, kill_failed = _kill_process_group()
+                            break
                     if poll_cb is not None:
                         try:
                             poll_cb(time.time() - t0)
@@ -1289,26 +1339,12 @@ def run_claude(
                             pass  # a status callback must never kill the run
         except subprocess.TimeoutExpired:
             timed_out = True
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except OSError:
-                pass
-            try:
-                rc = proc.wait(timeout=term_grace_seconds)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except OSError:
-                    pass
-                try:
-                    rc = proc.wait(timeout=kill_grace_seconds)
-                except subprocess.TimeoutExpired:
-                    # Unkillable (D-state?): give up rather than hang forever.
-                    kill_failed = True
-                    rc = -1
+            rc, kill_failed = _kill_process_group()
     return {
         "rc": rc,
         "timed_out": timed_out,
+        "aborted": aborted,
+        "abort_reason": abort_reason,
         "kill_failed": kill_failed,
         "started_at": started,
         "duration_seconds": round(time.time() - t0, 1),
@@ -1328,6 +1364,186 @@ def write_result_json(out_dir, result):
     if not os.path.exists(out_txt):
         open(out_txt, "wb").close()
     return path
+
+
+# --------------------------------------------------------------------------
+# Terminal-lane stop flags — «стоп» as a durable file, not a prayer
+# --------------------------------------------------------------------------
+#
+# 13.08.2026 (hermes-ops infra/orchestration-deadlock-20260813.md §5б): the
+# claimer had no flag it checks BEFORE claiming — a card was claimed 4 seconds
+# after the user said «остановись» — and the bot had no cancel verb at all
+# (the ``claude_code`` tool knew only ``run`` and ``status``). These flags are
+# the transport-independent half of the fix. A producer (the gateway /stop
+# path, the tool's ``cancel``/``no_claude`` actions) atomically drops a small
+# JSON file into a control directory; the consumer (the terminal-claimer)
+#   (a) refuses to claim anything while ``stop-all.json`` exists,
+#   (b) aborts a live run through :func:`run_claude`'s ``should_abort`` probe,
+#   (c) skips / hands off cards whose per-card flag is set.
+#
+# Contract points, pinned by tests/tools/test_claude_code_cancel.py:
+#
+# * writes are ATOMIC (tmp file in the same directory + ``os.replace``) — a
+#   reader can never observe a half-written flag;
+# * reads FAIL CLOSED: a flag file that exists but cannot be read or parsed
+#   still counts as an ACTIVE flag ({"reason": "unreadable"}). A stop order
+#   must not evaporate because a disk hiccup mangled 40 bytes of JSON;
+# * the ONLY sanctioned deletion in this module is :func:`resume_lane`
+#   removing ``stop-all.json``. Per-card flags are consumed by the claimer on
+#   its side of the contract; nothing here garbage-collects them.
+
+TERMINAL_STOP_SCHEMA = "TERMINAL-STOP-V1"
+
+#: The lane-wide flag's file name; per-card flags are ``<card>.cancel.json``
+#: and ``<card>.no-claude.json`` (see :func:`stop_flag_path`).
+STOP_ALL_FLAG_NAME = "stop-all.json"
+
+STOP_FLAG_ACTIONS = ("stop_all", "cancel", "no_claude")
+
+#: Card ids come from kanban (``t_xxxxxxxx``), but the flag file name embeds
+#: them, so they are validated as SAFE PATH COMPONENTS, not trusted.
+_STOP_FLAG_CARD_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def control_dir(env=None):
+    """Where the terminal lane's stop flags live, as a ``Path``.
+
+    ``KTC_CONTROL_DIR`` (same env family as the claimer's other seams) wins;
+    the default is ``~/.hermes/kanban/terminal-control``. ``env`` is a seam so
+    tests and embedders never touch the real directory by accident.
+    """
+    env = os.environ if env is None else env
+    raw = env.get("KTC_CONTROL_DIR")
+    if raw:
+        return Path(raw)
+    return Path(os.path.expanduser("~")) / ".hermes" / "kanban" / "terminal-control"
+
+
+def _stop_flag_name(action, card=None):
+    """File name for a flag; raises ValueError on caller bugs (unknown action,
+    missing/unsafe card) — a stop order silently written to a wrong name is a
+    stop order that never happened."""
+    if action == "stop_all":
+        return STOP_ALL_FLAG_NAME
+    if action not in STOP_FLAG_ACTIONS:
+        raise ValueError("unknown stop action: %r" % (action,))
+    if not isinstance(card, str) or not _STOP_FLAG_CARD_RE.match(card or ""):
+        raise ValueError("action %r needs a safe card id, got %r" % (action, card))
+    return "%s.%s.json" % (card, "cancel" if action == "cancel" else "no-claude")
+
+
+def stop_flag_path(control_dir, action, card=None):
+    """Full ``Path`` of one flag file (see :func:`_stop_flag_name`)."""
+    return Path(control_dir) / _stop_flag_name(action, card)
+
+
+def write_stop_flag(control_dir, action, card=None, board=None,
+                    requested_by="", reason="", cascade_from=None):
+    """Atomically raise a stop flag; returns the flag's ``Path``.
+
+    ``action`` is one of ``stop_all`` (lane-wide, no card), ``cancel`` /
+    ``no_claude`` (per card). The directory is created ``0700`` on first use
+    (the flags name cards and requesters; nobody else needs to read them).
+    The write is tmp-in-the-same-directory + ``os.replace`` so a concurrent
+    reader sees either the previous flag or the new one, never a torn file.
+    Idempotent by design: re-raising an existing flag simply refreshes it.
+    """
+    target = stop_flag_path(control_dir, action, card)
+    directory = str(target.parent)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(directory, 0o700)
+    except OSError:
+        pass
+    flag = {
+        "schema": TERMINAL_STOP_SCHEMA,
+        "action": action,
+        "card": card,
+        "board": board,
+        "requested_by": requested_by or "",
+        "reason": reason or "",
+        "at": utcnow_iso(),
+        "cascade_from": cascade_from,
+    }
+    tmp = os.path.join(directory,
+                       ".%s.tmp-%s" % (target.name, uuid.uuid4().hex[:8]))
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(flag, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, str(target))
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+    return target
+
+
+def resume_lane(control_dir):
+    """Remove ``stop-all.json`` — the ONLY deletion this contract sanctions.
+
+    Returns True when a flag was actually removed, False when there was none.
+    Any other OSError (permissions, a directory squatting on the name)
+    propagates: "resume failed" must not read as "nothing to resume".
+    Per-card flags are deliberately NOT touched here — un-cancelling a card is
+    a different decision from re-opening the lane.
+    """
+    target = Path(control_dir) / STOP_ALL_FLAG_NAME
+    try:
+        os.remove(str(target))
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def _read_stop_flag(path, action):
+    """One flag file → dict | None. FAIL CLOSED: a file that exists but cannot
+    be read or parsed is an ACTIVE flag, not a missing one."""
+    unreadable = {"schema": TERMINAL_STOP_SCHEMA, "action": action,
+                  "reason": "unreadable", "unreadable": True}
+    try:
+        with open(str(path), "r", encoding="utf-8") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return unreadable
+    try:
+        flag = json.loads(raw)
+    except (ValueError, TypeError):
+        return unreadable
+    if not isinstance(flag, dict):
+        return unreadable
+    return flag
+
+
+def read_stop_flags(control_dir, card):
+    """Every flag affecting *card*:
+    ``{"stop_all": flag|None, "cancel": flag|None, "no_claude": flag|None}``.
+
+    A card id that is not a safe path component gets ``None`` for its per-card
+    slots (such a flag can never have been written); the lane-wide slot is
+    always consulted. Unreadable files come back as ACTIVE flags (see
+    :func:`_read_stop_flag`).
+    """
+    base = Path(control_dir)
+    flags = {
+        "stop_all": _read_stop_flag(base / STOP_ALL_FLAG_NAME, "stop_all"),
+        "cancel": None,
+        "no_claude": None,
+    }
+    if isinstance(card, str) and _STOP_FLAG_CARD_RE.match(card or ""):
+        flags["cancel"] = _read_stop_flag(
+            base / _stop_flag_name("cancel", card), "cancel")
+        flags["no_claude"] = _read_stop_flag(
+            base / _stop_flag_name("no_claude", card), "no_claude")
+    return flags
+
+
+def stop_all_active(control_dir):
+    """The lane-wide stop flag, or None. Same fail-closed read."""
+    return _read_stop_flag(Path(control_dir) / STOP_ALL_FLAG_NAME, "stop_all")
 
 
 # --------------------------------------------------------------------------

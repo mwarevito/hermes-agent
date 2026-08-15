@@ -496,6 +496,247 @@ _payload_block = core.format_payload_block
 
 
 # --------------------------------------------------------------------------
+# Cancel / no-claude helpers (13.08.2026: «сказал стоп — карточку взяли через
+# 4 секунды», infra/orchestration-deadlock-20260813.md §5б: the tool knew only
+# run|status, so the bot had no cancel verb at all)
+# --------------------------------------------------------------------------
+
+#: Statuses the tool may block DIRECTLY: the card is still in the queue and
+#: nobody has claimed it. A ``running`` card is never closed from here —
+#: Batch-4 invariant: only the claiming side may close/block a claimed card —
+#: so for it the tool only raises the flag and says so on the card.
+_CANCELLABLE_QUEUE_STATUSES = ("todo", "ready", "scheduled")
+
+
+def _card_family(cfg, board, card, cascade):
+    """``(targets, statuses, err)`` — the card itself plus (with ``cascade``)
+    every DESCENDANT reachable through ``task_links`` (children, their
+    children, …). ``statuses`` maps the ids actually present in the board DB
+    to their status; an id absent from the map was not found there.
+
+    Read-only sqlite over the same DB file the CLI writes (``_board_db``
+    honours the dispatcher's ``HERMES_KANBAN_DB`` pin, so a worker cancelling
+    its own children looks at the board the cards really live on). ``err`` is
+    a human-readable reason when the DB could not be read — the caller still
+    proceeds with what it has (flags do not need the DB), but must say so.
+    """
+    db_path = _board_db(cfg, board)
+    targets = [card]
+    statuses = {}
+    try:
+        conn = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True,
+                               timeout=10)
+    except Exception as exc:
+        return targets, statuses, "kanban DB unreadable (%s): %r" % (db_path, exc)
+    try:
+        try:
+            if cascade:
+                seen = {card}
+                frontier = [card]
+                while frontier:
+                    marks = ",".join("?" * len(frontier))
+                    rows = conn.execute(
+                        "SELECT parent_id, child_id FROM task_links "
+                        "WHERE parent_id IN (%s)" % marks, frontier).fetchall()
+                    frontier = []
+                    for _parent, child in rows:
+                        if child and child not in seen:
+                            seen.add(child)
+                            targets.append(child)
+                            frontier.append(child)
+            marks = ",".join("?" * len(targets))
+            for tid, status in conn.execute(
+                    "SELECT id, status FROM tasks WHERE id IN (%s)" % marks,
+                    targets):
+                statuses[tid] = status
+        except sqlite3.Error as exc:
+            return targets, statuses, "kanban DB query failed: %r" % (exc,)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return targets, statuses, None
+
+
+def _requested_by(session_id):
+    return "session:%s" % session_id if session_id else "claude_code tool"
+
+
+def _cancel(args, session_id):
+    """Stop filed work. ``all=true`` raises the lane-wide stop flag; a
+    ``card_id`` cancels the card and (``cascade``, default true) its
+    descendants. Queue-state cards are blocked right here with
+    ``[cancelled] <reason>``; a RUNNING card only gets its flag + a comment —
+    the claimer, being the claiming side (Batch-4), is the one that kills the
+    process and closes the card."""
+    cfg = _cfg()
+    board = args.get("board") or cfg["board"]
+    reason = (args.get("reason") or "").strip() or "остановлено по команде"
+    cascade = args.get("cascade")
+    cascade = True if cascade is None else bool(cascade)
+    control = core.control_dir()
+    requested_by = _requested_by(session_id)
+
+    if args.get("all"):
+        try:
+            flag_path = core.write_stop_flag(
+                control, "stop_all", requested_by=requested_by, reason=reason)
+        except Exception as exc:
+            return tool_error("could not write the stop-all flag: %r" % (exc,),
+                              error_type="claude_code_stop_flag_failed")
+        return json.dumps({
+            "cancelled": "all",
+            "flagged": [str(flag_path)],
+            "blocked": [],
+            "kill_pending": [],
+            "note": ("stop-all поднят: клеймер не возьмёт новые карточки и "
+                     "прервёт живой прогон на ближайшем опросе (штатно ≤5 с). "
+                     "Снять: claude_code(action='resume_lane')."),
+        }, ensure_ascii=False)
+
+    card = (args.get("card_id") or "").strip()
+    if not _CARD_ID_RE.fullmatch(card):
+        return tool_error("cancel needs card_id (t_xxxxxxxx) or all=true",
+                          error_type="claude_code_bad_card")
+
+    targets, statuses, family_err = _card_family(cfg, board, card, cascade)
+    flagged, blocked, kill_pending = [], [], []
+    skipped, errors = {}, {}
+    for tid in targets:
+        try:
+            core.write_stop_flag(
+                control, "cancel", card=tid, board=board,
+                requested_by=requested_by, reason=reason,
+                cascade_from=(card if tid != card else None))
+            flagged.append(tid)
+        except Exception as exc:
+            # No flag → no claimer-side protection for this id; that is a
+            # failure of the cancel, not a footnote.
+            errors[tid] = "flag: %r" % (exc,)
+            continue
+        status = statuses.get(tid)
+        if status in _CANCELLABLE_QUEUE_STATUSES:
+            try:
+                res = _kanban(cfg, board, "block", tid,
+                              "[cancelled] %s" % reason)
+            except Exception as exc:
+                errors[tid] = "block: %r" % (exc,)
+                continue
+            if res.returncode == 0:
+                blocked.append(tid)
+            else:
+                errors[tid] = "block rc=%s: %s" % (
+                    res.returncode,
+                    ((res.stderr or "") + (res.stdout or "")).strip()[:200])
+        elif status == "running":
+            kill_pending.append(tid)
+            try:
+                res = _kanban(
+                    cfg, board, "comment", tid,
+                    "⏹ cancel: остановит клеймер — карточка claim-нута, "
+                    "закрыть её может только claim-нувшая сторона (Batch-4); "
+                    "флаг %s поднят. Причина: %s"
+                    % (core.stop_flag_path(control, "cancel", tid).name, reason),
+                    "--author", "claude_code")
+                if res.returncode != 0:
+                    errors[tid] = "comment rc=%s (флаг всё равно поднят)" % res.returncode
+            except Exception as exc:
+                errors[tid] = "comment: %r (флаг всё равно поднят)" % (exc,)
+        else:
+            skipped[tid] = status or "not found in %s" % _board_db(cfg, board)
+    out = {
+        "cancelled": card,
+        "cascade": cascade,
+        "targets": targets,
+        "flagged": flagged,
+        "blocked": blocked,
+        "kill_pending": kill_pending,
+    }
+    if skipped:
+        out["skipped"] = skipped
+    if errors:
+        out["errors"] = errors
+    if family_err:
+        out["warning"] = ("каскад мог быть неполным: %s — отменён только сам "
+                          "%s; потомков проверить руками (kanban show)"
+                          % (family_err, card))
+    return json.dumps(out, ensure_ascii=False)
+
+
+def _no_claude(args, session_id):
+    """«Сделай без Claude Code»: durable per-card flag (the claimer refuses the
+    card even after restarts) + an IMMEDIATE ``hermes kanban assign <id>
+    default`` attempt so a queued card moves to a plain worker now. Both
+    outcomes are reported honestly, per card."""
+    cfg = _cfg()
+    board = args.get("board") or cfg["board"]
+    card = (args.get("card_id") or "").strip()
+    if not _CARD_ID_RE.fullmatch(card):
+        return tool_error("no_claude needs card_id (t_xxxxxxxx)",
+                          error_type="claude_code_bad_card")
+    reason = (args.get("reason") or "").strip() or "делать без Claude Code"
+    cascade = args.get("cascade")
+    cascade = True if cascade is None else bool(cascade)
+    control = core.control_dir()
+    requested_by = _requested_by(session_id)
+
+    targets, statuses, family_err = _card_family(cfg, board, card, cascade)
+    flagged, reassigned = [], []
+    errors = {}
+    for tid in targets:
+        try:
+            core.write_stop_flag(
+                control, "no_claude", card=tid, board=board,
+                requested_by=requested_by, reason=reason,
+                cascade_from=(card if tid != card else None))
+            flagged.append(tid)
+        except Exception as exc:
+            errors[tid] = "flag: %r" % (exc,)
+            continue
+        try:
+            res = _kanban(cfg, board, "assign", tid, "default")
+        except Exception as exc:
+            errors[tid] = "assign: %r (флаг поднят — терминал карточку не возьмёт)" % (exc,)
+            continue
+        if res.returncode == 0:
+            reassigned.append(tid)
+        else:
+            errors[tid] = "assign rc=%s: %s (флаг поднят — терминал карточку не возьмёт)" % (
+                res.returncode,
+                ((res.stderr or "") + (res.stdout or "")).strip()[:200])
+    out = {
+        "card": card,
+        "cascade": cascade,
+        "targets": targets,
+        "flagged": flagged,
+        "reassigned": reassigned,
+    }
+    if errors:
+        out["errors"] = errors
+    if family_err:
+        out["warning"] = ("каскад мог быть неполным: %s — помечен только сам "
+                          "%s" % (family_err, card))
+    return json.dumps(out, ensure_ascii=False)
+
+
+def _resume_lane(args):
+    """Take the lane-wide stop down (core.resume_lane — the one sanctioned
+    deletion). Per-card cancel/no-claude flags stay: re-opening the lane is
+    not un-cancelling a card."""
+    try:
+        resumed = core.resume_lane(core.control_dir())
+    except Exception as exc:
+        return tool_error("could not remove the stop-all flag: %r" % (exc,),
+                          error_type="claude_code_resume_failed")
+    return json.dumps({
+        "resumed": resumed,
+        "note": ("stop-all снят — клеймер снова берёт карточки" if resumed
+                 else "stop-all и не стоял; ничего не менялось"),
+    }, ensure_ascii=False)
+
+
+# --------------------------------------------------------------------------
 # Actions
 # --------------------------------------------------------------------------
 
@@ -690,6 +931,14 @@ def _status(args):
         runs.append(entry)
     out["runs"] = runs
     out["artifacts_dir"] = runs_dir
+
+    # Active stop/cancel flags for this card (and the lane): a status readout
+    # that hides a raised flag would report a cancelled job as merely "slow".
+    try:
+        flags = core.read_stop_flags(core.control_dir(), card)
+        out["stop_flags"] = {k: v for k, v in flags.items() if v} or None
+    except Exception:
+        out["stop_flags"] = None
     return json.dumps(out, ensure_ascii=False)
 
 
@@ -701,8 +950,15 @@ def handle_claude_code(args, **kw):
         return _run(args, session_id)
     if action == "status":
         return _status(args)
-    return tool_error("action must be 'run' or 'status'",
-                      error_type="claude_code_bad_action")
+    if action == "cancel":
+        return _cancel(args, session_id)
+    if action == "no_claude":
+        return _no_claude(args, session_id)
+    if action == "resume_lane":
+        return _resume_lane(args)
+    return tool_error(
+        "action must be one of 'run', 'status', 'cancel', 'no_claude', "
+        "'resume_lane'", error_type="claude_code_bad_action")
 
 
 CLAUDE_CODE_SCHEMA = {
@@ -714,13 +970,24 @@ CLAUDE_CODE_SCHEMA = {
         "the card id; the run executes outside the gateway with file-backed "
         "artifacts, a hard timeout, budget cap and automatic ONE-shot resume "
         "if it times out mid-work. Completion wakes this conversation via the "
-        "kanban notifier — do NOT poll. action='status' inspects a filed job."
+        "kanban notifier — do NOT poll. action='status' inspects a filed job. "
+        "action='cancel' stops work: card_id cancels a card and (cascade, "
+        "default true) its descendants — queued cards are blocked here, a "
+        "running one is killed by the claimer via a durable flag; all=true "
+        "stops the whole lane until resume_lane. action='no_claude' flags a "
+        "card «делать без Claude Code» and reassigns it to a plain worker."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["run", "status"],
-                       "description": "run (default) files a job; status inspects one"},
+            "action": {"type": "string",
+                       "enum": ["run", "status", "cancel", "no_claude",
+                                "resume_lane"],
+                       "description": "run (default) files a job; status "
+                                      "inspects one; cancel stops a card or "
+                                      "(all=true) the lane; no_claude hands a "
+                                      "card to a plain worker; resume_lane "
+                                      "lifts a stop-all"},
             "prompt": {"type": "string",
                        "description": "The task for Claude Code (plain text; "
                                       "required for action=run)"},
@@ -755,7 +1022,20 @@ CLAUDE_CODE_SCHEMA = {
             "board": {"type": "string",
                       "description": "Kanban board (default hermes-infra)"},
             "card_id": {"type": "string",
-                        "description": "action=status: the card to inspect"},
+                        "description": "action=status/cancel/no_claude: the "
+                                       "card to inspect / stop / hand off"},
+            "all": {"type": "boolean",
+                    "description": "action=cancel: true stops the WHOLE "
+                                   "terminal lane (no new claims, live run "
+                                   "aborted) until resume_lane"},
+            "reason": {"type": "string",
+                       "description": "action=cancel/no_claude: why — lands "
+                                      "on the flag, the card comment and the "
+                                      "block reason"},
+            "cascade": {"type": "boolean",
+                        "description": "action=cancel/no_claude: also cover "
+                                       "every descendant card via task_links "
+                                       "(default true)"},
         },
         "required": [],
     },

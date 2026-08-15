@@ -595,7 +595,7 @@ def test_write_result_json_guarantees_output_txt(tmp_path):
 
 _STDLIB_OK = {
     "json", "os", "re", "shutil", "signal", "subprocess", "time", "uuid",
-    "datetime", "__future__", "hashlib", "hmac",
+    "datetime", "__future__", "hashlib", "hmac", "pathlib",
 }
 
 

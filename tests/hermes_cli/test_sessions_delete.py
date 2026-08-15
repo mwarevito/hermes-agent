@@ -94,17 +94,59 @@ def test_sessions_prune_bare_keeps_90_day_default(monkeypatch, capsys):
     import time as _time
 
     filters, _out = _run_prune(monkeypatch, capsys, [])
-    assert filters["last_active_before"] is not None
-    assert filters["last_active_before"] == pytest.approx(
+    assert filters["ended_before"] is not None
+    assert filters["ended_before"] == pytest.approx(
         _time.time() - 90 * 86400, abs=60
     )
+    assert filters["last_active_before"] is None
 
 
-def test_sessions_prune_preview_shows_oldest_newest(monkeypatch, capsys):
-    """Confirmation preview surfaces count + oldest/newest session times."""
+def test_sessions_prune_cli_preview_ages_from_end_time(
+    monkeypatch, capsys, tmp_path
+):
+    """The primary CLI path must spare an old-start/recent-end session."""
+    import time as _time
+
+    import hermes_cli.main as main_mod
+    import hermes_state
+
+    db = hermes_state.SessionDB(db_path=tmp_path / "state.db")
+    now = _time.time()
+    for sid, started_days_ago, ended_days_ago in (
+        ("long-running-recent-end", 120, 1),
+        ("old-ended", 120, 100),
+    ):
+        db.create_session(session_id=sid, source="cli")
+        db.end_session(sid, end_reason="done")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = ?",
+            (
+                now - started_days_ago * 86400,
+                now - ended_days_ago * 86400,
+                sid,
+            ),
+        )
+    db._conn.commit()
+
+    monkeypatch.setattr(hermes_state, "SessionDB", lambda: db)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["hermes", "sessions", "prune", "--older-than", "90", "--dry-run"],
+    )
+
+    main_mod.main()
+
+    output = capsys.readouterr().out
+    assert "old-ended" in output
+    assert "long-running-recent-end" not in output
+
+
+def test_sessions_prune_preview_shows_oldest_newest_end(monkeypatch, capsys):
+    """Prune confirmation surfaces count plus the selected end-time span."""
     from hermes_cli.session_filters import format_epoch
 
     _filters, out = _run_prune(monkeypatch, capsys, ["--source", "cron"])
     assert "2 session(s) match" in out
-    assert f"oldest activity {format_epoch(1_600_000_050.0)}" in out
-    assert f"newest activity {format_epoch(1_700_000_050.0)}" in out
+    assert f"oldest end {format_epoch(1_600_000_100.0)}" in out
+    assert f"newest end {format_epoch(1_700_000_100.0)}" in out

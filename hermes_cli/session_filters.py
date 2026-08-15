@@ -79,22 +79,28 @@ def format_epoch(ts: Optional[float]) -> str:
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
 
 
-def build_prune_filters(args: Any) -> Dict[str, Any]:
+def build_prune_filters(args: Any, *, age_basis: str = "activity") -> Dict[str, Any]:
     """Translate argparse Namespace flags into SessionDB filter kwargs.
 
     Understands: ``--older-than``, ``--newer-than``, ``--before``,
     ``--after``, ``--source``, ``--title``, ``--end-reason``, ``--cwd``,
     ``--min-messages``, ``--max-messages``, ``--archived``/``--no-archived``.
 
-    ``--older-than`` / ``--newer-than`` bound last activity, while
-    ``--before`` / ``--after`` explicitly bound session start time. Last
-    activity is the latest message timestamp, falling back to ``started_at``
-    for empty sessions.
+    ``--older-than`` / ``--newer-than`` bound last activity by default. Pass
+    ``age_basis="ended"`` for destructive pruning so both flags bound the
+    actual session end time instead. ``--before`` / ``--after`` explicitly
+    bound session start time. Last activity is the latest message timestamp,
+    falling back to ``started_at`` for empty sessions.
 
     Raises ``ValueError`` on unparseable values or an empty/inverted window.
     """
+    if age_basis not in {"activity", "ended"}:
+        raise ValueError(f"Unsupported age basis: {age_basis}")
+
     last_active_before: Optional[float] = None
     last_active_after: Optional[float] = None
+    ended_before: Optional[float] = None
+    ended_after: Optional[float] = None
     started_before: Optional[float] = None
     started_after: Optional[float] = None
 
@@ -105,18 +111,18 @@ def build_prune_filters(args: Any) -> Dict[str, Any]:
 
     older_than = getattr(args, "older_than", None)
     if older_than is not None:
-        last_active_before = _tighter(
-            last_active_before,
-            parse_point_in_time(older_than, "--older-than"),
-            True,
-        )
+        parsed = parse_point_in_time(older_than, "--older-than")
+        if age_basis == "ended":
+            ended_before = _tighter(ended_before, parsed, True)
+        else:
+            last_active_before = _tighter(last_active_before, parsed, True)
     newer_than = getattr(args, "newer_than", None)
     if newer_than is not None:
-        last_active_after = _tighter(
-            last_active_after,
-            parse_point_in_time(newer_than, "--newer-than"),
-            False,
-        )
+        parsed = parse_point_in_time(newer_than, "--newer-than")
+        if age_basis == "ended":
+            ended_after = _tighter(ended_after, parsed, False)
+        else:
+            last_active_after = _tighter(last_active_after, parsed, False)
     before = getattr(args, "before", None)
     if before is not None:
         started_before = _tighter(
@@ -148,6 +154,16 @@ def build_prune_filters(args: Any) -> Dict[str, Any]:
             f"({format_epoch(last_active_after)}) is not earlier than the "
             f"--older-than bound ({format_epoch(last_active_before)})."
         )
+    if (
+        ended_before is not None
+        and ended_after is not None
+        and ended_after >= ended_before
+    ):
+        raise ValueError(
+            "Empty end-time window: the --newer-than bound "
+            f"({format_epoch(ended_after)}) is not earlier than the "
+            f"--older-than bound ({format_epoch(ended_before)})."
+        )
 
     filters: Dict[str, Any] = {
         # older_than_days=None: the epoch bounds above are the whole story.
@@ -156,6 +172,8 @@ def build_prune_filters(args: Any) -> Dict[str, Any]:
         "older_than_days": None,
         "last_active_before": last_active_before,
         "last_active_after": last_active_after,
+        "ended_before": ended_before,
+        "ended_after": ended_after,
         "started_before": started_before,
         "started_after": started_after,
         "source": getattr(args, "source", None),
@@ -191,6 +209,10 @@ def describe_filters(filters: Dict[str, Any]) -> str:
         parts.append(
             f"last active after {format_epoch(filters['last_active_after'])}"
         )
+    if filters.get("ended_before") is not None:
+        parts.append(f"ended before {format_epoch(filters['ended_before'])}")
+    if filters.get("ended_after") is not None:
+        parts.append(f"ended after {format_epoch(filters['ended_after'])}")
     if filters.get("started_before") is not None:
         parts.append(f"started before {format_epoch(filters['started_before'])}")
     if filters.get("started_after") is not None:

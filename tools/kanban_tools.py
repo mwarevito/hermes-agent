@@ -37,6 +37,7 @@ from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
+from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,16 @@ def _is_delegated_child_context() -> bool:
         return is_delegated_child_context()
     except Exception:
         return False
+
+
+def _is_cron_context() -> bool:
+    """Return the request-scoped cron marker without cross-session leakage."""
+    try:
+        from gateway.session_context import get_session_env
+
+        return is_truthy_value(get_session_env("HERMES_CRON_SESSION", ""))
+    except Exception:
+        return is_truthy_value(os.environ.get("HERMES_CRON_SESSION", ""))
 
 
 def _reject_delegated_child_mutation(tool_name: str) -> Optional[str]:
@@ -617,6 +628,11 @@ def _handle_list(args: dict, **kw) -> str:
 
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
+    if _is_cron_context():
+        return tool_error(
+            "kanban_complete refused: cron sessions are not Kanban run "
+            "owners and cannot close tasks"
+        )
     delegated_err = _reject_delegated_child_mutation("kanban_complete")
     if delegated_err:
         return delegated_err
@@ -1303,6 +1319,13 @@ def _handle_create(args: dict, **kw) -> str:
     if not isinstance(parents, (list, tuple)):
         return tool_error(
             f"parents must be a list of task ids, got {type(parents).__name__}"
+        )
+    parents = [str(parent).strip() for parent in parents if str(parent).strip()]
+    worker_task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if worker_task_id and not parents:
+        return tool_error(
+            "kanban_create refused: a dispatcher worker cannot create a "
+            "free-standing root task; pass at least one parent task id"
         )
     try:
         # Resolve the target board deterministically instead of silently

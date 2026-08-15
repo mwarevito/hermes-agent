@@ -80,6 +80,16 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "runs" in d
 
 
+def test_show_without_task_id_is_rejected_by_kanban_interface(monkeypatch):
+    """The Kanban tool owns its required-id validation without a global gate."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_show({}))
+    assert out.get("ok") is not True
+    assert "task_id is required" in out.get("error", "")
+
+
 def test_list_filters_tasks(monkeypatch, worker_env):
     """kanban_list gives orchestrators filtered board discovery."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
@@ -629,6 +639,32 @@ def test_worker_can_comment_on_foreign_task(worker_env):
         conn.close()
 
 
+def test_worker_create_requires_a_parent(worker_env):
+    """A dispatcher worker cannot mint an unrelated root task."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    before = kb.connect()
+    try:
+        before_ids = {task.id for task in kb.list_tasks(before, limit=200)}
+    finally:
+        before.close()
+
+    out = json.loads(kt._handle_create({
+        "title": "detached follow-up",
+        "assignee": "peer",
+    }))
+    assert out.get("ok") is not True
+    assert "parent" in out.get("error", "").lower()
+
+    after = kb.connect()
+    try:
+        after_ids = {task.id for task in kb.list_tasks(after, limit=200)}
+    finally:
+        after.close()
+    assert after_ids == before_ids
+
+
 def test_worker_unblock_rejects_foreign_task_id(worker_env):
     """A worker cannot unblock any task — kanban_unblock is orchestrator-only.
 
@@ -685,6 +721,45 @@ def test_orchestrator_complete_any_task_allowed(monkeypatch, tmp_path):
     out = kt._handle_complete({"task_id": tid, "summary": "orchestrator close"})
     d = json.loads(out)
     assert d.get("ok") is True and d.get("task_id") == tid
+
+
+def test_cron_session_cannot_complete_a_kanban_task(monkeypatch, tmp_path):
+    """A gate-exempt cron turn is not a Kanban run owner."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="must remain open", assignee="worker")
+    finally:
+        conn.close()
+
+    tokens = set_session_vars(cron_session="1")
+    try:
+        out = json.loads(kt._handle_complete({
+            "task_id": tid,
+            "summary": "cron attempted closure",
+        }))
+    finally:
+        clear_session_vars(tokens)
+
+    assert out.get("ok") is not True
+    assert "cron" in out.get("error", "").lower()
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "ready"
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -826,6 +901,7 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "channel-1")
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
 
     from tools import kanban_tools as kt
     out = kt._handle_create({
@@ -858,6 +934,7 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
     out = kt._handle_create({
         "title": "auto-sub tolerates add_notify_sub failure",
         "assignee": "peer",
+        "parents": [worker_env],
     })
     d = json.loads(out)
     assert d["ok"] is True, d
@@ -1049,6 +1126,7 @@ def test_tool_create_defaults_to_budget_mode(worker_env):
     d = json.loads(kt._handle_create({
         "title": "budget-mode default card",
         "assignee": "peer",
+        "parents": [worker_env],
     }))
     assert d["ok"] is True, d
     task = _get_task(d["task_id"])
@@ -1063,6 +1141,7 @@ def test_tool_create_explicit_goal_mode_still_works(worker_env):
     d = json.loads(kt._handle_create({
         "title": "explicit goal-loop card",
         "assignee": "peer",
+        "parents": [worker_env],
         "goal_mode": True,
         "goal_max_turns": 7,
     }))
@@ -1078,6 +1157,7 @@ def test_tool_create_goal_mode_string_true_still_works(worker_env):
     d = json.loads(kt._handle_create({
         "title": "explicit goal-loop card (string)",
         "assignee": "peer",
+        "parents": [worker_env],
         "goal_mode": "true",
     }))
     assert d["ok"] is True, d

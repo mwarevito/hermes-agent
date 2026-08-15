@@ -2753,6 +2753,97 @@ _INTERRUPT_REASON_GATEWAY_SHUTDOWN = "Gateway shutting down"
 _INTERRUPT_REASON_GATEWAY_RESTART = "Gateway restarting"
 
 
+# ---------------------------------------------------------------------------
+# Terminal-lane stop — «стоп» must also stop the Claude Code lane
+# ---------------------------------------------------------------------------
+#
+# 13.08.2026 (hermes-ops infra/orchestration-deadlock-20260813.md §5б): /stop
+# interrupted the gateway turn, but the terminal-claimer is a launchd daemon
+# OUTSIDE the gateway — it claimed the next card 4 seconds after the user said
+# «остановись», and a run already in flight was untouchable. The /stop path
+# (and a bare stop word, below) now ALSO raises the durable lane-wide stop
+# flag (tools/claude_code_core.write_stop_flag → stop-all.json) that the
+# claimer checks before claiming and mid-run.
+#
+# Gated the same way check_claude_code_requirements gates the claude_code
+# tool: HERMES_TERMINAL_LANE_STOP=1 AND HERMES_HOME resolving to the personal
+# ~/.hermes. The live repo is shared by all seven gateways and env leaks down
+# inherited process lines (observed 23.07), so without the home binding six
+# other bots' /stop would start writing flags for a lane they do not own.
+#
+# Every failure here is swallowed with a WARNING: the user's message path must
+# never die over a flag file.
+
+_STOP_WORDS_ENV = "HERMES_STOP_WORDS"
+_STOP_WORDS_DEFAULT = "стоп,остановись,stop"
+#: Trailing junk stripped before the exact-match check: whitespace and final
+#: punctuation only. «Стоп!» is a stop; «стоп, я передумал» is a sentence.
+_STOP_WORD_TRAILING_JUNK = " \t\r\n.!?…,;:"
+
+
+def _terminal_lane_stop_enabled() -> bool:
+    """True only on the profile that owns the terminal lane (env opt-in AND
+    the personal HERMES_HOME — the check_claude_code_requirements pattern)."""
+    if os.environ.get("HERMES_TERMINAL_LANE_STOP") != "1":
+        return False
+    home = os.path.expanduser("~")
+    hermes_home = os.path.realpath(
+        os.environ.get("HERMES_HOME", os.path.join(home, ".hermes")))
+    return hermes_home == os.path.realpath(os.path.join(home, ".hermes"))
+
+
+def _stop_requested_by(source) -> str:
+    """``platform:user_id`` for the flag's requested_by field; never raises."""
+    try:
+        platform = source.platform.value if getattr(source, "platform", None) else "unknown"
+    except Exception:
+        platform = "unknown"
+    user = getattr(source, "user_id", None) or "unknown"
+    return "%s:%s" % (platform, user)
+
+
+def _maybe_stop_terminal_lane(source=None, reason: str = "/stop") -> bool:
+    """Raise the terminal-lane stop-all flag. Returns True only when a flag
+    was actually written; False on a closed gate or ANY failure (logged,
+    swallowed — the surrounding /stop reply must still go out)."""
+    try:
+        if not _terminal_lane_stop_enabled():
+            return False
+        from tools import claude_code_core as _cc_core
+        flag_path = _cc_core.write_stop_flag(
+            _cc_core.control_dir(), "stop_all",
+            requested_by=_stop_requested_by(source), reason=reason)
+        logger.info("terminal-lane STOP: flag written to %s (reason=%s)",
+                    flag_path, reason)
+        return True
+    except Exception:
+        logger.warning(
+            "terminal-lane STOP flag could NOT be written — the claimer will "
+            "keep claiming; use claude_code(action='cancel', all=true)",
+            exc_info=True,
+        )
+        return False
+
+
+def _is_bare_stop_word(text) -> bool:
+    """Exact NORMALIZED match of the WHOLE message against one of the
+    configured stop words (env ``HERMES_STOP_WORDS``, comma-separated;
+    default «стоп,остановись,stop»).
+
+    Normalization is strip + casefold-to-lower + dropping TRAILING
+    punctuation. A stop word inside a longer phrase never triggers — steering
+    text like «стоп, сначала дочитай» keeps its existing semantics. No DB, no
+    file reads: env + string compare only, safe on the message path."""
+    if not text or not isinstance(text, str):
+        return False
+    normalized = text.strip().lower().rstrip(_STOP_WORD_TRAILING_JUNK)
+    if not normalized:
+        return False
+    raw = os.environ.get(_STOP_WORDS_ENV) or _STOP_WORDS_DEFAULT
+    words = tuple(w.strip().lower() for w in raw.split(",") if w.strip())
+    return normalized in words
+
+
 def _reap_gateway_turn_processes(
     task_id: str,
     process_baseline,
@@ -14361,6 +14452,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             interrupt_reason=_INTERRUPT_REASON_STOP,
             invalidation_reason="stop_command",
         )
+        # The gateway turn is dead; the terminal lane (launchd claimer) is a
+        # separate process and needs its own, durable stop (§5б 13.08.2026 —
+        # a card was claimed 4 s after «остановись»). Gated + best-effort.
+        _maybe_stop_terminal_lane(source, reason="/stop")
         logger.info("STOP for session %s — agent interrupted, session lock released", quick_key)
         return EphemeralReply(t("gateway.stop.stopped"))
 
@@ -14957,6 +15052,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event, _cmd_def_inner, _quick_key, source,
                 )
 
+            # Bare stop word: «стоп» / «остановись» / «stop» as the ENTIRE
+            # message routes to the /stop path (interrupt + terminal-lane
+            # flag) instead of being steered/queued into the running turn.
+            # Exact normalized match only — a stop word inside a longer
+            # phrase keeps its existing busy-text semantics. Active ONLY on
+            # the profile that owns the terminal lane (same env+home gate as
+            # the flag itself), so the other six bots see no behavior change.
+            if (
+                event.message_type == MessageType.TEXT
+                and not getattr(event, "media_urls", None)
+                and not getattr(event, "media_types", None)
+                and _terminal_lane_stop_enabled()
+                and _is_bare_stop_word(event.text)
+            ):
+                logger.info(
+                    "Bare stop word for session %s — routing to the /stop path",
+                    _quick_key,
+                )
+                return await self._busy_stop_command(event, _quick_key, source)
+
             if event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
                 adapter = self._adapter_for_source(source)
@@ -15001,6 +15116,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if event.get_command() == "stop":
                     # Force-clean the sentinel so the session is unlocked.
                     self._release_running_agent_state(_quick_key)
+                    # A hard /stop means "everything", including the terminal
+                    # lane the launchd claimer runs outside this process.
+                    _maybe_stop_terminal_lane(source, reason="/stop")
                     logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key)
                     return EphemeralReply("⚡ Force-stopped. The agent was still starting — session unlocked.")
                 # Queue the message so it will be picked up after the

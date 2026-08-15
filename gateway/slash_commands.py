@@ -1374,7 +1374,11 @@ class GatewaySlashCommandsMixin:
 
         The session is preserved so the user can continue the conversation.
         """
-        from gateway.run import _AGENT_PENDING_SENTINEL, _INTERRUPT_REASON_STOP
+        from gateway.run import (
+            _AGENT_PENDING_SENTINEL,
+            _INTERRUPT_REASON_STOP,
+            _maybe_stop_terminal_lane,
+        )
         source = event.source
         session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
@@ -1388,6 +1392,7 @@ class GatewaySlashCommandsMixin:
                 interrupt_reason=_INTERRUPT_REASON_STOP,
                 invalidation_reason="stop_command_pending",
             )
+            _maybe_stop_terminal_lane(source, reason="/stop")
             logger.info("STOP (pending) for session %s — sentinel cleared", session_key)
             return EphemeralReply(t("gateway.stop.stopped_pending"))
         if agent:
@@ -1399,6 +1404,11 @@ class GatewaySlashCommandsMixin:
                 interrupt_reason=_INTERRUPT_REASON_STOP,
                 invalidation_reason="stop_command_handler",
             )
+            # The terminal lane (launchd claimer) is a separate process: the
+            # interrupt above cannot reach it, and 13.08.2026 it claimed the
+            # next card 4 s after the user's stop. Raise its durable flag too
+            # (env+home gated; never raises).
+            _maybe_stop_terminal_lane(source, reason="/stop")
             return EphemeralReply(t("gateway.stop.stopped"))
 
         # No run under the caller's own session key.  In a per-user thread
@@ -1416,6 +1426,7 @@ class GatewaySlashCommandsMixin:
                     interrupt_reason=_INTERRUPT_REASON_STOP,
                     invalidation_reason="stop_command_thread_sibling",
                 )
+            _maybe_stop_terminal_lane(source, reason="/stop")
             logger.info(
                 "STOP (thread sibling) by %s — interrupted %d run(s) in thread: %s",
                 session_key,
@@ -1424,11 +1435,17 @@ class GatewaySlashCommandsMixin:
             )
             return EphemeralReply(t("gateway.stop.stopped"))
 
-        # No running agent anywhere for this scope. A platform status
-        # indicator can still be stuck — e.g. Slack's persistent
-        # assistant.threads.setStatus survives a gateway restart or a turn
-        # that died without a final send (#32295). Best-effort clear so
-        # /stop always dismisses a phantom "is thinking...".
+        # No running agent anywhere for this scope — which is EXACTLY the
+        # shape of the 13.08 incident: the work the user wants stopped is a
+        # terminal-lane run in a separate launchd process, invisible to
+        # _running_agents. /stop still raises the lane flag (env+home gated;
+        # a no-op everywhere else).
+        _maybe_stop_terminal_lane(source, reason="/stop")
+
+        # A platform status indicator can still be stuck — e.g. Slack's
+        # persistent assistant.threads.setStatus survives a gateway restart
+        # or a turn that died without a final send (#32295). Best-effort
+        # clear so /stop always dismisses a phantom "is thinking...".
         adapter = getattr(self, "adapters", {}).get(source.platform)
         if adapter and hasattr(adapter, "_stop_typing_with_metadata"):
             try:

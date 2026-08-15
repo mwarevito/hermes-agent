@@ -961,14 +961,47 @@ class TestDeleteAndExport:
 # =========================================================================
 
 class TestPruneSessions:
+    def test_prune_ages_ended_sessions_from_ended_at(self, db):
+        now = time.time()
+
+        # A long-running session that ended recently is not stale just because
+        # it started before the retention window.
+        db.create_session(session_id="long-running", source="cli")
+        db.end_session("long-running", end_reason="done")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = ?",
+            (now - 100 * 86400, now, "long-running"),
+        )
+
+        # A session that actually ended before the retention window is stale.
+        db.create_session(session_id="old-ended", source="cli")
+        db.end_session("old-ended", end_reason="done")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = ?",
+            (now - 110 * 86400, now - 100 * 86400, "old-ended"),
+        )
+        db._conn.commit()
+
+        candidates = db.list_prune_candidates(older_than_days=90)
+        pruned = db.prune_sessions(older_than_days=90)
+
+        assert [row["id"] for row in candidates] == ["old-ended"]
+        assert pruned == 1
+        assert db.get_session("long-running") is not None
+        assert db.get_session("old-ended") is None
+
     def test_prune_old_ended_sessions(self, db):
         # Create and end an "old" session
         db.create_session(session_id="old", source="cli")
         db.end_session("old", end_reason="done")
-        # Manually backdate started_at
+        # Manually backdate both the start and the actual end.
         db._conn.execute(
-            "UPDATE sessions SET started_at = ? WHERE id = ?",
-            (time.time() - 100 * 86400, "old"),
+            "UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = ?",
+            (
+                time.time() - 110 * 86400,
+                time.time() - 100 * 86400,
+                "old",
+            ),
         )
         db._conn.commit()
 
@@ -981,6 +1014,43 @@ class TestPruneSessions:
         session = db.get_session("new")
         assert session is not None
         assert session["id"] == "new"
+
+    def test_archive_keeps_historical_last_activity_age(self, db):
+        now = time.time()
+        db.create_session(session_id="old-empty-recent-end", source="cli")
+        db.end_session("old-empty-recent-end", end_reason="done")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = ?",
+            (now - 100 * 86400, now, "old-empty-recent-end"),
+        )
+        db._conn.commit()
+
+        archived = db.archive_sessions(older_than_days=90)
+
+        assert archived == 1
+        assert db.get_session("old-empty-recent-end")["archived"] == 1
+
+    def test_ended_time_window_filters_both_bounds(self, db):
+        now = time.time()
+        for sid, ended_days_ago in (
+            ("too-old", 120),
+            ("inside", 100),
+            ("recent", 80),
+        ):
+            db.create_session(session_id=sid, source="cli")
+            db.end_session(sid, end_reason="done")
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = ?",
+                (now - 130 * 86400, now - ended_days_ago * 86400, sid),
+            )
+        db._conn.commit()
+
+        rows = db.list_prune_candidates(
+            ended_after=now - 110 * 86400,
+            ended_before=now - 90 * 86400,
+        )
+
+        assert [row["id"] for row in rows] == ["inside"]
 
 
     def test_prune_skips_active_sessions(self, db):
@@ -2252,12 +2322,16 @@ class TestOptimizeFts:
 
 class TestAutoMaintenance:
     def _make_old_ended(self, db, sid: str, days_old: int = 100):
-        """Create a session that is ended and was started `days_old` days ago."""
+        """Create a session whose end is `days_old` days old."""
         db.create_session(session_id=sid, source="cli")
         db.end_session(sid, end_reason="done")
         db._conn.execute(
-            "UPDATE sessions SET started_at = ? WHERE id = ?",
-            (time.time() - days_old * 86400, sid),
+            "UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = ?",
+            (
+                time.time() - (days_old + 1) * 86400,
+                time.time() - days_old * 86400,
+                sid,
+            ),
         )
         db._conn.commit()
 

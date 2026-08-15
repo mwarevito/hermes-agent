@@ -8146,6 +8146,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         *,
         last_active_before: Optional[float] = None,
         last_active_after: Optional[float] = None,
+        ended_before: Optional[float] = None,
+        ended_after: Optional[float] = None,
         started_before: Optional[float] = None,
         started_after: Optional[float] = None,
         source: Optional[str] = None,
@@ -8206,6 +8208,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    ) >= ?"""
             )
             params.append(last_active_after)
+        if ended_before is not None:
+            clauses.append("s.ended_at < ?")
+            params.append(ended_before)
+        if ended_after is not None:
+            clauses.append("s.ended_at >= ?")
+            params.append(ended_after)
         if started_before is not None:
             clauses.append("s.started_at < ?")
             params.append(started_before)
@@ -8281,6 +8289,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             clauses.append("s.archived = 0")
         return " AND ".join(clauses), params
 
+    @staticmethod
+    def _apply_older_than_cutoff(
+        filters: Dict[str, Any],
+        older_than_days: Optional[float],
+        *,
+        cutoff_filter: str,
+    ) -> None:
+        """Add the implicit age cutoff unless an explicit upper bound wins."""
+        if (
+            filters.get("last_active_before") is None
+            and filters.get("ended_before") is None
+            and filters.get("started_before") is None
+            and older_than_days is not None
+        ):
+            filters[cutoff_filter] = time.time() - (older_than_days * 86400)
+
     def list_prune_candidates(
         self,
         older_than_days: Optional[float] = None,
@@ -8294,18 +8318,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         keyword filters as :meth:`_prune_filter_where` (unknown names raise
         ``TypeError`` there). Rows are ordered oldest-first and carry
         ``id, source, title, model, started_at, last_active, ended_at,
-        message_count, archived``. ``older_than_days`` is an inactivity
-        threshold: it uses the latest message timestamp, falling back to
-        ``started_at`` for sessions without messages.
+        message_count, archived``. ``older_than_days`` is a retention
+        threshold measured from ``ended_at`` so a long-running session is not
+        treated as stale immediately after it ends.
         """
-        if (
-            filters.get("last_active_before") is None
-            and filters.get("started_before") is None
-            and older_than_days is not None
-        ):
-            filters["last_active_before"] = time.time() - (
-                older_than_days * 86400
-            )
+        self._apply_older_than_cutoff(
+            filters, older_than_days, cutoff_filter="ended_before"
+        )
         where, params = self._prune_filter_where(source=source, **filters)
         with self._lock:
             cursor = self._conn.execute(
@@ -8341,8 +8360,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         archived) so repeat runs are idempotent no-ops.
         """
         filters.setdefault("archived", False)
+        # Archiving is reversible and historically ages on last activity.
+        # Keep that behavior even though destructive pruning now ages on the
+        # actual end time.
+        self._apply_older_than_cutoff(
+            filters, older_than_days, cutoff_filter="last_active_before"
+        )
         rows = self.list_prune_candidates(
-            older_than_days=older_than_days, source=source, **filters
+            older_than_days=None, source=source, **filters
         )
         for row in rows:
             self.set_session_archived(row["id"], True)
@@ -8403,19 +8428,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     ) -> int:
         """Delete sessions matching the filters. Returns count deleted.
 
-        By default, delete ended sessions inactive for
-        ``older_than_days`` days, optionally restricted to ``source``.
-        Activity is the latest message timestamp, falling back to
-        ``started_at`` for sessions without messages. Additional keyword
-        filters AND together — the full set is defined by
+        By default, delete sessions that ended more than
+        ``older_than_days`` days ago, optionally restricted to ``source``.
+        This deliberately ages retention from ``ended_at`` rather than
+        ``started_at`` so recently ended long-running sessions survive.
+        Additional keyword filters AND together — the full set is defined by
         :meth:`_prune_filter_where`:
 
         * ``last_active_before`` / ``last_active_after`` — epoch bounds on
           the latest message timestamp (falling back to ``started_at``).
+        * ``ended_before`` / ``ended_after`` — epoch bounds on ``ended_at``.
         * ``started_before`` / ``started_after`` — epoch bounds on
-          ``started_at``. An explicit ``started_before`` overrides the
-          default ``older_than_days`` inactivity cutoff; pass
-          ``older_than_days=None`` for no implicit upper age bound.
+          ``started_at``. An explicit ``last_active_before``,
+          ``ended_before``, or ``started_before`` overrides the default
+          ``older_than_days`` end-time cutoff; pass ``older_than_days=None``
+          for no implicit upper age bound.
         * ``title_like`` / ``model_like`` / ``branch_like`` —
           case-insensitive substring matches.
         * ``end_reason`` / ``provider`` / ``user_id`` / ``chat_id`` /
@@ -8437,14 +8464,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``request_dump_*``) for every pruned session, outside the DB
         transaction.
         """
-        if (
-            filters.get("last_active_before") is None
-            and filters.get("started_before") is None
-            and older_than_days is not None
-        ):
-            filters["last_active_before"] = time.time() - (
-                older_than_days * 86400
-            )
+        self._apply_older_than_cutoff(
+            filters, older_than_days, cutoff_filter="ended_before"
+        )
         where, where_params = self._prune_filter_where(source=source, **filters)
         removed_ids: list[str] = []
 
@@ -9145,7 +9167,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         sessions_dir: Optional[Path] = None,
         min_vacuum_interval_days: int = 30,
     ) -> Dict[str, Any]:
-        """Idempotent auto-maintenance: prune inactive sessions + optional VACUUM.
+        """Idempotent auto-maintenance: prune long-ended sessions + optional VACUUM.
 
         Records the last run timestamp in state_meta so subsequent calls
         within ``min_interval_hours`` no-op. VACUUM has its own, typically
@@ -9215,7 +9237,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             if pruned > 0:
                 logger.info(
-                    "state.db auto-maintenance: pruned %d session(s) inactive for %d days%s",
+                    "state.db auto-maintenance: pruned %d session(s) ended over %d days ago%s",
                     pruned,
                     retention_days,
                     " + VACUUM" if result["vacuumed"] else "",

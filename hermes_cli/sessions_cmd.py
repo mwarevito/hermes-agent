@@ -828,7 +828,9 @@ def cmd_sessions(args, sessions_parser=None):
             args.older_than = "90"
 
         try:
-            filters = build_prune_filters(args)
+            filters = build_prune_filters(
+                args, age_basis="ended" if action == "prune" else "activity"
+            )
         except ValueError as e:
             print(f"Error: {e}")
             return
@@ -857,14 +859,16 @@ def cmd_sessions(args, sessions_parser=None):
             print(f"No sessions match ({describe_filters(filters)}).")
             return
 
-        # Candidates are ordered by activity oldest-first. Surface that
-        # span so a long-lived but recently used conversation cannot look
-        # old merely because of its creation date.
-        _oldest = candidates[0].get("last_active")
-        _newest = candidates[-1].get("last_active")
+        # Surface the span on the same clock that selected the rows: end time
+        # for destructive prune, last activity for reversible archive.
+        _span_key = "ended_at" if action == "prune" else "last_active"
+        _span_label = "end" if action == "prune" else "activity"
+        _span_values = [s.get(_span_key) for s in candidates if s.get(_span_key)]
+        _oldest = min(_span_values) if _span_values else None
+        _newest = max(_span_values) if _span_values else None
         _span = (
-            f"oldest activity {format_epoch(_oldest)}, "
-            f"newest activity {format_epoch(_newest)}"
+            f"oldest {_span_label} {format_epoch(_oldest)}, "
+            f"newest {_span_label} {format_epoch(_newest)}"
         )
 
         if args.dry_run or not args.yes:

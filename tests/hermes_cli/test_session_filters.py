@@ -67,6 +67,20 @@ class TestBuildPruneFilters:
         assert f["started_before"] is None
         assert f["started_after"] is None
 
+    def test_prune_age_window_uses_session_end_time(self):
+        f = build_prune_filters(
+            _ns(older_than="90", newer_than="120"), age_basis="ended"
+        )
+
+        assert f["ended_before"] == pytest.approx(
+            time.time() - 90 * 86400, abs=5
+        )
+        assert f["ended_after"] == pytest.approx(
+            time.time() - 120 * 86400, abs=5
+        )
+        assert f["last_active_before"] is None
+        assert f["last_active_after"] is None
+
 
 
 
@@ -81,7 +95,6 @@ class TestBuildPruneFilters:
         assert f["cwd_prefix"] == "/tmp/x"
         assert f["min_messages"] == 1
         assert f["max_messages"] == 9
-
 
 
 

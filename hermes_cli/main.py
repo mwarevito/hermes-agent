@@ -11976,7 +11976,7 @@ def main():
         "(matched by path substring or basename).",
     )
 
-    def _add_session_filter_args(p, default_older_help):
+    def _add_session_filter_args(p, default_older_help, newer_help=None):
         p.add_argument(
             "--older-than",
             metavar="AGE",
@@ -11985,7 +11985,8 @@ def main():
         p.add_argument(
             "--newer-than",
             metavar="AGE",
-            help="Only match sessions active within the last AGE "
+            help=newer_help
+            or "Only match sessions active within the last AGE "
             "(e.g. '5h', '2d') or after an ISO timestamp",
         )
         p.add_argument(
@@ -12166,9 +12167,11 @@ def main():
     )
     _add_session_filter_args(
         sessions_prune,
-        "Delete sessions older than AGE — days if bare number, or a duration "
+        "Delete sessions ended more than AGE ago — days if bare number, or a duration "
         "like '5h'/'2d'/'1w', or an ISO timestamp (bare prune with no filters "
         "defaults to 90 days; any filter matches all ages)",
+        "Only delete sessions ended within the last AGE "
+        "(e.g. '5h', '2d') or at/after an ISO timestamp",
     )
     sessions_prune.add_argument(
         "--include-archived",

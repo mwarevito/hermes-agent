@@ -1781,7 +1781,11 @@ CREATE TABLE IF NOT EXISTS task_runs (
     summary             TEXT,
     metadata            TEXT,
     error               TEXT,
-    owner_session_id    TEXT
+    owner_session_id    TEXT,
+    transcript_ended_at INTEGER,
+    transcript_finalize_attempted_at INTEGER,
+    transcript_finalize_required INTEGER NOT NULL DEFAULT 0,
+    transcript_finalize_pid INTEGER
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -3103,6 +3107,34 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "task_runs", "owner_session_id", "owner_session_id TEXT"
             )
+        if "transcript_ended_at" not in _run_cols:
+            _add_column_if_missing(
+                conn,
+                "task_runs",
+                "transcript_ended_at",
+                "transcript_ended_at INTEGER",
+            )
+        if "transcript_finalize_attempted_at" not in _run_cols:
+            _add_column_if_missing(
+                conn,
+                "task_runs",
+                "transcript_finalize_attempted_at",
+                "transcript_finalize_attempted_at INTEGER",
+            )
+        if "transcript_finalize_required" not in _run_cols:
+            _add_column_if_missing(
+                conn,
+                "task_runs",
+                "transcript_finalize_required",
+                "transcript_finalize_required INTEGER NOT NULL DEFAULT 0",
+            )
+        if "transcript_finalize_pid" not in _run_cols:
+            _add_column_if_missing(
+                conn,
+                "task_runs",
+                "transcript_finalize_pid",
+                "transcript_finalize_pid INTEGER",
+            )
 
     _rebuild_drifted_tables(conn)
 
@@ -3146,7 +3178,10 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
-        " error TEXT, owner_session_id TEXT)",
+        " error TEXT, owner_session_id TEXT, transcript_ended_at INTEGER,"
+        " transcript_finalize_attempted_at INTEGER,"
+        " transcript_finalize_required INTEGER NOT NULL DEFAULT 0,"
+        " transcript_finalize_pid INTEGER)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",
@@ -4623,6 +4658,8 @@ def _end_run(
     error: Optional[str] = None,
     metadata: Optional[dict] = None,
     status: Optional[str] = None,
+    finalize_transcript: bool = False,
+    finalize_transcript_pid: Optional[int] = None,
 ) -> Optional[int]:
     """Close the currently-active run for ``task_id`` and clear the pointer.
 
@@ -4659,7 +4696,9 @@ def _end_run(
                ended_at      = ?,
                claim_lock    = NULL,
                claim_expires = NULL,
-               worker_pid    = NULL
+               worker_pid    = NULL,
+               transcript_finalize_required = ?,
+               transcript_finalize_pid = ?
          WHERE id = ?
            AND ended_at IS NULL
         """,
@@ -4670,6 +4709,12 @@ def _end_run(
             error,
             json.dumps(metadata, ensure_ascii=False) if metadata else None,
             now,
+            1 if finalize_transcript else 0,
+            (
+                int(finalize_transcript_pid)
+                if finalize_transcript_pid is not None
+                else None
+            ),
             run_id,
         ),
     )
@@ -5316,6 +5361,7 @@ def release_stale_claims(
                 outcome="reclaimed", status="reclaimed",
                 error=f"stale_lock={row['claim_lock']}",
                 metadata=termination,
+                finalize_transcript=bool(termination.get("terminated")),
             )
             payload = {
                 "stale_lock": row["claim_lock"],
@@ -8249,6 +8295,304 @@ def _run_task_context(
     return task_id, home
 
 
+MAX_TRANSCRIPT_FINALIZATIONS_PER_TICK = 32
+TRANSCRIPT_STATE_BUSY_TIMEOUT_MS = 250
+TRANSCRIPT_FINALIZE_RETRY_SECONDS = 60
+
+
+def _run_transcript_home(profile: Optional[str]) -> Optional[Path]:
+    """Resolve a run's exact worker home, failing closed for named profiles."""
+    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+
+    try:
+        canonical = normalize_profile_name(profile or "default")
+        return Path(resolve_profile_env(canonical))
+    except Exception as exc:
+        _log.error(
+            "kanban transcript finalize: profile %r cannot be resolved (%s); "
+            "refusing to fall back to the dispatcher's state.db",
+            profile,
+            exc,
+        )
+        return None
+
+
+def _compression_tip(state_conn: sqlite3.Connection, session_id: str) -> Optional[str]:
+    """Return the same non-branch compression tip used by SessionDB."""
+    from hermes_state_common import _sql_session_last_active
+
+    current = session_id
+    seen = {current}
+    for _ in range(100):
+        row = state_conn.execute(
+            f"""
+            SELECT child.id
+              FROM sessions parent
+              JOIN sessions child ON child.parent_session_id = parent.id
+             WHERE parent.id = ?
+               AND parent.end_reason = 'compression'
+               AND json_extract(
+                     CASE WHEN json_valid(COALESCE(child.model_config, '{{}}'))
+                          THEN COALESCE(child.model_config, '{{}}') ELSE '{{}}' END,
+                     '$._branched_from') IS NULL
+               AND json_extract(
+                     CASE WHEN json_valid(COALESCE(child.model_config, '{{}}'))
+                          THEN COALESCE(child.model_config, '{{}}') ELSE '{{}}' END,
+                     '$._delegate_from') IS NULL
+               AND COALESCE(child.source, '') != 'tool'
+             ORDER BY
+               CASE
+                 WHEN child.end_reason = 'compression' THEN 0
+                 WHEN child.ended_at IS NULL THEN 1
+                 ELSE 2
+               END,
+               {_sql_session_last_active("child")} DESC,
+               child.started_at DESC,
+               child.id DESC
+             LIMIT 1
+            """,
+            (current,),
+        ).fetchone()
+        if row is None:
+            return current
+        child_id = str(row[0] or "")
+        if not child_id or child_id in seen:
+            _log.error(
+                "kanban transcript finalize: compression lineage for a terminal "
+                "run is cyclic; leaving its receipt pending"
+            )
+            return None
+        seen.add(child_id)
+        current = child_id
+    _log.error(
+        "kanban transcript finalize: compression lineage exceeded 100 rows; "
+        "leaving its receipt pending"
+    )
+    return None
+
+
+def _transcript_death_metadata(row) -> tuple[dict, bool]:
+    """Return ``(metadata, candidate)`` for safe current/legacy reconciliation."""
+    if int(row["transcript_finalize_required"] or 0) == 1:
+        try:
+            metadata = json.loads(row["metadata"] or "{}")
+        except (TypeError, ValueError):
+            metadata = {}
+        return (metadata if isinstance(metadata, dict) else {}), True
+    try:
+        metadata = json.loads(row["metadata"] or "{}")
+    except (TypeError, ValueError):
+        return {}, False
+    if not isinstance(metadata, dict):
+        return {}, False
+    # Evidence-gated upgrade path for runs ended before the dedicated columns
+    # existed. Free-form metadata keys never authorize a normal completion:
+    # only historical reaper outcomes are considered, and their pid must be
+    # observed dead below unless the old reaper recorded terminated=true.
+    candidate = row["outcome"] in {"crashed", "rate_limited"}
+    return metadata, candidate
+
+
+def _transcript_worker_death_verified(row) -> bool:
+    """Positive death evidence for a run whose board row is already terminal."""
+    metadata, candidate = _transcript_death_metadata(row)
+    if not candidate:
+        return False
+    if int(row["transcript_finalize_required"] or 0) == 1:
+        raw_pid = row["transcript_finalize_pid"]
+        if raw_pid is None:
+            return True
+        try:
+            pid = int(raw_pid)
+        except (TypeError, ValueError):
+            return False
+        return pid > 0 and not _pid_alive(pid)
+    if row["outcome"] in {"crashed", "rate_limited"}:
+        if metadata.get("terminated"):
+            return True
+        raw_pid = metadata.get("pid", metadata.get("prev_pid"))
+        try:
+            pid = int(raw_pid)
+        except (TypeError, ValueError):
+            return False
+        return pid > 0 and not _pid_alive(pid)
+    return False
+
+
+def finalize_terminal_run_transcripts(conn: sqlite3.Connection) -> list[int]:
+    """End worker transcripts whose Kanban runs maintenance already ended.
+
+    Kanban task/run state and conversation transcripts live in different
+    SQLite databases.  A dispatcher reclaim used to make the board terminal
+    while leaving ``task_runs.owner_session_id`` open forever in ``state.db``.
+    This reconciliation runs only *after* the board transaction commits and
+    closes sessions only when their persisted source is exactly ``kanban``.
+
+    ``transcript_ended_at`` is the cross-database receipt.  It is written only
+    after the transcript row is observed terminal.  A crash between the two
+    writes is safe: ``ended_at IS NULL`` makes the transcript update idempotent
+    and the next dispatcher tick records the missing receipt.  Lock errors and
+    not-yet-visible session rows remain unreceipted and are retried.
+    """
+    attempt_time = int(time.time())
+    all_rows = conn.execute(
+        "SELECT id, task_id, profile, owner_session_id, outcome, metadata, "
+        "       transcript_finalize_attempted_at, "
+        "       transcript_finalize_required, transcript_finalize_pid "
+        "FROM task_runs "
+        "WHERE ended_at IS NOT NULL "
+        "  AND owner_session_id IS NOT NULL "
+        "  AND transcript_ended_at IS NULL "
+        "  AND (transcript_finalize_required = 1 "
+        "       OR outcome IN ('crashed', 'rate_limited')) "
+        "  AND outcome IN ('crashed', 'rate_limited', 'reclaimed', 'stale', "
+        "                  'timed_out', 'out_of_time') "
+        "  AND COALESCE(transcript_finalize_attempted_at, 0) <= ? "
+        "ORDER BY COALESCE(transcript_finalize_attempted_at, 0), id "
+        "LIMIT ?",
+        (
+            attempt_time - TRANSCRIPT_FINALIZE_RETRY_SECONDS,
+            MAX_TRANSCRIPT_FINALIZATIONS_PER_TICK,
+        ),
+    ).fetchall()
+    # Stamp every selected row before rejecting malformed legacy evidence.
+    # Otherwise 32 permanently-invalid low-id legacy rows can occupy the SQL
+    # LIMIT forever and starve a valid dedicated-eligibility row behind them.
+    rows = all_rows
+    if rows:
+        with write_txn(conn):
+            for row in rows:
+                conn.execute(
+                    "UPDATE task_runs SET transcript_finalize_attempted_at = ? "
+                    "WHERE id = ? AND transcript_ended_at IS NULL",
+                    (attempt_time, int(row["id"])),
+                )
+    grouped: dict[Path, list] = {}
+    for row in rows:
+        if not _transcript_death_metadata(row)[1]:
+            continue
+        worker_home = _run_transcript_home(row["profile"])
+        if worker_home is None:
+            continue
+        state_path = worker_home / "state.db"
+        if not state_path.exists():
+            _log.warning(
+                "kanban transcript finalize: %s is absent for terminal run %s; "
+                "leaving it pending for a later dispatcher tick",
+                state_path,
+                int(row["id"]),
+            )
+            continue
+        grouped.setdefault(state_path, []).append(row)
+
+    observed: list = []
+    for state_path, state_rows in grouped.items():
+        state_conn = None
+        try:
+            state_conn = sqlite3.connect(
+                str(state_path),
+                timeout=TRANSCRIPT_STATE_BUSY_TIMEOUT_MS / 1000.0,
+            )
+            state_conn.execute(
+                f"PRAGMA busy_timeout = {TRANSCRIPT_STATE_BUSY_TIMEOUT_MS}"
+            )
+            state_conn.execute("BEGIN IMMEDIATE")
+            group_observed: list = []
+            for row in state_rows:
+                run_id = int(row["id"])
+                if not _transcript_worker_death_verified(row):
+                    continue
+                owner = str(row["owner_session_id"] or "").strip()
+                if not owner:
+                    continue
+                owner_row = state_conn.execute(
+                    "SELECT source FROM sessions WHERE id = ?",
+                    (owner,),
+                ).fetchone()
+                if owner_row is None or str(owner_row[0] or "") != "kanban":
+                    _log.error(
+                        "kanban transcript finalize: refusing run %s because "
+                        "its owner session source is not kanban",
+                        run_id,
+                    )
+                    continue
+                tip = _compression_tip(state_conn, owner)
+                if tip is None:
+                    continue
+                session = state_conn.execute(
+                    "SELECT source, ended_at FROM sessions WHERE id = ?",
+                    (tip,),
+                ).fetchone()
+                if session is None:
+                    _log.info(
+                        "kanban transcript finalize: session tip for terminal "
+                        "run %s is not visible yet; leaving it pending",
+                        run_id,
+                    )
+                    continue
+                if str(session[0] or "") != "kanban":
+                    _log.error(
+                        "kanban transcript finalize: refusing to end session for "
+                        "run %s because its tip source is not kanban",
+                        run_id,
+                    )
+                    continue
+                if session[1] is None:
+                    state_conn.execute(
+                        "UPDATE sessions SET ended_at = ?, end_reason = ? "
+                        "WHERE id = ? AND source = 'kanban' AND ended_at IS NULL",
+                        (time.time(), "kanban_run_terminal", tip),
+                    )
+                terminal = state_conn.execute(
+                    "SELECT ended_at FROM sessions WHERE id = ? AND source = 'kanban'",
+                    (tip,),
+                ).fetchone()
+                if terminal is not None and terminal[0] is not None:
+                    group_observed.append(row)
+            state_conn.commit()
+            observed.extend(group_observed)
+        except sqlite3.Error as exc:
+            if state_conn is not None:
+                try:
+                    state_conn.rollback()
+                except sqlite3.Error:
+                    pass
+            _log.warning(
+                "kanban transcript finalize: state write failed for %s (%s); "
+                "leaving that profile's runs pending",
+                state_path,
+                exc,
+            )
+        finally:
+            if state_conn is not None:
+                try:
+                    state_conn.close()
+                except sqlite3.Error:
+                    pass
+    finalized: list[int] = []
+    if observed:
+        with write_txn(conn):
+            receipt_time = int(time.time())
+            for row in observed:
+                run_id = int(row["id"])
+                cur = conn.execute(
+                    "UPDATE task_runs SET transcript_ended_at = ? "
+                    "WHERE id = ? AND ended_at IS NOT NULL "
+                    "  AND transcript_ended_at IS NULL",
+                    (receipt_time, run_id),
+                )
+                if cur.rowcount == 1:
+                    _append_event(
+                        conn,
+                        str(row["task_id"]),
+                        "transcript_terminalized",
+                        {"end_reason": "kanban_run_terminal"},
+                        run_id=run_id,
+                    )
+                    finalized.append(run_id)
+    return finalized
+
+
 def _host_start_time(pid: int) -> Optional[int]:
     """Kernel start ticks for a live pid, or None when unavailable.
 
@@ -9626,6 +9970,7 @@ def enforce_max_runtime(
         # before the grace expires.
         killed = False
         orphans: dict = {}
+        transcript_finalize_authorized = False
         kill = signal_fn if signal_fn is not None else (
             os.kill if hasattr(os, "kill") else None
         )
@@ -9641,6 +9986,7 @@ def enforce_max_runtime(
                 )
                 kill = None
         if kill is not None:
+            transcript_finalize_authorized = True
             # Must precede the kill: afterwards the worker's children are
             # reparented to init and no tree walk can find them. ``tid`` is the
             # identity proof for the tree walk (the worker's argv carries it);
@@ -9681,6 +10027,7 @@ def enforce_max_runtime(
                     "snapshotted descendant(s) NOT reaped", pid, len(descendants),
                 )
 
+        transcript_worker_dead = not _pid_alive(pid)
         with write_txn(conn):
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -9705,6 +10052,12 @@ def enforce_max_runtime(
                     outcome=outcome, status=outcome,
                     error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
                     metadata=payload,
+                    finalize_transcript=transcript_finalize_authorized,
+                    finalize_transcript_pid=(
+                        None
+                        if transcript_worker_dead or not transcript_finalize_authorized
+                        else pid
+                    ),
                 )
                 _append_event(
                     conn, tid, "timed_out", payload, run_id=run_id,
@@ -9896,6 +10249,7 @@ def detect_stale_running(
                     else "no heartbeat ever"
                 ) + f" after {int(elapsed)}s running",
                 metadata=payload,
+                finalize_transcript=bool(termination.get("terminated")),
             )
             _append_event(
                 conn, tid, "stale", payload, run_id=run_id,
@@ -10242,6 +10596,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     outcome=_run_outcome, status=_run_outcome,
                     error=error_text,
                     metadata=dict(event_payload),
+                    finalize_transcript=True,
                 )
                 _append_event(
                     conn, row["id"], event_kind,
@@ -10901,7 +11256,7 @@ def dispatch_once(
         # Path resolution should never fail, but if it somehow does we
         # must not lose the tick — fall through to an unguarded dispatch
         # rather than dropping work.
-        return _dispatch_once_locked(
+        result = _dispatch_once_locked(
             conn,
             spawn_fn=spawn_fn,
             ttl_seconds=ttl_seconds,
@@ -10915,6 +11270,8 @@ def dispatch_once(
             max_in_progress_per_profile=max_in_progress_per_profile,
             default_max_runtime_seconds=default_max_runtime_seconds,
         )
+        finalize_terminal_run_transcripts(conn)
+        return result
     with _dispatch_tick_lock(db_path) as held:
         if not held:
             return DispatchResult(skipped_locked=True)
@@ -10935,7 +11292,11 @@ def dispatch_once(
         # Still under the dispatch lock: opportunistically truncate the WAL
         # at a coarse interval so it cannot grow unbounded between restarts.
         _maybe_checkpoint_wal(conn, db_path)
-        return result
+    # Cross-database transcript reconciliation is deliberately outside the
+    # board dispatch lock. A busy profile state.db must not stall every reclaim,
+    # promotion, and spawn on this board.
+    finalize_terminal_run_transcripts(conn)
+    return result
 
 
 def _dispatch_once_locked(

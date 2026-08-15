@@ -70,6 +70,24 @@ def _ra():
     return run_agent
 
 
+def _resolve_kanban_worker_guidance(valid_tool_names: set[str]) -> str:
+    """Return lifecycle guidance only for a dispatcher-spawned worker.
+
+    Orchestrator profiles may deliberately load the ``kanban`` toolset so they
+    can create and route work.  Tool presence alone is therefore not proof that
+    the current process owns a task.  The dispatcher-owned environment marker
+    is the process boundary for the worker contract.
+    """
+    if not (os.environ.get("HERMES_KANBAN_TASK") or "").strip():
+        return ""
+    if "kanban_show" not in valid_tool_names:
+        return ""
+
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    return KANBAN_GUIDANCE
+
+
 def _moa_reference_output_allowed(agent: Any) -> bool:
     """Keep MoA display events off only the machine-readable ``-Q`` surface."""
     return not (
@@ -1444,15 +1462,14 @@ def init_agent(
     elif not agent.quiet_mode:
         print("🛠️  No tools loaded (all tools filtered out or unavailable)")
 
-    # Kanban worker/orchestrator lifecycle guidance is session-static:
-    # the dispatcher decides at spawn time whether this process is a kanban
-    # worker (kanban_show tool is present iff HERMES_KANBAN_TASK is set).
+    # Kanban worker lifecycle guidance is session-static: the dispatcher marks
+    # worker processes with HERMES_KANBAN_TASK.  Orchestrator profiles can also
+    # load kanban_show for routing, so tool presence alone is not worker proof.
     # Resolving the ~835-token block once here avoids re-running the
     # membership test + reference on every system-prompt rebuild
     # (init + each context compression).
-    from agent.prompt_builder import KANBAN_GUIDANCE
-    agent._kanban_worker_guidance = (
-        KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
+    agent._kanban_worker_guidance = _resolve_kanban_worker_guidance(
+        agent.valid_tool_names
     )
 
     # Check tool requirements

@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from agent.agent_init import _resolve_kanban_worker_guidance
 from agent.system_prompt import build_system_prompt, build_system_prompt_parts
 
 
@@ -128,6 +129,36 @@ def test_build_system_prompt_records_stable_prefix():
 
     assert prompt.startswith(agent._cached_system_prompt_static)
     assert prompt[len(agent._cached_system_prompt_static):].startswith("\n\ncontext")
+
+
+def test_kanban_guidance_fallback_absent_for_normal_orchestrator(monkeypatch):
+    """Loading kanban routing tools must not turn a normal chat into a worker."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    agent = _make_agent(
+        valid_tool_names=["kanban_show", "kanban_list"],
+        _kanban_worker_guidance=None,
+    )
+
+    assert "# Kanban task execution protocol" not in _stable_prompt(agent)
+
+
+def test_kanban_guidance_fallback_present_for_dispatcher_worker(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+    agent = _make_agent(
+        valid_tool_names=["kanban_show"],
+        _kanban_worker_guidance=None,
+    )
+
+    assert "# Kanban task execution protocol" in _stable_prompt(agent)
+
+
+def test_agent_init_guidance_resolver_uses_worker_marker(monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    assert _resolve_kanban_worker_guidance({"kanban_show", "kanban_list"}) == ""
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+    guidance = _resolve_kanban_worker_guidance({"kanban_show"})
+    assert "# Kanban task execution protocol" in guidance
 
 
 def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):

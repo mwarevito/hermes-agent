@@ -101,6 +101,7 @@ def test_dispatcher_worker_death_ends_linked_worker_transcript(
 def test_terminal_run_never_ends_a_non_kanban_session(
     kanban_home: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A bad owner link must fail closed instead of ending user history."""
     session_id = "ordinary-cli-session"
@@ -121,10 +122,27 @@ def test_terminal_run_never_ends_a_non_kanban_session(
             "SELECT transcript_ended_at FROM task_runs WHERE id = ?",
             (run.id,),
         ).fetchone()[0]
+        eligibility = conn.execute(
+            "SELECT transcript_finalize_required FROM task_runs WHERE id = ?",
+            (run.id,),
+        ).fetchone()[0]
+
+        # The foreign-source refusal is definitive. Even if the retry clock is
+        # rewound, the row must not be selected and logged every dispatcher tick.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET transcript_finalize_attempted_at = 0 "
+                "WHERE id = ?",
+                (run.id,),
+            )
+        caplog.clear()
+        assert kb.finalize_terminal_run_transcripts(conn) == []
+        assert "owner session source is not kanban" not in caplog.text
 
     assert result.crashed == [task_id]
     assert closed_run is not None and closed_run.ended_at is not None
     assert transcript_receipt is None
+    assert eligibility == -1
     with sqlite3.connect(kanban_home / "state.db") as state_conn:
         transcript = state_conn.execute(
             "SELECT ended_at, end_reason FROM sessions WHERE id = ?",

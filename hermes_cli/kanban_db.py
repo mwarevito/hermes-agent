@@ -1784,6 +1784,8 @@ CREATE TABLE IF NOT EXISTS task_runs (
     owner_session_id    TEXT,
     transcript_ended_at INTEGER,
     transcript_finalize_attempted_at INTEGER,
+    -- -1 = permanently refused by source validation, 0 = not required/legacy,
+    --  1 = dedicated maintenance eligibility.
     transcript_finalize_required INTEGER NOT NULL DEFAULT 0,
     transcript_finalize_pid INTEGER
 );
@@ -4709,7 +4711,11 @@ def _end_run(
             error,
             json.dumps(metadata, ensure_ascii=False) if metadata else None,
             now,
-            1 if finalize_transcript else 0,
+            (
+                TRANSCRIPT_FINALIZE_REQUIRED
+                if finalize_transcript
+                else TRANSCRIPT_FINALIZE_NOT_REQUIRED
+            ),
             (
                 int(finalize_transcript_pid)
                 if finalize_transcript_pid is not None
@@ -8298,6 +8304,9 @@ def _run_task_context(
 MAX_TRANSCRIPT_FINALIZATIONS_PER_TICK = 32
 TRANSCRIPT_STATE_BUSY_TIMEOUT_MS = 250
 TRANSCRIPT_FINALIZE_RETRY_SECONDS = 60
+TRANSCRIPT_FINALIZE_REFUSED = -1
+TRANSCRIPT_FINALIZE_NOT_REQUIRED = 0
+TRANSCRIPT_FINALIZE_REQUIRED = 1
 
 
 def _run_transcript_home(profile: Optional[str]) -> Optional[Path]:
@@ -8373,7 +8382,10 @@ def _compression_tip(state_conn: sqlite3.Connection, session_id: str) -> Optiona
 
 def _transcript_death_metadata(row) -> tuple[dict, bool]:
     """Return ``(metadata, candidate)`` for safe current/legacy reconciliation."""
-    if int(row["transcript_finalize_required"] or 0) == 1:
+    eligibility = int(row["transcript_finalize_required"] or 0)
+    if eligibility == TRANSCRIPT_FINALIZE_REFUSED:
+        return {}, False
+    if eligibility == TRANSCRIPT_FINALIZE_REQUIRED:
         try:
             metadata = json.loads(row["metadata"] or "{}")
         except (TypeError, ValueError):
@@ -8398,7 +8410,7 @@ def _transcript_worker_death_verified(row) -> bool:
     metadata, candidate = _transcript_death_metadata(row)
     if not candidate:
         return False
-    if int(row["transcript_finalize_required"] or 0) == 1:
+    if int(row["transcript_finalize_required"] or 0) == TRANSCRIPT_FINALIZE_REQUIRED:
         raw_pid = row["transcript_finalize_pid"]
         if raw_pid is None:
             return True
@@ -8443,14 +8455,17 @@ def finalize_terminal_run_transcripts(conn: sqlite3.Connection) -> list[int]:
         "WHERE ended_at IS NOT NULL "
         "  AND owner_session_id IS NOT NULL "
         "  AND transcript_ended_at IS NULL "
-        "  AND (transcript_finalize_required = 1 "
-        "       OR outcome IN ('crashed', 'rate_limited')) "
+        "  AND (transcript_finalize_required = ? "
+        "       OR (transcript_finalize_required = ? "
+        "           AND outcome IN ('crashed', 'rate_limited'))) "
         "  AND outcome IN ('crashed', 'rate_limited', 'reclaimed', 'stale', "
         "                  'timed_out', 'out_of_time') "
         "  AND COALESCE(transcript_finalize_attempted_at, 0) <= ? "
         "ORDER BY COALESCE(transcript_finalize_attempted_at, 0), id "
         "LIMIT ?",
         (
+            TRANSCRIPT_FINALIZE_REQUIRED,
+            TRANSCRIPT_FINALIZE_NOT_REQUIRED,
             attempt_time - TRANSCRIPT_FINALIZE_RETRY_SECONDS,
             MAX_TRANSCRIPT_FINALIZATIONS_PER_TICK,
         ),
@@ -8486,6 +8501,7 @@ def finalize_terminal_run_transcripts(conn: sqlite3.Connection) -> list[int]:
         grouped.setdefault(state_path, []).append(row)
 
     observed: list = []
+    refused: list[tuple[object, str]] = []
     for state_path, state_rows in grouped.items():
         state_conn = None
         try:
@@ -8498,6 +8514,7 @@ def finalize_terminal_run_transcripts(conn: sqlite3.Connection) -> list[int]:
             )
             state_conn.execute("BEGIN IMMEDIATE")
             group_observed: list = []
+            group_refused: list[tuple[object, str]] = []
             for row in state_rows:
                 run_id = int(row["id"])
                 if not _transcript_worker_death_verified(row):
@@ -8509,12 +8526,20 @@ def finalize_terminal_run_transcripts(conn: sqlite3.Connection) -> list[int]:
                     "SELECT source FROM sessions WHERE id = ?",
                     (owner,),
                 ).fetchone()
-                if owner_row is None or str(owner_row[0] or "") != "kanban":
+                if owner_row is None:
+                    _log.info(
+                        "kanban transcript finalize: owner session for run %s "
+                        "is not visible yet; leaving it pending",
+                        run_id,
+                    )
+                    continue
+                if str(owner_row[0] or "") != "kanban":
                     _log.error(
                         "kanban transcript finalize: refusing run %s because "
                         "its owner session source is not kanban",
                         run_id,
                     )
+                    group_refused.append((row, "owner_source_not_kanban"))
                     continue
                 tip = _compression_tip(state_conn, owner)
                 if tip is None:
@@ -8536,6 +8561,7 @@ def finalize_terminal_run_transcripts(conn: sqlite3.Connection) -> list[int]:
                         "run %s because its tip source is not kanban",
                         run_id,
                     )
+                    group_refused.append((row, "tip_source_not_kanban"))
                     continue
                 if session[1] is None:
                     state_conn.execute(
@@ -8551,6 +8577,7 @@ def finalize_terminal_run_transcripts(conn: sqlite3.Connection) -> list[int]:
                     group_observed.append(row)
             state_conn.commit()
             observed.extend(group_observed)
+            refused.extend(group_refused)
         except sqlite3.Error as exc:
             if state_conn is not None:
                 try:
@@ -8570,9 +8597,29 @@ def finalize_terminal_run_transcripts(conn: sqlite3.Connection) -> list[int]:
                 except sqlite3.Error:
                     pass
     finalized: list[int] = []
-    if observed:
+    if observed or refused:
         with write_txn(conn):
             receipt_time = int(time.time())
+            for row, reason in refused:
+                run_id = int(row["id"])
+                cur = conn.execute(
+                    "UPDATE task_runs SET transcript_finalize_required = ? "
+                    "WHERE id = ? AND transcript_ended_at IS NULL "
+                    "  AND transcript_finalize_required != ?",
+                    (
+                        TRANSCRIPT_FINALIZE_REFUSED,
+                        run_id,
+                        TRANSCRIPT_FINALIZE_REFUSED,
+                    ),
+                )
+                if cur.rowcount == 1:
+                    _append_event(
+                        conn,
+                        str(row["task_id"]),
+                        "transcript_finalize_refused",
+                        {"reason": reason},
+                        run_id=run_id,
+                    )
             for row in observed:
                 run_id = int(row["id"])
                 cur = conn.execute(

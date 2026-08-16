@@ -2357,7 +2357,9 @@ class ShellFileOperations(FileOperations):
         # default, and has parallel directory traversal (~200x faster than
         # find on wide trees).  Mirrors _search_content which already uses rg.
         if self._has_command('rg'):
-            return self._search_files_rg(search_pattern, path, limit, offset)
+            result = self._search_files_rg(search_pattern, path, limit, offset)
+            self._attach_exact_directory_warning(result, search_pattern, path)
+            return result
 
         # Fallback: find (slower, no .gitignore awareness)
         if not self._has_command('find'):
@@ -2418,11 +2420,52 @@ class ShellFileOperations(FileOperations):
             files = filtered_files[offset:offset + limit]
         # pagination for standard roots is already applied in shell
 
-        return SearchResult(
+        result = SearchResult(
             files=files,
             total_count=len(files),
             truncated=bool(limit_reason),
             limit_reason=limit_reason,
+        )
+        self._attach_exact_directory_warning(result, search_pattern, path)
+        return result
+
+    def _attach_exact_directory_warning(
+        self, result: SearchResult, pattern: str, path: str
+    ) -> None:
+        """Expose an exact directory match without opening hidden contents.
+
+        ``target='files'`` deliberately returns regular files only and keeps
+        hidden trees out of ordinary scans.  Models nevertheless use an exact
+        cache-directory name (for example ``.pytest_cache``) as an existence
+        check.  A bare zero then looks like proof that the directory is absent.
+
+        For a literal basename query only, perform one bounded directory-name
+        probe and attach paths as steering evidence.  This does not read any
+        directory contents and does not broaden wildcard/ordinary searches.
+        """
+        if (
+            result.error
+            or result.total_count
+            or result.files
+            or not pattern
+            or '/' in pattern
+            or re.search(r"[*?\[]", pattern)
+            or not self._has_command('find')
+        ):
+            return
+        command = (
+            f"find {self._escape_shell_arg(path)} -type d "
+            f"-name {self._escape_shell_arg(pattern)} -print 2>/dev/null "
+            "| head -n 5"
+        )
+        probe = self._exec(command, timeout=15)
+        directories = [line for line in probe.stdout.splitlines() if line.strip()]
+        if not directories:
+            return
+        joined = ", ".join(directories)
+        result.warning = (
+            "Exact directory match exists, but target='files' returns regular "
+            f"files only: {joined}. Use that directory as path to inspect it explicitly."
         )
 
     def _search_files_rg(self, pattern: str, path: str, limit: int, offset: int) -> SearchResult:

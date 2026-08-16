@@ -466,6 +466,30 @@ class TestSearchFilesFallbackHiddenPaths:
         assert result.error is None
         assert set(result.files) == {str(visible_file), str(visible_nested_file)}
 
+    def test_exact_directory_name_reports_existing_hidden_directory(
+        self, tmp_path, monkeypatch
+    ):
+        """An exact dot-directory query must not look like proof of absence."""
+        root = tmp_path / "repo"
+        cache = root / ".pytest_cache"
+        cache.mkdir(parents=True)
+        (cache / "README.md").write_text("pytest cache")
+
+        ops = ShellFileOperations(self._make_env())
+        monkeypatch.setattr(ops, "_has_command", lambda command: command == "find")
+        result = ops.search(
+            ".pytest_cache",
+            path=str(root),
+            target="files",
+            limit=50,
+        )
+
+        assert result.error is None
+        assert result.total_count == 0
+        assert result.warning is not None
+        assert str(cache) in result.warning
+        assert "directory" in result.warning.lower()
+
 
 class TestShellFileOpsWriteDenied:
     def test_write_file_denied_path(self, file_ops):

@@ -30,6 +30,19 @@ _MAX_TOTAL_UNREFERENCED_EVENTS = 10_000
 _AD_HOC_SCRIPT_NAME_PREFIXES = ("hermes-verify-", "hermes-ad-hoc-")
 _VERIFY_SCHEMA_VERSION = 1
 _SHELL_SPLIT_RE = re.compile(r"\s*(?:&&|\|\||;)\s*")
+_GENERATED_PYTHON_CACHE_SUFFIXES = frozenset({".pyc", ".pyo"})
+_GENERATED_PYTHON_CACHE_DIRECTORIES = frozenset({"__pycache__", ".pytest_cache"})
+
+
+def is_generated_python_cache_path(raw: str) -> bool:
+    """Return whether *raw* names generated Python runtime/test cache state."""
+    try:
+        path = Path(str(raw))
+    except Exception:
+        return False
+    if any(part.lower() in _GENERATED_PYTHON_CACHE_DIRECTORIES for part in path.parts):
+        return True
+    return path.suffix.lower() in _GENERATED_PYTHON_CACHE_SUFFIXES
 
 
 @dataclass(frozen=True)
@@ -529,7 +542,7 @@ def mark_workspace_edited(
     cwd: str | Path | None,
     paths: list[str] | tuple[str, ...] | None = None,
 ) -> Optional[dict[str, Any]]:
-    """Mark verification evidence stale after a successful file edit."""
+    """Mark evidence stale after a source edit, ignoring generated Python caches."""
 
     try:
         from agent.coding_context import project_facts_for
@@ -542,7 +555,12 @@ def mark_workspace_edited(
 
     sid = str(session_id or "default")
     root = str(facts.get("root") or Path(cwd or ".").resolve())
-    changed_paths = sorted({str(p) for p in (paths or []) if p})
+    supplied_paths = sorted({str(p) for p in (paths or []) if p})
+    changed_paths = [
+        path for path in supplied_paths if not is_generated_python_cache_path(path)
+    ]
+    if supplied_paths and not changed_paths:
+        return None
     edited_at = _utc_now()
 
     with _DB_LOCK:

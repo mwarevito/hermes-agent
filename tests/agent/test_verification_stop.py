@@ -224,6 +224,45 @@ def test_mixed_doc_and_code_edit_still_nudges(tmp_path, monkeypatch):
     assert doc not in nudge
 
 
+def test_generated_python_cache_cleanup_does_not_require_reverification(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _node_project(tmp_path)
+
+    nudge = build_verify_on_stop_nudge(
+        session_id="s1",
+        changed_paths=[
+            str(tmp_path / "src" / "__pycache__" / "store.cpython-311.pyc"),
+            str(tmp_path / ".pytest_cache" / "v" / "cache" / "nodeids"),
+            str(tmp_path / "src" / "legacy.pyo"),
+        ],
+    )
+
+    assert nudge is None
+
+
+def test_generated_python_cache_does_not_hide_a_source_edit(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _node_project(tmp_path)
+    source = str(tmp_path / "src" / "app.ts")
+    cache = str(tmp_path / "src" / "__pycache__" / "app.cpython-311.pyc")
+    mark_workspace_edited(
+        session_id="s1",
+        cwd=tmp_path,
+        paths=[cache, source],
+    )
+
+    nudge = build_verify_on_stop_nudge(
+        session_id="s1",
+        changed_paths=[cache, source],
+    )
+
+    assert nudge is not None
+    assert source in nudge
+    assert cache not in nudge
+
+
 def test_is_non_code_path_classification():
     from agent.verification_stop import _is_non_code_path
 

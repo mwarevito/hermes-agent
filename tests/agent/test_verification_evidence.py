@@ -151,6 +151,54 @@ def test_file_tool_stales_evidence_by_session_id_for_absolute_edit(tmp_path, mon
 
 
 
+def test_generated_cache_only_cleanup_preserves_passing_evidence(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _node_project(tmp_path)
+    record_terminal_result(
+        command="pnpm test",
+        cwd=tmp_path,
+        session_id="conversation",
+        exit_code=0,
+        output="green",
+    )
+
+    result = mark_workspace_edited(
+        session_id="conversation",
+        cwd=tmp_path,
+        paths=[
+            str(tmp_path / "src" / "__pycache__" / "store.cpython-311.pyc"),
+            str(tmp_path / ".pytest_cache" / "v" / "cache" / "nodeids"),
+        ],
+    )
+
+    assert result is None
+    assert verification_status(session_id="conversation", cwd=tmp_path)["status"] == "passed"
+
+
+def test_generated_cache_does_not_hide_a_real_source_edit(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _node_project(tmp_path)
+    source = str(tmp_path / "src" / "app.ts")
+    cache = str(tmp_path / "src" / "__pycache__" / "store.cpython-311.pyc")
+    record_terminal_result(
+        command="pnpm test",
+        cwd=tmp_path,
+        session_id="conversation",
+        exit_code=0,
+        output="green",
+    )
+
+    mark_workspace_edited(
+        session_id="conversation",
+        cwd=tmp_path,
+        paths=[cache, source],
+    )
+
+    status = verification_status(session_id="conversation", cwd=tmp_path)
+    assert status["status"] == "stale"
+    assert status["changed_paths"] == [source]
+
+
 def test_recording_expires_old_edit_only_state(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     monkeypatch.setenv("HERMES_HOME", str(home))

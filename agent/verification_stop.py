@@ -12,6 +12,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Iterable
 
+from agent.verification_evidence import is_generated_python_cache_path
+
 
 _MAX_CHANGED_PATHS_IN_NUDGE = 8
 
@@ -59,6 +61,8 @@ def _is_non_code_path(raw: str) -> bool:
         p = Path(str(raw))
     except Exception:
         return False
+    if is_generated_python_cache_path(str(p)):
+        return True
     suffix = p.suffix.lower()
     if suffix in _NON_CODE_VERIFY_EXTENSIONS:
         return True

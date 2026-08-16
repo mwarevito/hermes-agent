@@ -894,6 +894,12 @@ class TestOpenAIModelExecutionGuidance:
         assert isinstance(OPENAI_MODEL_EXECUTION_GUIDANCE, str)
         assert len(OPENAI_MODEL_EXECUTION_GUIDANCE) > 100
 
+    def test_one_step_exact_arithmetic_does_not_require_a_tool(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "one-step exact arithmetic may be answered directly" in text
+        assert "multi-step calculations" in text
+        assert "precision/high-stakes" in text
+
 
 class TestParallelToolCallGuidance:
     """Behavior contracts for the universal parallel-tool-call guidance block.
@@ -919,5 +925,4 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
 

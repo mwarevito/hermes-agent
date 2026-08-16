@@ -37,6 +37,14 @@ from agent.prompt_builder import (
 from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
 
 
+@pytest.fixture(autouse=True)
+def _isolate_truncation_warnings():
+    """Do not leak module-local prompt warnings into later test modules."""
+    drain_truncation_warnings()
+    yield
+    drain_truncation_warnings()
+
+
 # =========================================================================
 # Guidance constants
 # =========================================================================
@@ -925,4 +933,3 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
